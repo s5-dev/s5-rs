@@ -1,0 +1,47 @@
+[package]
+name = "sia_rhp4_webtransport_streamer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+anyhow = "1.0.98"
+console_error_panic_hook = "0.1.7"
+console_log = "1.0.0"
+dashmap = "6.1.0"
+hex = "0.4.3"
+js-sys = "0.3.77"
+log = "0.4.27"
+sia_sdk = { git = "https://github.com/SiaFoundation/sia-sdk-rs.git", branch = "nate/rhp4" }
+s5_base = { path = "../../s5_base" }
+fs5 = { path = "../../fs5", features = [] }
+url = "2.5.4"
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = { version = "0.4.50" }
+web-transport = "0.9.3"
+bytes = "1.10.1"
+thiserror = "2.0.12"
+serde = "1.0.219"
+time = "0.3.41"
+ed25519-dalek = "2.1.1"
+ed25519 = "2.2.3"
+blake2 = "0.10.6"
+chacha20 = "0.9.1"
+
+[dependencies.web-sys]
+version = "0.3.77"
+features = [
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "TextDecoder",
+    "TextEncoder",
+    "WebTransport",
+    "WebTransportBidirectionalStream",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportReceiveStream",
+    "WebTransportSendStream",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+]
