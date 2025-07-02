@@ -6,7 +6,7 @@
 use std::{borrow::Borrow, fmt};
 
 /// Hash type used by S5 (blake3, 32 bytes)
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Hash(blake3::Hash);
 
 impl fmt::Debug for Hash {
