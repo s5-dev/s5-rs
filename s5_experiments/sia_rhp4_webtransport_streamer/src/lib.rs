@@ -9,12 +9,13 @@ use dashmap::DashMap;
 use ed25519::signature::SignerMut;
 use fs5::BlobId;
 use fs5::FileRef;
+use futures::future::{Either, select_all};
 use log::Level;
 use log::info;
 use log::warn;
-use s5_base::blob::location::BlobLocation;
-use s5_base::blob::location::SiaFile;
-use s5_base::blob::location::SiaFileHost;
+use s5_core::blob::location::BlobLocation;
+use s5_core::blob::location::SiaFile;
+use s5_core::blob::location::SiaFileHost;
 use sia::encoding::{SiaDecodable, SiaEncodable};
 use sia::rhp::AccountToken;
 use sia::rhp::HostPrices;
@@ -24,7 +25,7 @@ use sia::rhp::RPCSettingsResponse;
 use sia::rhp::RPCWriteSectorResponse;
 use sia::signing::PublicKey;
 use sia::types::Hash256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::io::Seek;
 use std::sync::Arc;
@@ -81,23 +82,30 @@ impl SiaTransporter {
     }
     async fn session_for(&self, siamux_address: &str) -> anyhow::Result<Session> {
         if self.sessions.contains_key(siamux_address) {
-            return Ok(self.sessions.get(siamux_address).unwrap().value().clone());
+            let sess: Session = self.sessions.get(siamux_address).unwrap().value().clone();
+            return Ok(sess);
         }
         let client = ClientBuilder::new()
             // .with_unreliable(true)
             // .with_congestion_control(web_transport::CongestionControl::Default)
             .with_system_roots()
             .unwrap();
+
         let session = client
-            .connect(Url::parse(&format!("https://{}/sia/rhp/v4", siamux_address)).unwrap())
+            .connect(Url::parse(&format!(
+                "https://{}/sia/rhp/v4",
+                siamux_address
+            ))?)
             .await
             .unwrap();
 
         self.sessions
             .insert(siamux_address.to_string(), session.clone());
+
         Ok(session)
     }
 
+    // ! main entrypoint
     pub async fn download_file_slice(
         &self,
         path: String,
@@ -108,6 +116,7 @@ impl SiaTransporter {
 
         match BlobLocation::deserialize(&bytes) {
             BlobLocation::SiaFile(file) => {
+                info!("sia file {:?}", file);
                 let res = self.download_slice(file, offset, length).await;
                 res.map(|bytes| bytes.into())
             }
@@ -131,12 +140,15 @@ impl SiaTransporter {
         if self.host_prices.contains_key(&host.hostkey) {
             return Ok(self.host_prices.get(&host.hostkey).unwrap().value().clone());
         }
+        info!("host addresses {:?}", host.v2_siamux_addresses);
+        let address = host.v2_siamux_addresses.get(0).unwrap();
         let res: Result<RPCSettingsResponse, SiaDownloadError> = self
-            .get_rpc_settings_for_host(host.v2_siamux_addresses.get(0).unwrap())
+            .get_rpc_settings_for_host(&address)
             .await
             .map_err(From::from);
 
         let prices = Arc::new(res?.settings.prices);
+        info!("SUCCESS {} got host prices {:?}", address, prices);
 
         self.host_prices
             .insert(host.hostkey.clone(), prices.clone());
@@ -182,10 +194,12 @@ impl SiaTransporter {
 
             // TODO implement reed solomon support
 
+            let mut futures: Vec<_> = vec![];
+
             for (host_id, root) in &slab.shard_roots {
                 if let Some(host) = file.hosts.get(&host_id) {
                     if !tokens.contains_key(&host_id) {
-                        info!("make account token for {:?}", host.v2_siamux_addresses);
+                        //info!("make account token for {:?}", host.v2_siamux_addresses);
                         let host_key = PublicKey::new(
                             hex::decode(&host.hostkey[8..]).unwrap().try_into().unwrap(),
                         );
@@ -197,7 +211,7 @@ impl SiaTransporter {
                         let valid_until =
                             OffsetDateTime::from_unix_timestamp(valid_until_unix as i64).unwrap();
 
-                        info!("make account token step 4");
+                        //info!("make account token step 4");
 
                         // OffsetDateTime::now_utc()        .replace_offset(UtcOffset::from_whole_seconds(10 * 60).unwrap());
 
@@ -222,113 +236,37 @@ impl SiaTransporter {
                     let mut tmp_data_1 = Vec::new();
                     token.encode(&mut tmp_data_1).unwrap();
                     let mut tmp_cursor_1 = Cursor::new(tmp_data_1);
-
-                    info!("try shard by {:?}", host.v2_siamux_addresses);
-
-                    let mut tmp_data_2 = Vec::new();
-                    let _ = &self
-                        .get_prices_for_host(host)
-                        .await?
-                        .encode(&mut tmp_data_2)
-                        .unwrap();
-                    let mut tmp_cursor_2 = Cursor::new(tmp_data_2);
-
-                    let mut read_sector_len = length.min(slab_size - (offset % slab_size));
-
-                    while (offset + read_sector_len) % SIA_LEAF_SIZE != 0 {
-                        read_sector_len += 1;
-                    }
-
-                    let read_req = RPCReadSectorRequest {
-                        prices: HostPrices::decode(&mut tmp_cursor_2).unwrap(),
-                        length: read_sector_len,
-                        offset: offset % slab_size,
-                        root: Hash256::new((*root).into()),
-                        token: AccountToken::decode(&mut tmp_cursor_1).unwrap(),
-                    };
-                    // info!("sending read sector request {:?}", read_req);
-                    let read_req = encode_read_sector_request(&read_req);
-
-                    // let mut data: Vec<u8> = Vec::new();
-
-                    let mut session = self
-                        .session_for(host.v2_siamux_addresses.get(0).unwrap())
-                        .await?;
-                    let (mut send, mut recv) = session.open_bi().await.unwrap();
-                    send.write(&read_req).await.unwrap();
-
-                    // send.finish().unwrap();
-
-                    let mut buf: Vec<u8> = vec![];
-                    loop {
-                        let res = recv.read_buf(&mut buf).await.unwrap();
-                        if res.is_none() {
-                            break;
-                        };
-                    }
-
-                    let buf_copy = if buf.len() < 1000 {
-                        buf.clone()
-                    } else {
-                        vec![]
-                    };
-
-                    let mut c = Cursor::new(buf);
-                    c.seek(std::io::SeekFrom::Start(1)).unwrap();
-                    let read_res = RPCReadSectorResponse::decode(&mut c).map_err(|_| {
-                        SiaDownloadError::RPCReadSectorError(
-                            String::from_utf8_lossy(&buf_copy).to_string(),
-                        )
-                    });
-
-                    if read_res.is_err() {
-                        warn!(
-                            "could not download shard from {:?}: {}",
-                            host.v2_siamux_addresses,
-                            read_res.unwrap_err()
-                        );
-                        continue;
-                    }
-
-                    let res = read_res.unwrap();
-
-                    // TODO verify proof or via blake3/bao tree
-
-                    let mut decrypted_shard_bytes = res.data.to_vec();
-                    {
-                        let mut shard_nonce = [0u8; 24];
-                        shard_nonce[1] = *host_id;
-                        let key = chacha20::Key::from_slice(&slab.slab_encryption_key);
-                        let iv = chacha20::XNonce::from_slice(&shard_nonce);
-                        let mut cipher = XChaCha20::new(key, iv);
-                        cipher.seek(offset % slab_size);
-                        cipher.apply_keystream(&mut decrypted_shard_bytes);
-                    }
-
-                    {
-                        let mut slab_nonce = [0u8; 24];
-                        let overflow_limit = 64 * (u32::MAX as u64);
-
-                        let offset = if offset >= overflow_limit {
-                            let nonce64: u64 = offset / overflow_limit;
-                            slab_nonce[16..].copy_from_slice(&nonce64.to_le_bytes());
-                            offset % overflow_limit
-                        } else {
-                            offset
-                        };
-                        let key = chacha20::Key::from_slice(&file.file_encryption_key);
-                        let iv = chacha20::XNonce::from_slice(&slab_nonce);
-                        let mut cipher = XChaCha20::new(key, iv);
-                        cipher.seek(offset);
-                        cipher.apply_keystream(&mut decrypted_shard_bytes);
-                    }
-
-                    out.extend_from_slice(&decrypted_shard_bytes);
-                    offset = offset + (decrypted_shard_bytes.len() as u64);
-                    length = length - (decrypted_shard_bytes.len() as u64);
-                    continue 'slab_loop;
+                    futures.push(Box::pin(self.try_host_dl(
+                        slab_size,
+                        (*root).into(),
+                        *host_id,
+                        &host,
+                        AccountToken::decode(&mut tmp_cursor_1).unwrap(),
+                        offset,
+                        length,
+                        slab.slab_encryption_key,
+                        file.file_encryption_key,
+                    )));
                 };
             }
+            while !futures.is_empty() {
+                match select_all(futures).await {
+                    (Ok((hostkey, data)), _index, _remaining) => {
+                        info!("fastest host: {}", hostkey,);
+
+                        out.extend_from_slice(&data);
+                        offset = offset + (data.len() as u64);
+                        length = length - (data.len() as u64);
+
+                        continue 'slab_loop;
+                    }
+                    (Err(e), index, remaining) => {
+                        warn!("could not download sector from this host: {}", e);
+                        futures = remaining;
+                    }
+                }
+            }
+
             return Err(SiaDownloadError::NoHostAvailableForSlab(slab_index));
         }
 
@@ -337,6 +275,132 @@ impl SiaTransporter {
         }
 
         return Ok(out.into());
+    }
+
+    async fn try_host_dl(
+        &self,
+        slab_size: u64,
+        root: [u8; 32],
+        host_id: u8,
+        host: &SiaFileHost,
+        token: AccountToken,
+        offset: u64,
+        length: u64,
+        slab_encryption_key: [u8; 32],
+        file_encryption_key: [u8; 32],
+    ) -> Result<(String, Vec<u8>), SiaDownloadError> {
+        info!("try shard by {:?}", host.v2_siamux_addresses);
+
+        let mut tmp_data_2 = Vec::new();
+        let prices = self.get_prices_for_host(host).await;
+
+        if prices.is_err() {
+            info!("failed to get prices, trying next host...");
+            return Err(SiaDownloadError::HostNotAvailable(host.hostkey.clone()));
+        }
+
+        let _ = &prices.unwrap().encode(&mut tmp_data_2).unwrap();
+        let mut tmp_cursor_2 = Cursor::new(tmp_data_2);
+
+        let mut read_sector_len = length.min(slab_size - (offset % slab_size));
+
+        while (offset + read_sector_len) % SIA_LEAF_SIZE != 0 {
+            read_sector_len += 1;
+        }
+
+        let read_req = RPCReadSectorRequest {
+            prices: HostPrices::decode(&mut tmp_cursor_2).unwrap(),
+            length: read_sector_len,
+            offset: offset % slab_size,
+            root: Hash256::new(root),
+            token,
+        };
+        // info!("sending read sector request {:?}", read_req);
+        let read_req = encode_read_sector_request(&read_req);
+
+        // let mut data: Vec<u8> = Vec::new();
+
+        let mut session = self
+            .session_for(host.v2_siamux_addresses.get(0).unwrap())
+            .await?;
+        let (mut send, mut recv) = session.open_bi().await.unwrap();
+        send.write(&read_req).await.unwrap();
+
+        // send.finish().unwrap();
+
+        let mut buf: Vec<u8> = vec![];
+        loop {
+            let res = recv.read_buf(&mut buf).await.unwrap();
+            if res.is_none() {
+                break;
+            };
+        }
+
+        let buf_copy = if buf.len() < 1000 {
+            buf.clone()
+        } else {
+            vec![]
+        };
+
+        let mut c = Cursor::new(buf);
+        c.seek(std::io::SeekFrom::Start(1)).unwrap();
+        let read_res = RPCReadSectorResponse::decode(&mut c).map_err(|_| {
+            SiaDownloadError::RPCReadSectorError(String::from_utf8_lossy(&buf_copy).to_string())
+        });
+
+        if read_res.is_err() {
+            warn!(
+                "could not download shard from {:?}: {}",
+                host.v2_siamux_addresses,
+                read_res.unwrap_err()
+            );
+            return Err(SiaDownloadError::HostNotAvailable(host.hostkey.clone()));
+        }
+
+        let res = read_res.unwrap();
+
+        // TODO verify proof or via blake3/bao tree
+
+        let mut decrypted_shard_bytes = res.data.to_vec();
+
+        if (decrypted_shard_bytes.len() as u64) != read_sector_len {
+            warn!(
+                "host {} slab wrong length {} != {read_sector_len}",
+                host.hostkey,
+                decrypted_shard_bytes.len()
+            );
+            return Err(SiaDownloadError::HostNotAvailable(host.hostkey.clone()));
+        }
+
+        {
+            let mut shard_nonce = [0u8; 24];
+            shard_nonce[1] = host_id;
+            let key = chacha20::Key::from_slice(&slab_encryption_key);
+            let iv = chacha20::XNonce::from_slice(&shard_nonce);
+            let mut cipher = XChaCha20::new(key, iv);
+            cipher.seek(offset % slab_size);
+            cipher.apply_keystream(&mut decrypted_shard_bytes);
+        }
+
+        {
+            let mut slab_nonce = [0u8; 24];
+            let overflow_limit = 64 * (u32::MAX as u64);
+
+            let offset = if offset >= overflow_limit {
+                let nonce64: u64 = offset / overflow_limit;
+                slab_nonce[16..].copy_from_slice(&nonce64.to_le_bytes());
+                offset % overflow_limit
+            } else {
+                offset
+            };
+            let key = chacha20::Key::from_slice(&file_encryption_key);
+            let iv = chacha20::XNonce::from_slice(&slab_nonce);
+            let mut cipher = XChaCha20::new(key, iv);
+            cipher.seek(offset);
+            cipher.apply_keystream(&mut decrypted_shard_bytes);
+        }
+
+        Ok((host.hostkey.clone(), decrypted_shard_bytes))
     }
 
     async fn get_rpc_settings_for_host(
@@ -391,6 +455,9 @@ pub enum SiaDownloadError {
 
     #[error("no supported location available to download blob")]
     NoBlobLocation,
+
+    #[error("host {0} not available")]
+    HostNotAvailable(String),
 
     #[error(transparent)]
     Other(anyhow::Error),
