@@ -28,10 +28,12 @@ pub struct SiaBlobStore {
     pub worker_pinned_object_api_url: String,
     pub bus_accounts_fund_api_url: String, // usually http://localhost:9980/api/bus/accounts/fund
     pub bus_hosts_api_url: String,         // usually http://localhost:9980/api/bus/hosts
-    pub bus_object_api_url: String,
+    pub bus_contracts_api_url: String,
     pub store_outboard: bool,
     auth_headers: HeaderMap,
     http_client: Arc<hyper::Client<hyper::client::HttpConnector>>,
+    // TODO implement
+    // host_quic_address_cache: DashMap<String, String>,
 }
 
 impl SiaBlobStore {
@@ -48,10 +50,11 @@ impl SiaBlobStore {
             auth_headers,
             worker_object_api_url: format!("{}/object", worker_api_url),
             worker_pinned_object_api_url: format!("{}/pinned", worker_api_url),
-            bus_object_api_url: format!("{}/object", bus_api_url),
             bus_hosts_api_url: format!("{}/hosts", bus_api_url),
+            bus_contracts_api_url: format!("{}/contracts", bus_api_url),
             bus_accounts_fund_api_url: format!("{}/accounts/fund", bus_api_url),
             store_outboard: true,
+            // TODO implement host_quic_address_cache: DashMap::new(),
         }
     }
 
@@ -68,7 +71,7 @@ impl SiaBlobStore {
 
         if self.store_outboard {
             if let Some(out) = outboard {
-                self.put_bytes(format!("obao4/{}", encoded), out).await?;
+                self.put_bytes(format!("obao6/{}", encoded), out).await?;
             }
         } else {
             log::debug!("skipping outboard");
@@ -172,7 +175,7 @@ impl SiaBlobStore {
         Ok(())
     }
 
-    fn object_url_for_hash(&self, hash: Hash, offset: Option<u64>, pinned_meta: bool) -> String {
+    fn pinned_object_url_for_hash(&self, hash: Hash, offset: Option<u64>) -> String {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
         let object_path = if let Some(offset) = offset {
             format!("blob3_split/{}/{}", encoded, offset)
@@ -182,13 +185,7 @@ impl SiaBlobStore {
 
         format!(
             "{}/{}?bucket={}",
-            if pinned_meta {
-                &self.worker_pinned_object_api_url
-            } else {
-                &self.bus_object_api_url
-            },
-            object_path,
-            self.bucket
+            &self.worker_pinned_object_api_url, object_path, self.bucket
         )
     }
     async fn http_get(&self, url: &str) -> Result<Bytes, Error> {
@@ -267,16 +264,35 @@ impl SiaBlobStore {
         }
     }
 
+    // TODO Implement
+    /*   async fn get_address_for_hostkey(&self, hostkey: &str) -> String {
+        if self.host_quic_address_cache.contains_key(hostkey) {
+            return self
+                .host_quic_address_cache
+                .get(hostkey)
+                .unwrap()
+                .to_string();
+        }
+        let res =
+        "".to_owned()
+    } */
+
     async fn provide_sia_file(&self, hash: Hash, offset: Option<u64>) -> Result<SiaFile, Error> {
         let res = self
-            .http_get(&self.object_url_for_hash(hash, offset, false))
+            .http_get(&self.pinned_object_url_for_hash(hash, offset))
             .await?;
-        let o: SiaObjectRes = serde_json::from_slice(&res)?;
+        let o: SiaPinnedObjectRes = serde_json::from_slice(&res)?;
 
-        let res = self
-            .http_get(&self.object_url_for_hash(hash, offset, true))
-            .await?;
-        let po: SiaPinnedObjectRes = serde_json::from_slice(&res)?;
+        // TODO make this more efficient
+        let contracts_res = self.http_get(&self.bus_contracts_api_url).await?;
+        let contracts: Vec<SiaRenterdBusContract> = serde_json::from_slice(&contracts_res)?;
+        let contracts: Vec<&SiaRenterdBusContract> = contracts
+            .iter()
+            .filter(|c| match c.usability {
+                SiaRenterdBusContractUsability::Good => true,
+                _ => false,
+            })
+            .collect();
 
         /* let api_hosts_res = self.http_get(&self.bus_hosts_api_url).await?;
         let api_hosts_res: Vec<SiaRenterdBusApiHost> = serde_json::from_slice(&api_hosts_res)?;
@@ -292,21 +308,21 @@ impl SiaBlobStore {
 
         let planned_u_sc_per_byte: f64 = 3.07e-3 * 1.0; // TODO adjust multiplier to make full file download possible?
 
-        let u_sc_needed_for_dl: u32 = (planned_u_sc_per_byte * (o.size as f64)).round() as u32;
+        let size: u64 = o.slabs.iter().map(|slab| slab.length as u64).sum();
+
+        let u_sc_needed_for_dl: u32 = (planned_u_sc_per_byte * (size as f64)).round() as u32;
 
         let mut hosts: BTreeMap<u8, SiaFileHost> = BTreeMap::new();
         let mut indexed_hostkeys: HashMap<String, u8> = HashMap::new();
         let mut slabs = vec![];
 
         for slab in &o.slabs {
-            let mut slab_encryption_key = [0u8; 32];
-            hex::decode_to_slice(&slab.slab.encryption_key[5..], &mut slab_encryption_key)?;
             let mut s = SiaFileSlab {
                 shard_roots: BTreeMap::new(),
-                slab_encryption_key,
+                slab_encryption_key: slab.encryption_key,
             };
-            for shard in &slab.slab.shards {
-                let hostkey = shard.contracts.keys().next().unwrap();
+            for shard in &slab.sectors {
+                let hostkey = &shard.host_key;
                 if get_address_for_hostkey(hostkey).is_none() {
                     log::debug!(
                         "host {} does not have web-compatible address, skipping",
@@ -323,17 +339,22 @@ impl SiaBlobStore {
                     let signing_key =
                         ed25519_dalek::SigningKey::from_bytes(&ephemeral_account_private_key);
 
+                    let mut contract_id = None;
+                    for c in &contracts {
+                        if &c.host_key == hostkey {
+                            contract_id = Some(c.id.clone());
+                            break;
+                        }
+                    }
+                    if contract_id.is_none() {
+                        continue;
+                    }
+
                     let pubkey_str: String = signing_key.verifying_key().encode_hex();
                     let fund_req = SiaRenterdBusApiFundRequest {
                         amount: format!("{}uS", u_sc_needed_for_dl),
                         account_id: format!("{}", pubkey_str),
-                        contract_id: shard
-                            .contracts
-                            .get(hostkey)
-                            .unwrap()
-                            .first()
-                            .unwrap()
-                            .clone(),
+                        contract_id: contract_id.unwrap(),
                     }; // TODO Maybe fund all?
                     let fund_req_str = serde_json::to_string(&fund_req)?;
 
@@ -366,11 +387,11 @@ impl SiaBlobStore {
         }
 
         let loc = SiaFile {
-            size: o.size,
+            size,
             slab_size: first_slab.length,
-            min_shards: first_slab.slab.min_shards,
+            min_shards: first_slab.min_shards,
             hosts,
-            file_encryption_key: po.encryption_key,
+            file_encryption_key: o.encryption_key,
             slabs,
         };
 
@@ -407,6 +428,18 @@ impl BlobStore for SiaBlobStore {
         let res = self.finalize_import(src).await?;
         Ok(res.0)
     }
+    async fn import_stream(
+        &self,
+        data: impl Stream<Item = Bytes> + Send + 'static,
+    ) -> Result<Hash, Error> {
+        todo!();
+
+        // TODO Implement
+        // data.try_next();
+
+        let hash = Hash::from_bytes([0u8; 32]);
+        Ok(hash)
+    }
 }
 
 enum ImportSource {
@@ -441,34 +474,39 @@ struct SiaRenterdBusApiHost {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SiaRenterdBusContract {
+    id: String,
+    host_key: String,
+    usability: SiaRenterdBusContractUsability,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SiaRenterdBusContractUsability {
+    Good,
+    Bad,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SiaPinnedObjectRes {
     encryption_key: [u8; 32],
+    slabs: Vec<SiaPinnedSlab>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SiaObjectRes {
-    size: u64,
-    // encryption_key: String,
-    slabs: Vec<SlabElement>,
-}
-
-#[derive(Deserialize)]
-struct SlabElement {
-    slab: SlabSlab,
-    length: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SlabSlab {
-    encryption_key: String,
+struct SiaPinnedSlab {
+    encryption_key: [u8; 32],
     min_shards: u8,
-    shards: Vec<Shard>,
+    sectors: Vec<SiaPinnedSector>,
+    offset: u32,
+    length: u32,
 }
 
 #[derive(Deserialize)]
-struct Shard {
-    contracts: HashMap<String, Vec<String>>,
+#[serde(rename_all = "camelCase")]
+struct SiaPinnedSector {
     root: String,
+    host_key: String,
 }
