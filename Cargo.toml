@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+  "blob_stores/sia",
+  "s5_cli",
+  "s5_core",
+  "s5_node",
+  "s5_utils",
+  "tools/http_importer",
+]
+
+[workspace.dependencies]
+blake3 = { version = "1.8.2", default-features = false }
+bytes = { version = "1.10.1" }
+iroh = { version = "0.91.1", default-features = false }
+minicbor = { version = "2.0.0", features = ["alloc", "derive", "half"] }
+tokio = { version = "1.47.1", features = ["full"] }
+
+# workspace crates
+http_importer = { path = "tools/http_importer" }
+s5_core = { path = "s5_core" }
+s5_node = { path = "s5_node" }
+s5_store_sia = { path = "blob_stores/sia" }
+s5_utils = { path = "s5_utils" }
