@@ -1,0 +1,11 @@
+[package]
+name = "s5_utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bao-tree = { version = "0.15.1", default-features = false, features = [
+  "tokio_fsm",
+  "validate",
+] }
+s5_core = { workspace = true }
