@@ -35,6 +35,10 @@ enum Commands {
     Import {
         // TODO support local fs paths
         url: String,
+
+        /// max number of concurrent blob imports
+        #[arg(short, long, value_name = "COUNT", default_value_t = 4)]
+        concurrency: usize,
     },
     /// Start the S5 Node and serve files from the default blob store
     Start,
@@ -122,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
             let config: S5NodeConfig = toml::from_str(&toml_content)?;
 
             match cli.cmd {
-                Commands::Import { url } => {
+                Commands::Import { url, concurrency } => {
                     let store = match config
                         .store
                         .get("default")
@@ -142,7 +146,8 @@ async fn main() -> anyhow::Result<()> {
                         .join(&cli.node)
                         .join("import_state.fs5.cbor");
 
-                    let http_importer = HttpImporter::new(node_import_state_file, store);
+                    let http_importer =
+                        HttpImporter::new(node_import_state_file, store, concurrency);
                     http_importer.import_url(url.parse()?).await?;
                 }
                 Commands::Start => {

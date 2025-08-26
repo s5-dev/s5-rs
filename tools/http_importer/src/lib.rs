@@ -16,7 +16,7 @@ pub struct HttpImporter<T: BlobStore> {
 }
 
 impl<T: BlobStore> HttpImporter<T> {
-    pub fn new(state_path: PathBuf, store: T) -> Self {
+    pub fn new(state_path: PathBuf, store: T, max_concurrent_blob_imports: usize) -> Self {
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
 
         let lock_file = File::create(state_path.with_extension("lock")).unwrap();
@@ -31,7 +31,7 @@ impl<T: BlobStore> HttpImporter<T> {
         Self {
             lock_file,
             http_client: reqwest::Client::new(),
-            rate_limiter: Arc::new(Semaphore::new(10)),
+            rate_limiter: Arc::new(Semaphore::new(max_concurrent_blob_imports)),
             indexing_state: Arc::new(RwLock::new(indexing_state)),
             store,
             indexing_state_dir_path: state_path,
