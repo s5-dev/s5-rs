@@ -14,7 +14,7 @@ impl BlobLocation {
     }
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cbor(flat)]
 pub enum BlobLocation {
     #[n(0)]
@@ -27,6 +27,9 @@ pub enum BlobLocation {
     #[n(1)]
     #[cbor(array)]
     Url(#[n(0)] String),
+
+    #[n(4)]
+    Iroh(#[n(0)] IrohLocation),
 
     #[n(0x41)]
     SiaFile(#[n(0)] SiaFile),
@@ -60,13 +63,24 @@ pub enum BlobLocation {
     ),
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IrohLocation {
+    #[n(0)]
+    pub host: [u8; 32], //NodeId,
+
+    /// The kind of the announcement.
+    #[n(1)]
+    #[cbor(default)]
+    pub partial: bool,
+}
+
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cbor(array)]
 pub struct SiaFile {
     #[n(0)]
     pub size: u64,
     #[n(1)]
-    pub slab_size: u64,
+    pub slab_size: u32,
     #[n(2)]
     pub min_shards: u8,
     #[n(3)]
@@ -78,7 +92,7 @@ pub struct SiaFile {
     pub slabs: Vec<SiaFileSlab>,
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cbor(array)]
 pub struct SiaFileHost {
     #[n(0)]
@@ -90,7 +104,7 @@ pub struct SiaFileHost {
     pub ephemeral_account_private_key: [u8; 32],
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cbor(array)]
 pub struct SiaFileSlab {
     #[n(0)]

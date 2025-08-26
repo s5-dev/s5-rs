@@ -1,9 +1,0 @@
-[package]
-name = "fs5"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-blake3 = "1.8.2"
-minicbor = { version = "1.0.0", features = ["alloc", "derive"] }
-thiserror = "2.0.12"

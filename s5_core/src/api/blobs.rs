@@ -3,9 +3,13 @@ use bytes::Bytes;
 use std::path::PathBuf;
 
 // TODO return results
+// TODO move this to root
+
+pub mod store;
 
 pub trait BlobsRead: Sync + Send {
     /// Downloads a full file blob to memory
+    // TODO this should be try
     fn blob_download(&self, hash: Hash) -> impl std::future::Future<Output = Bytes> + Send;
 
     // Downloads a slice of a blob to memory, starting from `offset` (inclusive) with length `length`

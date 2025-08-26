@@ -1,15 +1,16 @@
 [package]
-name = "s5_base"
+name = "s5_core"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 description = "types and traits shared by all S5 crates"
 repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-blake3 = { version = "1.8.2", default-features = false }
-bytes = "1.10.1"
+blake3 = { workspace = true }
+bytes = { workspace = true }
 data-encoding = "2.9.0"
 futures-core = "0.3.31"
-minicbor = { version = "1.0.0", features = ["alloc", "derive"] }
+minicbor = { workspace = true }
 multibase = "0.9.1"
+thiserror = "2.0.14"
