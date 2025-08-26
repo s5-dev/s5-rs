@@ -17,14 +17,14 @@ pub struct HttpImporter<T: BlobStore> {
 
 impl<T: BlobStore> HttpImporter<T> {
     pub fn new(state_path: PathBuf, store: T) -> Self {
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+
         let lock_file = File::create(state_path.with_extension("lock")).unwrap();
         lock_file.lock().unwrap();
 
         let indexing_state = if std::fs::exists(&state_path).unwrap() {
             DirV1::from_bytes(&std::fs::read(&state_path).unwrap())
         } else {
-            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
-
             DirV1::new()
         };
 
