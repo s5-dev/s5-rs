@@ -1,4 +1,5 @@
 use chrono::DateTime;
+use futures::StreamExt;
 use reqwest::header::LAST_MODIFIED;
 use s5_core::{BlobStore, DirV1, FileRef, OpenDirV1};
 use scraper::{Html, Selector};
@@ -69,20 +70,12 @@ impl HttpImporter {
             let tasks: Vec<_> = urls.into_iter().map(|url| self.import_url(url)).collect();
             futures::future::join_all(tasks).await;
         } else {
-            // TODO stream response instead of buffering in memory
-            /* self.store
-            .import_stream(res.bytes_stream().map(Result::unwrap))
-            .await?; */
-            /* self.indexing_state
-            .files
-            .insert(url.to_string(), FileRef::new()); */
+            let (hash, size) = self
+                .store
+                .import_stream(Box::new(res.bytes_stream().map(Result::unwrap)))
+                .await?;
 
-            let bytes = res.bytes().await?;
-            let len = bytes.len() as u64;
-            // TODO proper error handling
-            let hash = self.store.import_bytes(bytes).await.unwrap();
-
-            let mut file_ref = FileRef::new(hash.into(), len);
+            let mut file_ref = FileRef::new(hash, size);
 
             if let Some(lm) = last_modified {
                 file_ref.timestamp = Some(lm.timestamp() as u32);
