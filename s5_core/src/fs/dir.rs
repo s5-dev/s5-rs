@@ -1,10 +1,15 @@
 use crate::Hash;
 use crate::blob::location::BlobLocation;
 use bytes::Bytes;
-use minicbor::decode::Decoder;
-use minicbor::encode::{Encoder, Write};
+use fs4::fs_std::FileExt;
 use minicbor::{CborLen, Decode, Encode};
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::NamedTempFile;
+use tokio::sync::RwLock;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -21,6 +26,50 @@ pub struct DirV1 {
     pub dirs: BTreeMap<String, DirRef>,
     #[n(3)]
     pub files: BTreeMap<String, FileRef>,
+}
+
+pub struct OpenDirV1 {
+    inner: Arc<RwLock<OpenDirV1Inner>>,
+}
+
+struct OpenDirV1Inner {
+    dir: DirV1,
+    /// The handle to the locked file.
+    file: std::fs::File,
+    /// The path to the original file.
+    path: std::path::PathBuf,
+}
+
+impl OpenDirV1 {
+    pub async fn file_exists(&self, path: &str) -> bool {
+        let inner = self.inner.read().await;
+        inner.dir.files.contains_key(path)
+    }
+
+    pub async fn file_put(&self, path: &str, file_ref: FileRef) -> io::Result<()> {
+        let mut inner = self.inner.write().await;
+        // TODO update instead of replace
+        inner.dir.files.insert(path.to_owned(), file_ref);
+        self.save().await
+    }
+
+    pub async fn save(&self) -> io::Result<()> {
+        let inner = self.inner.write().await;
+        // Create a temporary file in the same directory as the original file.
+        let parent_dir = inner.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Could not find parent directory")
+        })?;
+        let mut temp_file = NamedTempFile::new_in(parent_dir)?;
+
+        // Write the buffer's contents to the temporary file.
+        temp_file.write_all(&inner.dir.to_vec())?;
+
+        temp_file.as_file().sync_all()?;
+
+        temp_file.persist(&inner.path)?;
+
+        Ok(())
+    }
 }
 
 impl DirV1 {
@@ -45,6 +94,27 @@ impl DirV1 {
             dirs: BTreeMap::new(),
             files: BTreeMap::new(),
         }
+    }
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<OpenDirV1> {
+        let path = path.as_ref().to_path_buf();
+
+        if !std::fs::exists(&path)? {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, DirV1::new().to_bytes())?;
+        }
+
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+
+        file.lock_exclusive()?;
+
+        let mut buffer = Vec::new();
+        let mut file_ref = &file;
+        file_ref.read_to_end(&mut buffer)?;
+        let dir = Self::from_bytes(&buffer);
+
+        Ok(OpenDirV1 {
+            inner: Arc::new(RwLock::new(OpenDirV1Inner { dir, file, path })),
+        })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> DirV1 {

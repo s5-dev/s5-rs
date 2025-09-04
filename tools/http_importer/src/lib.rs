@@ -1,54 +1,33 @@
 use chrono::DateTime;
 use reqwest::header::LAST_MODIFIED;
-use s5_core::{BlobStore, DirV1, FileRef};
+use s5_core::{BlobStore, DirV1, FileRef, OpenDirV1};
 use scraper::{Html, Selector};
-use std::{fs::File, path::PathBuf, sync::Arc};
-use tokio::sync::{RwLock, Semaphore};
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::Semaphore;
 use url::Url;
 
-pub struct HttpImporter<T: BlobStore> {
+pub struct HttpImporter {
     http_client: reqwest::Client,
     rate_limiter: Arc<Semaphore>,
-    indexing_state: Arc<RwLock<DirV1>>,
-    store: T,
-    indexing_state_dir_path: PathBuf,
-    lock_file: File,
+    dir: OpenDirV1,
+    store: BlobStore,
 }
 
-impl<T: BlobStore> HttpImporter<T> {
-    pub fn new(state_path: PathBuf, store: T, max_concurrent_blob_imports: usize) -> Self {
-        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
-
-        let lock_file = File::create(state_path.with_extension("lock")).unwrap();
-        lock_file.lock().unwrap();
-
-        let indexing_state = if std::fs::exists(&state_path).unwrap() {
-            DirV1::from_bytes(&std::fs::read(&state_path).unwrap())
-        } else {
-            DirV1::new()
-        };
+impl HttpImporter {
+    pub fn new(state_path: PathBuf, store: BlobStore, max_concurrent_blob_imports: usize) -> Self {
+        let dir = DirV1::open(state_path).unwrap();
 
         Self {
-            lock_file,
             http_client: reqwest::Client::new(),
             rate_limiter: Arc::new(Semaphore::new(max_concurrent_blob_imports)),
-            indexing_state: Arc::new(RwLock::new(indexing_state)),
+            dir,
             store,
-            indexing_state_dir_path: state_path,
         }
     }
 
     pub async fn import_url(&self, url: Url) -> anyhow::Result<()> {
-        {
-            if self
-                .indexing_state
-                .read()
-                .await
-                .files
-                .contains_key(url.as_str())
-            {
-                return Ok(());
-            }
+        if self.dir.file_exists(url.as_str()).await {
+            return Ok(());
         }
 
         let handle = self.rate_limiter.acquire().await;
@@ -103,16 +82,13 @@ impl<T: BlobStore> HttpImporter<T> {
             // TODO proper error handling
             let hash = self.store.import_bytes(bytes).await.unwrap();
 
-            let mut dir = self.indexing_state.write().await;
-
             let mut file_ref = FileRef::new(hash.into(), len);
 
             if let Some(lm) = last_modified {
                 file_ref.timestamp = Some(lm.timestamp() as u32);
             }
 
-            dir.files.insert(url.to_string(), file_ref);
-            std::fs::write(&self.indexing_state_dir_path, dir.to_bytes())?;
+            self.dir.file_put(url.as_str(), file_ref).await?;
         }
         Ok(())
     }

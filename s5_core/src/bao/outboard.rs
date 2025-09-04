@@ -1,4 +1,4 @@
-//! The hash type used by S5 (blake3, 32 bytes)
+//! The bao outboard format used by S5
 //!
 //! Implementation from Iroh (MIT OR Apache-2.0)
 //! https://github.com/n0-computer/
@@ -26,7 +26,7 @@ pub fn compute_outboard(
     size: u64,
     // TODO Implement progress
     _progress: impl Fn(u64) -> std::io::Result<()> + Send + Sync + 'static,
-) -> std::io::Result<(s5_core::Hash, Option<Vec<u8>>)> {
+) -> std::io::Result<(crate::Hash, Option<Vec<u8>>)> {
     use bao_tree::io::sync::CreateOutboard;
     let buf_size = usize::try_from(size).unwrap_or(usize::MAX).min(1024 * 1024);
     let reader = BufReader::with_capacity(buf_size, read);

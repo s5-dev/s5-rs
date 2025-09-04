@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
+bench = false
 name = "s5"
 path = "src/main.rs"
 test = false
-bench = false
 
 [dependencies]
 anyhow = "1.0.99"
@@ -19,8 +19,6 @@ directories = "6.0.0"
 http_importer = { workspace = true }
 rand = "0.9.2"
 s5_node = { workspace = true }
-# TODO remove this dependency and move it to s5_node
-s5_store_sia = { workspace = true }
 tokio = { workspace = true }
 toml = "0.9.5"
 toml_edit = "0.23.4"

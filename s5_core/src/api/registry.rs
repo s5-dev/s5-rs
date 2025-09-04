@@ -1,4 +1,4 @@
-use crate::{Entry, PublicKeyEd25519};
+use crate::Entry;
 
 pub trait RegistryRead: Sync + Send {
     fn registry_get(

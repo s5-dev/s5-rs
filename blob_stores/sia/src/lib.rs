@@ -1,17 +1,35 @@
+mod config;
 mod store;
-mod temp;
 
-pub use store::SiaBlobStore;
+pub use config::SiaStoreConfig;
+pub use store::SiaStore;
 
 use hex::FromHexError;
 use std::string::FromUtf8Error;
 use thiserror::Error;
 
+pub type SiaStoreResult<T, E = Error> = std::result::Result<T, E>;
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    #[error(
+        "renterd config error: disable upload packing in your renterd settings, this is not supported yet"
+    )]
+    RenterdPackingEnabled,
+
+    #[error(
+        "renterd config error: set min shards to 1 in your renterd redundancy settings, erasure coding is not supported by s5 yet"
+    )]
+    RenterdErasureCodingEnabled,
+
+    #[error("host not found on siascan")]
+    HostNotFoundOnSiascan,
+
     #[error("Got HTTP {0} with content '{1}'")]
     HttpFailWithBody(u16, String),
+    #[error("Got unexpected HTTP {0}")]
+    HttpFail(u16),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

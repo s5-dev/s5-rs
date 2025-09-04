@@ -17,10 +17,7 @@ pub struct NodeConfigIdentity {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum NodeConfigStore {
-    SiaRenterd {
-        bucket: String,
-        worker_api_url: String,
-        bus_api_url: String,
-        password: String,
-    },
+    SiaRenterd(s5_store_sia::SiaStoreConfig),
+    Local(s5_store_local::LocalStoreConfig),
+    S3(s5_store_s3::S3StoreConfig),
 }

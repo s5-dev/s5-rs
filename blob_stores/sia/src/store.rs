@@ -1,220 +1,117 @@
 use crate::Error;
-use crate::temp::zen::get_address_for_hostkey;
+use crate::config::SiaStoreConfig;
 use base64::Engine;
 use bytes::Bytes;
-use futures_core::Stream;
+use dashmap::DashMap;
+use futures::{Stream, StreamExt};
 use hex::ToHex;
 use http::{HeaderMap, HeaderValue};
 use hyper::Body;
 use s5_core::blob::location::{BlobLocation, SiaFile, SiaFileHost, SiaFileSlab};
-use s5_core::{BlobStore, Hash};
-use s5_utils::compute_outboard;
+use s5_core::store::{Store, StoreFeatures, StoreResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::{
     io::{self},
     path::PathBuf,
     sync::Arc,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
 const BLOB_CHUNK_SIZE: u64 = 1 << 32;
 
 #[derive(Debug, Clone)]
-pub struct SiaBlobStore {
+pub struct SiaStore {
     pub bucket: String,
     pub worker_object_api_url: String, // usually http://localhost:9980/api/worker/object/
     pub worker_pinned_object_api_url: String,
     pub bus_accounts_fund_api_url: String, // usually http://localhost:9980/api/bus/accounts/fund
     pub bus_hosts_api_url: String,         // usually http://localhost:9980/api/bus/hosts
     pub bus_contracts_api_url: String,
-    pub store_outboard: bool,
     auth_headers: HeaderMap,
     http_client: Arc<hyper::Client<hyper::client::HttpConnector>>,
-    // TODO implement
-    // host_quic_address_cache: DashMap<String, String>,
+
+    network_is_zen: bool,
+    host_quic_address_cache: DashMap<String, Option<String>>,
+    reqwest_client: reqwest::Client,
 }
 
-impl SiaBlobStore {
-    pub fn new(bucket: &str, worker_api_url: &str, bus_api_url: &str, password: &str) -> Self {
+impl SiaStore {
+    pub async fn create(config: SiaStoreConfig) -> StoreResult<Self> {
+        // bucket: &str, worker_api_url: &str, bus_api_url: &str, password: &str
         let mut auth_headers: HeaderMap = HeaderMap::new();
-        let auth_str = base64::engine::general_purpose::STANDARD.encode(format!(":{}", password));
+        let auth_str =
+            base64::engine::general_purpose::STANDARD.encode(format!(":{}", config.password));
         auth_headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Basic {}", auth_str)).unwrap(),
         );
-        Self {
-            bucket: bucket.to_string(),
+
+        let mut store = Self {
+            bucket: config.bucket,
             http_client: Arc::new(hyper::Client::new()),
             auth_headers,
-            worker_object_api_url: format!("{}/object", worker_api_url),
-            worker_pinned_object_api_url: format!("{}/pinned", worker_api_url),
-            bus_hosts_api_url: format!("{}/hosts", bus_api_url),
-            bus_contracts_api_url: format!("{}/contracts", bus_api_url),
-            bus_accounts_fund_api_url: format!("{}/accounts/fund", bus_api_url),
-            store_outboard: true,
-            // TODO implement host_quic_address_cache: DashMap::new(),
+            worker_object_api_url: format!("{}/object", config.worker_api_url),
+            worker_pinned_object_api_url: format!("{}/pinned", config.worker_api_url),
+            bus_hosts_api_url: format!("{}/hosts", config.bus_api_url),
+            bus_contracts_api_url: format!("{}/contracts", config.bus_api_url),
+            bus_accounts_fund_api_url: format!("{}/accounts/fund", config.bus_api_url),
+            network_is_zen: false,
+            host_quic_address_cache: DashMap::new(),
+            reqwest_client: reqwest::Client::new(),
+        };
+
+        let upload_settings_res = store
+            .http_get(&format!("{}/state", config.bus_api_url))
+            .await?;
+        let upload_settings: RenterdBusUploadSettingsRes =
+            serde_json::from_slice(&upload_settings_res)?;
+
+        if upload_settings.packing.enabled {
+            return Err(Error::RenterdPackingEnabled.into());
         }
+        if upload_settings.redundancy.min_shards > 1 {
+            return Err(Error::RenterdPackingEnabled.into());
+        }
+
+        let state_res = store
+            .http_get(&format!("{}/state", config.bus_api_url))
+            .await?;
+        let bus_state: RenterdBusStateRes = serde_json::from_slice(&state_res)?;
+        store.network_is_zen = bus_state.network == "zen";
+
+        Ok(store)
     }
 
-    async fn finalize_import(&self, src: ImportSource) -> Result<(Hash, u64), Error> {
-        let size = src.len()?;
-        let (hash, outboard) = match &src {
-            ImportSource::File(path) => {
-                let file = std::fs::File::open(path)?;
-                compute_outboard(file, size, move |_| Ok(()))?
-            }
-            ImportSource::Memory(bytes) => compute_outboard(bytes.as_ref(), size, |_| Ok(()))?,
-        };
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-
-        if self.store_outboard {
-            if let Some(out) = outboard {
-                self.put_bytes(format!("obao6/{}", encoded), out).await?;
-            }
-        } else {
-            log::debug!("skipping outboard");
-        }
-        log::debug!("uploading blob bytes...");
-
-        match src {
-            ImportSource::File(path) => {
-                if size < BLOB_CHUNK_SIZE {
-                    let file = tokio::fs::File::open(&path).await?;
-                    let stream = ReaderStream::new(file);
-                    self.put_stream(format!("blob3/{}", encoded), stream)
-                        .await?;
-                } else {
-                    let mut offset: u64 = 0;
-                    while offset < size {
-                        let file = std::fs::File::open(&path)?;
-
-                        let mut file = tokio::fs::File::from_std(file);
-
-                        file.seek(io::SeekFrom::Start(offset)).await?;
-
-                        let limited_reader = file.take(BLOB_CHUNK_SIZE);
-
-                        let stream = ReaderStream::new(limited_reader);
-
-                        let res = self
-                            .put_stream(format!("blob3_split/{}/{}", encoded, offset), stream)
-                            .await;
-                        if res.is_ok() {
-                            offset += BLOB_CHUNK_SIZE;
-                        } else {
-                            log::warn!("retry due to error {}", res.unwrap_err());
-                        }
-                    }
-                }
-            }
-            ImportSource::Memory(bytes) => {
-                let path = format!("blob3/{}", encoded);
-                let url = format!(
-                    "{}/{}?bucket={}",
-                    self.worker_object_api_url, path, self.bucket
-                );
-                self.http_req(
-                    http::Method::PUT,
-                    &url,
-                    self.auth_headers.clone(),
-                    Body::from(bytes),
-                )
-                .await?;
-            }
-        };
-
-        Ok((hash, size))
-    }
-
-    async fn put_stream<S>(&self, path: String, stream: S) -> Result<(), Error>
-    where
-        S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
-    {
-        let url = format!(
-            "{}/{}?bucket={}",
-            self.worker_object_api_url, path, self.bucket
-        );
-        let request = {
-            let mut request = http::Request::builder().method(http::Method::PUT).uri(url);
-            for (header, value) in self.auth_headers.iter() {
-                request = request.header(header, value);
-            }
-            request.body(Body::wrap_stream(stream))?
-        };
-        let response = self.http_client.request(request).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text =
-                String::from_utf8(hyper::body::to_bytes(response.into_body()).await?.into())?;
-            return Err(Error::HttpFailWithBody(status, text).into());
-        }
-        Ok(())
-    }
-
-    async fn put_bytes(&self, path: String, bytes: Vec<u8>) -> Result<(), Error> {
-        let url = format!(
-            "{}/{}?bucket={}",
-            self.worker_object_api_url, path, self.bucket
-        );
-        let request = {
-            let mut request = http::Request::builder().method(http::Method::PUT).uri(url);
-            for (header, value) in self.auth_headers.iter() {
-                request = request.header(header, value);
-            }
-            request.body(Body::from(bytes))?
-        };
-        let response = self.http_client.request(request).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text =
-                String::from_utf8(hyper::body::to_bytes(response.into_body()).await?.into())?;
-            return Err(Error::HttpFailWithBody(status, text).into());
-        }
-        Ok(())
-    }
-
-    fn pinned_object_url_for_hash(&self, hash: Hash, offset: Option<u64>) -> String {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-        let object_path = if let Some(offset) = offset {
-            format!("blob3_split/{}/{}", encoded, offset)
-        } else {
-            format!("blob3/{}", encoded)
-        };
-
+    fn pinned_object_url_for_path(&self, path: &str) -> String {
         format!(
             "{}/{}?bucket={}",
-            &self.worker_pinned_object_api_url, object_path, self.bucket
+            &self.worker_pinned_object_api_url, path, self.bucket
         )
     }
+
     async fn http_get(&self, url: &str) -> Result<Bytes, Error> {
         let headers = self.auth_headers.clone();
-        self.http_req(http::Method::GET, url, headers, Body::empty())
+        self.http_req_full(http::Method::GET, url, headers, Body::empty())
             .await
     }
 
     async fn http_post(&self, url: &str, body: Body) -> Result<Bytes, Error> {
         let mut headers = self.auth_headers.clone();
         headers.insert("content-type", HeaderValue::from_str("application/json")?);
-        self.http_req(http::Method::POST, url, headers, body).await
+        self.http_req_full(http::Method::POST, url, headers, body)
+            .await
     }
 
-    async fn http_req(
+    async fn http_req_full(
         &self,
         method: http::Method,
         url: &str,
         headers: HeaderMap,
         body: Body,
     ) -> Result<Bytes, Error> {
-        let request = {
-            let mut request = http::Request::builder().method(method).uri(url);
-            for (header, value) in headers.iter() {
-                request = request.header(header, value);
-            }
-            request.body(body)?
-        };
-        let response = self.http_client.request(request).await?;
+        let response = self.http_req(method, url, headers, body).await?;
+
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text =
@@ -224,62 +121,64 @@ impl SiaBlobStore {
         let body_bytes = hyper::body::to_bytes(response.into_body()).await?;
         Ok(body_bytes)
     }
-    pub async fn provide(&self, hash: Hash) -> Result<Vec<BlobLocation>, Error> {
-        let loc = self.provide_sia_file(hash, None).await;
 
-        return loc.map(|loc| vec![BlobLocation::SiaFile(loc)]);
-        /* if loc.is_ok() {
-            return Ok(vec![BlobLocation::SiaFile(loc?)]);
-        }; */
-
-        let first_chunk_loc = self.provide_sia_file(hash, Some(0)).await;
-
-        if first_chunk_loc.is_err() {
-            return first_chunk_loc.map(|x| vec![BlobLocation::SiaFile(x)]);
-        } else {
-            todo!();
-            /*             let fc = first_chunk_loc.unwrap();
-            let mut offset: u64 = fc.size;
-            let first_chunk = BlobLocation::Slice {
-                offset: 0,
-                length: fc.size,
-                inner: Box::new(BlobLocation::SiaFile(fc)),
-            };
-            let mut chunks = vec![first_chunk];
-            loop {
-                let next_chunk_res = self.provide_sia_file(hash, Some(offset)).await;
-                if next_chunk_res.is_err() {
-                    break;
-                } else {
-                    let file = next_chunk_res.unwrap();
-                    offset = offset + file.size;
-                    chunks.push(BlobLocation::Slice {
-                        offset: offset - file.size,
-                        length: file.size,
-                        inner: Box::new(BlobLocation::SiaFile(file)),
-                    });
-                }
+    async fn http_req(
+        &self,
+        method: http::Method,
+        url: &str,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Result<http::Response<Body>, Error> {
+        let request = {
+            let mut request = http::Request::builder().method(method).uri(url);
+            for (header, value) in headers.iter() {
+                request = request.header(header, value);
             }
-            return Ok(chunks); */
-        }
+            request.body(body)?
+        };
+        Ok(self.http_client.request(request).await?)
     }
 
-    // TODO Implement
-    /*   async fn get_address_for_hostkey(&self, hostkey: &str) -> String {
+    async fn get_address_for_hostkey(&self, hostkey: &str) -> StoreResult<Option<String>> {
         if self.host_quic_address_cache.contains_key(hostkey) {
-            return self
+            return Ok(self
                 .host_quic_address_cache
                 .get(hostkey)
                 .unwrap()
-                .to_string();
+                .to_owned());
         }
-        let res =
-        "".to_owned()
-    } */
-
-    async fn provide_sia_file(&self, hash: Hash, offset: Option<u64>) -> Result<SiaFile, Error> {
         let res = self
-            .http_get(&self.pinned_object_url_for_hash(hash, offset))
+            .reqwest_client
+            .post(if self.network_is_zen {
+                "https://api.siascan.com/hosts?offset=0&limit=1"
+            } else {
+                "https://api.siascan.com/zen/hosts?offset=0&limit=1"
+            })
+            .body(format!("{{\"publicKeys\":[\"{}\"]}}", hostkey))
+            .send()
+            .await?
+            .json::<Vec<SiascanHostRes>>()
+            .await?;
+
+        let mut addr = None;
+
+        if let Some(first) = res.first() {
+            for address in &first.v2_net_addresses {
+                if address.protocol == "quic" {
+                    addr = Some(address.address.to_owned());
+                }
+            }
+        }
+
+        self.host_quic_address_cache
+            .insert(hostkey.to_owned(), addr.clone());
+        Ok(addr)
+        // Err(Error::HostNotFoundOnSiascan.into())
+    }
+
+    async fn provide_sia_file(&self, path: &str) -> StoreResult<SiaFile> {
+        let res = self
+            .http_get(&self.pinned_object_url_for_path(path))
             .await?;
         let o: SiaPinnedObjectRes = serde_json::from_slice(&res)?;
 
@@ -323,7 +222,7 @@ impl SiaBlobStore {
             };
             for shard in &slab.sectors {
                 let hostkey = &shard.host_key;
-                if get_address_for_hostkey(hostkey).is_none() {
+                if self.get_address_for_hostkey(hostkey).await?.is_none() {
                     log::debug!(
                         "host {} does not have web-compatible address, skipping",
                         hostkey
@@ -371,7 +270,9 @@ impl SiaBlobStore {
                         host_id,
                         SiaFileHost {
                             hostkey: hostkey.clone(),
-                            v2_siamux_addresses: vec![get_address_for_hostkey(hostkey).unwrap()],
+                            v2_siamux_addresses: vec![
+                                self.get_address_for_hostkey(hostkey).await?.unwrap(),
+                            ],
                             ephemeral_account_private_key,
                         },
                     );
@@ -399,19 +300,123 @@ impl SiaBlobStore {
     }
 }
 
-impl BlobStore for SiaBlobStore {
-    type Error = crate::Error;
-    async fn contains_hash(&self, _hash: s5_core::Hash) -> bool {
-        todo!()
+#[async_trait::async_trait]
+impl Store for SiaStore {
+    fn features(&self) -> StoreFeatures {
+        StoreFeatures {
+            case_sensitive: false,
+            recommended_max_dir_size: u64::MAX,
+            supports_rename: true,
+        }
+    }
+    async fn exists(&self, path: &str) -> StoreResult<bool> {
+        let headers = self.auth_headers.clone();
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let res = self
+            .http_req(http::Method::HEAD, &url, headers, Body::empty())
+            .await?;
+
+        match res.status().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(Error::HttpFail(status).into()),
+        }
     }
 
-    async fn import_file(&self, path: std::path::PathBuf) -> Result<(Hash, u64), Error> {
-        if !path.is_absolute() {
+    async fn delete(&self, path: &str) -> StoreResult<()> {
+        todo!("implement")
+    }
+
+    async fn rename(&self, old_path: &str, new_path: &str) -> StoreResult<()> {
+        todo!("implement")
+    }
+
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+    ) -> StoreResult<()> {
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let request = {
+            let mut request = http::Request::builder().method(http::Method::PUT).uri(url);
+            for (header, value) in self.auth_headers.iter() {
+                request = request.header(header, value);
+            }
+            request.body(Body::wrap_stream(stream.map(Ok::<_, Infallible>)))?
+        };
+        let response = self.http_client.request(request).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text =
+                String::from_utf8(hyper::body::to_bytes(response.into_body()).await?.into())?;
+            return Err(Error::HttpFailWithBody(status, text).into());
+        }
+        Ok(())
+    }
+
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let request = {
+            let mut request = http::Request::builder().method(http::Method::PUT).uri(url);
+            for (header, value) in self.auth_headers.iter() {
+                request = request.header(header, value);
+            }
+            request.body(Body::from(bytes))?
+        };
+        let response = self.http_client.request(request).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text =
+                String::from_utf8(hyper::body::to_bytes(response.into_body()).await?.into())?;
+            return Err(Error::HttpFailWithBody(status, text).into());
+        }
+        Ok(())
+    }
+
+    async fn open_read_stream(
+        &self,
+        path: &str,
+        offset: u64,
+        max_len: Option<u64>,
+    ) -> StoreResult<Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>> {
+        todo!("implement")
+    }
+
+    async fn open_read_bytes(
+        &self,
+        path: &str,
+        offset: u64,
+        max_len: Option<u64>,
+    ) -> StoreResult<Bytes> {
+        todo!("implement")
+    }
+
+    async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>> {
+        let loc = self.provide_sia_file(path).await?;
+
+        Ok(vec![BlobLocation::SiaFile(loc)])
+    }
+    /*
+    async fn put_file(
+        &self,
+        path: &str,
+        file_path: std::path::PathBuf,
+    ) -> StoreResult<(Hash, u64), Error> {
+        if !file_path.is_absolute() {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "path must be absolute").into(),
             );
         }
-        if !path.is_file() && !path.is_symlink() {
+        if !file_path.is_file() && !file_path.is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "path is not a file or symlink",
@@ -420,26 +425,7 @@ impl BlobStore for SiaBlobStore {
         }
         let src = ImportSource::File(path);
         self.finalize_import(src).await
-    }
-
-    async fn import_bytes(&self, bytes: bytes::Bytes) -> Result<s5_core::Hash, Error> {
-        let src = ImportSource::Memory(bytes);
-
-        let res = self.finalize_import(src).await?;
-        Ok(res.0)
-    }
-    async fn import_stream(
-        &self,
-        data: impl Stream<Item = Bytes> + Send + 'static,
-    ) -> Result<Hash, Error> {
-        todo!();
-
-        // TODO Implement
-        // data.try_next();
-
-        let hash = Hash::from_bytes([0u8; 32]);
-        Ok(hash)
-    }
+    } */
 }
 
 enum ImportSource {
@@ -509,4 +495,43 @@ struct SiaPinnedSlab {
 struct SiaPinnedSector {
     root: String,
     host_key: String,
+}
+
+#[derive(Deserialize)]
+struct RenterdBusStateRes {
+    network: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenterdBusUploadSettingsRes {
+    packing: RenterdBusUploadSettingsPacking,
+    redundancy: RenterdBusUploadSettingsRedundancy,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenterdBusUploadSettingsPacking {
+    enabled: bool,
+    slab_buffer_max_size_soft: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenterdBusUploadSettingsRedundancy {
+    pub min_shards: u8,
+    pub total_shards: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SiascanHostRes {
+    pub v2_net_addresses: Vec<SiascanHostV2NetAddr>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SiascanHostV2NetAddr {
+    pub protocol: String,
+    pub address: String,
 }

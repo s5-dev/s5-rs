@@ -5,7 +5,6 @@ use directories::ProjectDirs;
 use http_importer::HttpImporter;
 use rand::RngCore;
 use s5_node::config::{NodeConfigStore, S5NodeConfig};
-use s5_store_sia::SiaBlobStore;
 use std::{fs, io::Write, path::PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 use tracing::{debug, info};
@@ -127,18 +126,14 @@ async fn main() -> anyhow::Result<()> {
 
             match cli.cmd {
                 Commands::Import { url, concurrency } => {
-                    let store = match config
-                        .store
-                        .get("default")
-                        .context("no default store present in node config")?
-                    {
-                        NodeConfigStore::SiaRenterd {
-                            bucket,
-                            worker_api_url,
-                            bus_api_url,
-                            password,
-                        } => SiaBlobStore::new(bucket, worker_api_url, bus_api_url, password),
-                    };
+                    let store = s5_node::create_store(
+                        config
+                            .store
+                            .get("default")
+                            .context("no default store present in node config")?
+                            .to_owned(),
+                    )
+                    .await?;
 
                     let node_import_state_file = dirs
                         .data_dir()
