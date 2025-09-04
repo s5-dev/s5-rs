@@ -62,7 +62,7 @@ impl SiaStore {
         };
 
         let upload_settings_res = store
-            .http_get(&format!("{}/state", config.bus_api_url))
+            .http_get(&format!("{}/settings/upload", config.bus_api_url))
             .await?;
         let upload_settings: RenterdBusUploadSettingsRes =
             serde_json::from_slice(&upload_settings_res)?;
