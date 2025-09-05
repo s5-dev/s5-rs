@@ -10,7 +10,7 @@ use crate::{
     Hash,
     bao::outboard::compute_outboard,
     blob::location::BlobLocation,
-    store::{Store, StoreResult},
+    store::{Store, StoreFeatures, StoreResult},
 };
 
 #[derive(Debug, Clone)]
@@ -27,23 +27,50 @@ impl BlobStore {
             outboard_store: Some(store),
         }
     }
-    fn path_for_hash(&self, hash: Hash) -> String {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-        format!("blob3/{}", encoded)
+    fn path_for_hash(&self, hash: Hash, features: &StoreFeatures) -> String {
+        let hash_str = if features.case_sensitive {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+        } else {
+            let mut output = Vec::with_capacity(base32_fs::encoded_len(hash.as_bytes().len()));
+            base32_fs::encode(hash.as_bytes(), &mut output);
+            String::from_utf8(output).unwrap()
+        };
+
+        if features.recommended_max_dir_size < 10000 {
+            if features.case_sensitive {
+                format!("{}/{}/{}", &hash_str[0..2], &hash_str[2..4], &hash_str[4..],)
+            } else {
+                format!(
+                    "{}/{}/{}/{}",
+                    &hash_str[0..2],
+                    &hash_str[2..4],
+                    &hash_str[4..6],
+                    &hash_str[6..]
+                )
+            }
+        } else {
+            hash_str
+        }
+    }
+
+    fn blob_path_for_hash(&self, hash: Hash) -> String {
+        format!("blob3/{}", self.path_for_hash(hash, &self.store.features()))
     }
 
     /// returns path for storing the bao outboard metadata for a specific blob hash
     fn obao6_path_for_hash(&self, hash: Hash) -> String {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-        format!("obao6/{}", encoded)
+        format!(
+            "obao6/{}",
+            self.path_for_hash(hash, &self.outboard_store.as_ref().unwrap().features())
+        )
     }
 
     pub async fn contains(&self, hash: Hash) -> StoreResult<bool> {
-        self.store.exists(&self.path_for_hash(hash)).await
+        self.store.exists(&self.blob_path_for_hash(hash)).await
     }
 
     pub async fn provide(&self, hash: Hash) -> StoreResult<Vec<BlobLocation>> {
-        self.store.provide(&self.path_for_hash(hash)).await
+        self.store.provide(&self.blob_path_for_hash(hash)).await
     }
 
     /// Insert an in-memory blob of bytes to the blob store
@@ -64,7 +91,7 @@ impl BlobStore {
 
         // TODO maybe first check if store already contains hash?
         self.store
-            .put_bytes(&self.path_for_hash(hash), bytes)
+            .put_bytes(&self.blob_path_for_hash(hash), bytes)
             .await?;
 
         Ok(hash)
@@ -139,11 +166,15 @@ impl BlobStore {
             hasher.finalize().into()
         };
 
+        if self.store.exists(&self.blob_path_for_hash(hash)).await? {
+            return Ok((hash, size));
+        }
+
         let stream = FramedRead::new(tokio::fs::File::open(path).await?, BytesCodec::new())
             .map(|result| result.unwrap().into());
 
         self.store
-            .put_stream(&self.path_for_hash(hash), Box::new(stream))
+            .put_stream(&self.blob_path_for_hash(hash), Box::new(stream))
             .await?;
 
         Ok((hash, size))
