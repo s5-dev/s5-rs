@@ -93,7 +93,9 @@ impl BlobStore {
         }
         writer.flush().await?;
         drop(writer);
-        self.import_file(temp_path).await
+        let res = self.import_file(temp_path.clone()).await;
+        std::fs::remove_file(temp_path)?;
+        res
     }
 
     //type Error: Sized + Debug + Send + Sync + 'static;
