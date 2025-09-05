@@ -1,0 +1,10 @@
+[package]
+name = "s5_blobs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iroh = { workspace = true }
+log = "0.4.28"
+minicbor = { workspace = true }
+s5_core = { workspace = true }

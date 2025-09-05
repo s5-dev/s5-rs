@@ -4,6 +4,7 @@ members = [
   "blob_stores/local",
   "blob_stores/s3",
   "blob_stores/sia",
+  "s5_blobs",
   "s5_cli",
   "s5_core",
   "s5_node",
@@ -22,6 +23,7 @@ futures = "0.3.31"
 http_importer = { path = "tools/http_importer" }
 iroh = { version = "0.91.1", default-features = false }
 minicbor = { version = "2.0.0", features = ["alloc", "derive", "half"] }
+s5_blobs = { path = "s5_blobs" }
 s5_core = { path = "s5_core" }
 s5_node = { path = "s5_node" }
 s5_store_local = { path = "blob_stores/local" }

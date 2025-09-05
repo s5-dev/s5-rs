@@ -45,8 +45,12 @@ pub async fn run_node(config_file_path: PathBuf, config: S5NodeConfig) -> anyhow
         .bind()
         .await?;
 
+    log::info!("iroh node running with id {}", endpoint.node_id());
+
+    let blobs = s5_blobs::BlobsProtocol::new(store, endpoint.clone());
+
     let router = Router::builder(endpoint)
-        // TODO .accept(iroh_blobs::ALPN, blobs)
+        .accept(s5_blobs::ALPN, blobs)
         .spawn();
 
     tokio::signal::ctrl_c().await?;

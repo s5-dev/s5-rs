@@ -39,7 +39,7 @@ enum Commands {
         #[arg(short, long, value_name = "COUNT", default_value_t = 4)]
         concurrency: usize,
     },
-    /// Start the S5 Node and serve files from the default blob store
+    /// Start the S5 Node and serve all hashes from the default blob store
     Start,
 }
 

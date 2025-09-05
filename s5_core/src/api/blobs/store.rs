@@ -9,6 +9,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use crate::{
     Hash,
     bao::outboard::compute_outboard,
+    blob::location::BlobLocation,
     store::{Store, StoreResult},
 };
 
@@ -39,6 +40,10 @@ impl BlobStore {
 
     pub async fn contains(&self, hash: Hash) -> StoreResult<bool> {
         self.store.exists(&self.path_for_hash(hash)).await
+    }
+
+    pub async fn provide(&self, hash: Hash) -> StoreResult<Vec<BlobLocation>> {
+        self.store.provide(&self.path_for_hash(hash)).await
     }
 
     /// Insert an in-memory blob of bytes to the blob store
