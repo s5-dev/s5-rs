@@ -47,9 +47,11 @@ impl OpenDirV1 {
     }
 
     pub async fn file_put(&self, path: &str, file_ref: FileRef) -> io::Result<()> {
-        let mut inner = self.inner.write().await;
-        // TODO update instead of replace
-        inner.dir.files.insert(path.to_owned(), file_ref);
+        {
+            let mut inner = self.inner.write().await;
+            // TODO update instead of replace
+            inner.dir.files.insert(path.to_owned(), file_ref);
+        }
         self.save().await
     }
 
