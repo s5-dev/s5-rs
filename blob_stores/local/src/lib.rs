@@ -41,19 +41,15 @@ impl s5_core::store::Store for LocalStore {
     async fn put_stream(
         &self,
         path: &str,
-        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+        stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<()> {
         let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
         let mut file = File::create(&full_path).await?;
-        let stream_of_results = stream.map(Ok::<_, std::io::Error>);
-        let mut stream_reader = StreamReader::new(stream_of_results);
-
+        let mut stream_reader = StreamReader::new(stream);
         tokio::io::copy(&mut stream_reader, &mut file).await?;
-
         Ok(())
     }
 
@@ -87,7 +83,8 @@ impl s5_core::store::Store for LocalStore {
         path: &str,
         offset: u64,
         max_len: Option<u64>,
-    ) -> StoreResult<Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>> {
+    ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>
+    {
         let full_path = self.resolve_path(path)?;
         let mut file = File::open(&full_path).await?;
 
@@ -101,7 +98,9 @@ impl s5_core::store::Store for LocalStore {
             Box::new(file)
         };
 
-        todo!()
+        let stream = ReaderStream::new(reader);
+
+        Ok(Box::new(stream))
     }
 
     async fn open_read_bytes(
