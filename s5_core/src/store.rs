@@ -11,7 +11,7 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     async fn put_stream(
         &self,
         path: &str,
-        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+        stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<PutResponse>;
 
     fn features(&self) -> StoreFeatures;
@@ -25,7 +25,7 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
         path: &str,
         offset: u64,
         max_len: Option<u64>,
-    ) -> StoreResult<Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>>;
+    ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>;
 
     async fn open_read_bytes(
         &self,

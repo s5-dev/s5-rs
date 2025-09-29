@@ -1,12 +1,13 @@
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures::Stream;
-use s3::{Bucket, Region, creds::Credentials, error::S3Error};
+use s3::{Bucket, Region, creds::Credentials};
 use s5_core::{
     blob::location::BlobLocation,
     store::{StoreFeatures, StoreResult},
 };
 use std::u64;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct S3StoreConfig {
@@ -42,6 +43,7 @@ impl S3Store {
         )
         .unwrap()
         .with_path_style();
+        s3::set_retries(5);
         Self { bucket }
     }
 }
@@ -51,13 +53,16 @@ impl s5_core::store::Store for S3Store {
     async fn put_stream(
         &self,
         path: &str,
-        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+        stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<()> {
-        todo!("implement")
+        let mut reader = StreamReader::new(stream);
+        self.bucket.put_object_stream(&mut reader, path).await?;
+        Ok(())
     }
 
     async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
-        todo!("implement")
+        self.bucket.put_object(path, &bytes).await?;
+        Ok(())
     }
 
     fn features(&self) -> StoreFeatures {
@@ -82,8 +87,24 @@ impl s5_core::store::Store for S3Store {
         path: &str,
         offset: u64,
         max_len: Option<u64>,
-    ) -> StoreResult<Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>> {
-        todo!()
+    ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>
+    {
+        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+
+        let bucket = self.bucket.clone();
+        let path = path.to_owned();
+        tokio::spawn(async move {
+            let _ = bucket
+                .get_object_range_to_writer(
+                    path,
+                    offset,
+                    max_len.map(|len| len - offset - 1),
+                    &mut writer,
+                )
+                .await;
+        });
+
+        Ok(Box::new(ReaderStream::new(reader)))
     }
 
     async fn open_read_bytes(
@@ -92,7 +113,11 @@ impl s5_core::store::Store for S3Store {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
-        todo!()
+        let res = self
+            .bucket
+            .get_object_range(path, offset, max_len.map(|len| len - offset - 1))
+            .await?;
+        Ok(res.into_bytes())
     }
 
     async fn delete(&self, path: &str) -> StoreResult<()> {
@@ -100,7 +125,7 @@ impl s5_core::store::Store for S3Store {
         Ok(())
     }
 
-    async fn rename(&self, old_path: &str, new_path: &str) -> StoreResult<()> {
+    async fn rename(&self, _: &str, _: &str) -> StoreResult<()> {
         panic!("not supported by this store")
     }
 
