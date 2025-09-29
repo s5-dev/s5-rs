@@ -3,22 +3,17 @@ use crate::config::SiaStoreConfig;
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use futures::stream::TryStreamExt;
 use hex::ToHex;
 use http::{HeaderMap, HeaderValue};
 use hyper::Body;
+use hyper::body::HttpBody;
 use s5_core::blob::location::{BlobLocation, SiaFile, SiaFileHost, SiaFileSlab};
 use s5_core::store::{Store, StoreFeatures, StoreResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::convert::Infallible;
-use std::{
-    io::{self},
-    path::PathBuf,
-    sync::Arc,
-};
-
-const BLOB_CHUNK_SIZE: u64 = 1 << 32;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct SiaStore {
@@ -28,6 +23,7 @@ pub struct SiaStore {
     pub bus_accounts_fund_api_url: String, // usually http://localhost:9980/api/bus/accounts/fund
     pub bus_hosts_api_url: String,         // usually http://localhost:9980/api/bus/hosts
     pub bus_contracts_api_url: String,
+    pub bus_objects_rename_api_url: String,
     auth_headers: HeaderMap,
     http_client: Arc<hyper::Client<hyper::client::HttpConnector>>,
 
@@ -47,22 +43,25 @@ impl SiaStore {
             HeaderValue::from_str(&format!("Basic {}", auth_str)).unwrap(),
         );
 
+        let worker_api_url = config.worker_api_url;
+        let bus_api_url = config.bus_api_url;
         let mut store = Self {
             bucket: config.bucket,
             http_client: Arc::new(hyper::Client::new()),
             auth_headers,
-            worker_object_api_url: format!("{}/object", config.worker_api_url),
-            worker_pinned_object_api_url: format!("{}/pinned", config.worker_api_url),
-            bus_hosts_api_url: format!("{}/hosts", config.bus_api_url),
-            bus_contracts_api_url: format!("{}/contracts", config.bus_api_url),
-            bus_accounts_fund_api_url: format!("{}/accounts/fund", config.bus_api_url),
+            worker_object_api_url: format!("{worker_api_url}/object"),
+            worker_pinned_object_api_url: format!("{worker_api_url}/pinned"),
+            bus_hosts_api_url: format!("{bus_api_url}/hosts"),
+            bus_contracts_api_url: format!("{bus_api_url}/contracts"),
+            bus_accounts_fund_api_url: format!("{bus_api_url}/accounts/fund"),
+            bus_objects_rename_api_url: format!("{bus_api_url}/objects/rename"),
             network_is_zen: false,
             host_quic_address_cache: DashMap::new(),
             reqwest_client: reqwest::Client::new(),
         };
 
         let upload_settings_res = store
-            .http_get(&format!("{}/settings/upload", config.bus_api_url))
+            .http_get(&format!("{bus_api_url}/settings/upload"))
             .await?;
         let upload_settings: RenterdBusUploadSettingsRes =
             serde_json::from_slice(&upload_settings_res)?;
@@ -74,9 +73,7 @@ impl SiaStore {
             return Err(Error::RenterdPackingEnabled.into());
         }
 
-        let state_res = store
-            .http_get(&format!("{}/state", config.bus_api_url))
-            .await?;
+        let state_res = store.http_get(&format!("bus_api_url/state")).await?;
         let bus_state: RenterdBusStateRes = serde_json::from_slice(&state_res)?;
         store.network_is_zen = bus_state.network == "zen";
 
@@ -193,16 +190,6 @@ impl SiaStore {
             })
             .collect();
 
-        /* let api_hosts_res = self.http_get(&self.bus_hosts_api_url).await?;
-        let api_hosts_res: Vec<SiaRenterdBusApiHost> = serde_json::from_slice(&api_hosts_res)?;
-        let api_hosts: BTreeMap<String, Option<String>> = api_hosts_res
-            .into_iter()
-            .map(|x| {
-                let address = get_address_for_hostkey(&x.public_key);
-                (x.public_key, address)
-            })
-            .collect(); */
-
         let first_slab = &o.slabs[0];
 
         let planned_u_sc_per_byte: f64 = 3.07e-3 * 1.0; // TODO adjust multiplier to make full file download possible?
@@ -298,6 +285,22 @@ impl SiaStore {
 
         Ok(loc)
     }
+    fn auth_with_range_header(&self, offset: u64, max_len: Option<u64>) -> StoreResult<HeaderMap> {
+        let mut headers = self.auth_headers.clone();
+        if offset > 0 {
+            headers.insert(
+                "Range",
+                if let Some(max_len) = max_len {
+                    format!("bytes={offset}-{}", max_len - offset - 1)
+                } else {
+                    format!("bytes={offset}-",)
+                }
+                .try_into()?,
+            );
+        }
+
+        Ok(headers)
+    }
 }
 
 #[async_trait::async_trait]
@@ -327,17 +330,47 @@ impl Store for SiaStore {
     }
 
     async fn delete(&self, path: &str) -> StoreResult<()> {
-        todo!("implement")
+        let headers = self.auth_headers.clone();
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let res = self
+            .http_req(http::Method::DELETE, &url, headers, Body::empty())
+            .await?;
+        match res.status().as_u16() {
+            200 => Ok(()),
+            status => Err(Error::HttpFail(status).into()),
+        }
     }
 
     async fn rename(&self, old_path: &str, new_path: &str) -> StoreResult<()> {
-        todo!("implement")
+        let headers = self.auth_headers.clone();
+        let req = SiaRenterdBusObjectsRenameRequest {
+            bucket: self.bucket.to_owned(),
+            from: old_path.to_owned(),
+            to: new_path.to_owned(),
+            mode: "single".to_owned(),
+            force: false,
+        };
+        let res = self
+            .http_req(
+                http::Method::POST,
+                &self.bus_objects_rename_api_url,
+                headers,
+                Body::from(serde_json::to_string(&req)?),
+            )
+            .await?;
+        match res.status().as_u16() {
+            200 => Ok(()),
+            status => Err(Error::HttpFail(status).into()),
+        }
     }
 
     async fn put_stream(
         &self,
         path: &str,
-        stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+        stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<()> {
         let url = format!(
             "{}/{}?bucket={}",
@@ -348,7 +381,7 @@ impl Store for SiaStore {
             for (header, value) in self.auth_headers.iter() {
                 request = request.header(header, value);
             }
-            request.body(Body::wrap_stream(stream.map(Ok::<_, Infallible>)))?
+            request.body(Body::wrap_stream(stream))?
         };
         let response = self.http_client.request(request).await?;
         if !response.status().is_success() {
@@ -387,8 +420,27 @@ impl Store for SiaStore {
         path: &str,
         offset: u64,
         max_len: Option<u64>,
-    ) -> StoreResult<Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>> {
-        todo!("implement")
+    ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>
+    {
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let res = self
+            .http_req(
+                http::Method::GET,
+                &url,
+                self.auth_with_range_header(offset, max_len)?,
+                Body::empty(),
+            )
+            .await?;
+
+        if !res.status().is_success() {
+            return Err(Error::HttpFail(res.status().as_u16()).into());
+        }
+        let body = res.into_body().into_stream();
+        let stream = body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        Ok(Box::new(stream))
     }
 
     async fn open_read_bytes(
@@ -397,48 +449,29 @@ impl Store for SiaStore {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
-        todo!("implement")
+        let url = format!(
+            "{}/{}?bucket={}",
+            self.worker_object_api_url, path, self.bucket
+        );
+        let res = self
+            .http_req(
+                http::Method::GET,
+                &url,
+                self.auth_with_range_header(offset, max_len)?,
+                Body::empty(),
+            )
+            .await?;
+
+        match res.status().as_u16() {
+            200 => Ok(res.collect().await?.to_bytes()),
+            status => Err(Error::HttpFail(status).into()),
+        }
     }
 
     async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>> {
         let loc = self.provide_sia_file(path).await?;
 
         Ok(vec![BlobLocation::SiaFile(loc)])
-    }
-    /*
-    async fn put_file(
-        &self,
-        path: &str,
-        file_path: std::path::PathBuf,
-    ) -> StoreResult<(Hash, u64), Error> {
-        if !file_path.is_absolute() {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "path must be absolute").into(),
-            );
-        }
-        if !file_path.is_file() && !file_path.is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path is not a file or symlink",
-            )
-            .into());
-        }
-        let src = ImportSource::File(path);
-        self.finalize_import(src).await
-    } */
-}
-
-enum ImportSource {
-    File(PathBuf),
-    Memory(Bytes),
-}
-
-impl ImportSource {
-    fn len(&self) -> io::Result<u64> {
-        match self {
-            Self::File(path) => std::fs::metadata(path).map(|m| m.len()),
-            Self::Memory(data) => Ok(data.len() as u64),
-        }
     }
 }
 
@@ -450,12 +483,13 @@ struct SiaRenterdBusApiFundRequest {
     contract_id: String,
     amount: String,
 }
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SiaRenterdBusApiHost {
-    // public_key: String,
-    // v2_siamux_addresses: Vec<String>,
+#[derive(Serialize)]
+struct SiaRenterdBusObjectsRenameRequest {
+    bucket: String,
+    from: String,
+    to: String,
+    mode: String,
+    force: bool,
 }
 
 #[derive(Deserialize)]
@@ -486,7 +520,7 @@ struct SiaPinnedSlab {
     encryption_key: [u8; 32],
     min_shards: u8,
     sectors: Vec<SiaPinnedSector>,
-    offset: u32,
+    // offset: u32,
     length: u32,
 }
 
@@ -513,14 +547,14 @@ struct RenterdBusUploadSettingsRes {
 #[serde(rename_all = "camelCase")]
 struct RenterdBusUploadSettingsPacking {
     enabled: bool,
-    slab_buffer_max_size_soft: u64,
+    // slab_buffer_max_size_soft: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenterdBusUploadSettingsRedundancy {
     pub min_shards: u8,
-    pub total_shards: u16,
+    // pub total_shards: u16,
 }
 
 #[derive(Deserialize)]
