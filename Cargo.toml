@@ -7,6 +7,7 @@ members = [
   "s5_blobs",
   "s5_cli",
   "s5_core",
+  "s5_fs",
   "s5_node",
   "tools/http_importer",
 ]
@@ -21,7 +22,10 @@ blake3 = { version = "1.8.2", features = [
 bytes = { version = "1.10.1" }
 futures = "0.3.31"
 http_importer = { path = "tools/http_importer" }
-iroh = { version = "0.91.1", default-features = false }
+iroh = { version = "0.92.0" }
+iroh-blobs = { version = "0.94.0" }
+irpc = "0.8.0"
+log = "0.4.28"
 minicbor = { version = "2.0.0", features = ["alloc", "derive", "half"] }
 s5_blobs = { path = "s5_blobs" }
 s5_core = { path = "s5_core" }
@@ -30,6 +34,8 @@ s5_store_local = { path = "blob_stores/local" }
 s5_store_s3 = { path = "blob_stores/s3" }
 s5_store_sia = { path = "blob_stores/sia" }
 serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.15", features = ["io"] }
+tracing = "0.1.41"
 

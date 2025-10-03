@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 iroh = { workspace = true }
-iroh-blobs = { version = "0.91.0" }
+iroh-blobs = { workspace = true }
 log = "0.4.28"
 s5_blobs = { workspace = true }
 s5_core = { workspace = true }

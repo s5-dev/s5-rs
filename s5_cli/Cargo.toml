@@ -18,6 +18,7 @@ clap-verbosity-flag = { version = "3.0.4", default-features = false, features = 
 directories = "6.0.0"
 http_importer = { workspace = true }
 rand = "0.9.2"
+s5_core.workspace = true
 s5_node = { workspace = true }
 tokio = { workspace = true }
 toml = "0.9.5"

@@ -1,14 +1,11 @@
 mod bao;
 mod cbor;
-mod fs;
 mod hash;
 mod registry;
-mod stream;
+pub mod stream;
 
-pub use fs::dir::DirRef;
-pub use fs::dir::DirV1;
-pub use fs::dir::FileRef;
-pub use fs::dir::OpenDirV1;
+pub use registry::RedbRegistry;
+
 
 pub mod api;
 pub mod blob;
@@ -18,7 +15,7 @@ pub use api::blobs::store::BlobStore;
 pub use blob::identifier::BlobId;
 pub use hash::Hash;
 
-pub use registry::Entry;
-pub use stream::Message;
+pub use stream::StreamKey;
+pub use stream::StreamMessage;
 
 pub type PublicKeyEd25519 = [u8; 32];

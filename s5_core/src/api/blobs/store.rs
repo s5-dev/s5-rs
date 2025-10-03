@@ -69,8 +69,35 @@ impl BlobStore {
         self.store.exists(&self.blob_path_for_hash(hash)).await
     }
 
+    pub async fn contains_obao6(&self, hash: Hash) -> StoreResult<bool> {
+        if let Some(obao_store) = &self.outboard_store {
+            obao_store.exists(&&self.obao6_path_for_hash(hash)).await
+        } else {
+            Ok(false)
+        }
+    }
+
     pub async fn provide(&self, hash: Hash) -> StoreResult<Vec<BlobLocation>> {
         self.store.provide(&self.blob_path_for_hash(hash)).await
+    }
+
+    pub async fn provide_obao6(&self, hash: Hash) -> StoreResult<Vec<BlobLocation>> {
+        if let Some(obao_store) = &self.outboard_store {
+            obao_store.provide(&&self.obao6_path_for_hash(hash)).await
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    pub async fn read_as_bytes(
+        &self,
+        hash: Hash,
+        offset: u64,
+        max_len: Option<u64>,
+    ) -> StoreResult<Bytes> {
+        self.store
+            .open_read_bytes(&self.blob_path_for_hash(hash), offset, max_len)
+            .await
     }
 
     /// Insert an in-memory blob of bytes to the blob store
@@ -108,7 +135,7 @@ impl BlobStore {
     /// the temporary file is cleaned up.
     pub async fn import_stream(
         &self,
-        mut stream: Box<dyn Stream<Item = Bytes> + Send + Unpin + 'static>,
+        mut stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<(Hash, u64)> {
         let temp_path: PathBuf = std::env::temp_dir()
             .join("s5_import")
@@ -116,7 +143,7 @@ impl BlobStore {
         std::fs::create_dir_all(temp_path.parent().unwrap())?;
         let mut writer = tokio::fs::File::create(&temp_path).await?;
         while let Some(chunk) = stream.next().await {
-            writer.write_all(&chunk).await?;
+            writer.write_all(&chunk?).await?;
         }
         writer.flush().await?;
         drop(writer);
@@ -171,7 +198,7 @@ impl BlobStore {
         }
 
         let stream = FramedRead::new(tokio::fs::File::open(path).await?, BytesCodec::new())
-            .map(|result| result.unwrap().into());
+            .map(|result| result.map(|b| b.into()));
 
         self.store
             .put_stream(&self.blob_path_for_hash(hash), Box::new(stream))

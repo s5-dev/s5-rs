@@ -10,7 +10,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalStoreConfig {
-    base_path: String,
+    pub base_path: String,
 }
 
 #[derive(Debug, Clone)]
