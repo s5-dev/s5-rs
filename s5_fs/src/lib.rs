@@ -14,7 +14,7 @@
 mod actor;
 mod api;
 mod context;
-mod dir;
+pub mod dir;
 
 pub use api::FS5;
 pub use context::DirContext;

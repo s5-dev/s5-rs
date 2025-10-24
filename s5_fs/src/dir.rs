@@ -17,40 +17,52 @@ pub struct DirV1 {
     pub dirs: BTreeMap<String, DirRef>,
     #[n(3)]
     pub files: BTreeMap<String, FileRef>,
+    // TODO: Serialize only when non-empty
+    #[n(4)]
+    pub shards: BTreeMap<u8, DirRef>,
 }
 
 impl DirV1 {
+    /// Creates an empty directory snapshot with default header.
     pub fn new() -> Self {
         Self {
             magic: "S5.pro".to_string(),
             header: DirHeader::new(),
             dirs: BTreeMap::new(),
             files: BTreeMap::new(),
+            shards: BTreeMap::new(),
         }
     }
+    /// Creates a directory preconfigured for static web apps.
     pub fn new_web_app() -> Self {
         Self {
             magic: "S5.pro/web".to_string(),
             header: DirHeader {
+                shard_level: None,
                 try_files: Some(vec!["index.html".to_string()]),
                 error_pages: None,
+                random_id: None,
                 // extra: Extra::new(),
             },
             dirs: BTreeMap::new(),
             files: BTreeMap::new(),
+            shards: BTreeMap::new(),
         }
     }
     /* pub fn open<P: AsRef<Path>>(path: P) -> io::Result<OpenDirV1> {
         OpenDirV1::open(path)
     } */
 
+    /// Decodes a directory from CBOR bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<DirV1, minicbor::decode::Error> {
         minicbor::decode(bytes)
     }
 
+    /// Encodes this directory to a CBOR `Vec<u8>`.
     pub fn to_vec(&self) -> Result<Vec<u8>, minicbor::encode::Error<Infallible>> {
         minicbor::to_vec(self)
     }
+    /// Encodes this directory to CBOR as a `Bytes` buffer.
     pub fn to_bytes(&self) -> Result<Bytes, minicbor::encode::Error<Infallible>> {
         Ok(self.to_vec()?.into())
     }
@@ -59,17 +71,27 @@ impl DirV1 {
 #[derive(Encode, Decode, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct DirHeader {
+    #[n(0x4)]
+    pub shard_level: Option<u8>,
+
     #[n(6)]
     try_files: Option<Vec<String>>,
     #[n(14)]
     error_pages: Option<BTreeMap<u16, String>>,
+
+    #[n(0xff)]
+    #[cbor(with = "minicbor::bytes")]
+    pub random_id: Option<[u8; 16]>,
 }
 
 impl DirHeader {
+    /// Creates a default header (no sharding, no hints).
     pub fn new() -> Self {
         Self {
+            shard_level: None,
             error_pages: None,
             try_files: None,
+            random_id: None,
         }
     }
 }
@@ -107,6 +129,7 @@ pub enum DirRefType {
 }
 
 impl DirRef {
+    /// Creates a `DirRef` that points to a directory by Blake3 hash.
     pub fn from_hash(hash: Hash) -> Self {
         Self {
             // link: DirLink::FixedHashBlake3(hash),
@@ -119,14 +142,42 @@ impl DirRef {
             keys: None,
         }
     }
+
+    pub(crate) fn new_empty() -> Self {
+        // let dir = DirV1::new();
+        // let hash = blake3::hash(&dir.to_vec().unwrap());
+        Self {
+            // link: DirLink::FixedHashBlake3(hash),
+            ref_type: DirRefType::Blake3Hash,
+            hash: [0; 32],
+            ts_seconds: None,
+            ts_nanos: None,
+            extra: None,
+            encryption_type: None,
+            keys: None,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[cbor(index_only)]
+pub enum FileRefType {
+    #[n(0x00)]
+    InlineBlob = 0x00,
+    #[n(0x03)]
+    Blake3Hash = 0x03,
+    #[n(0x11)]
+    RegistryKey = 0x11,
 }
 
 #[derive(Encode, Decode, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct FileRef {
+    #[n(0)]
+    pub ref_type: FileRefType,
     #[n(1)]
-    #[cbor(with = "minicbor::bytes")]
-    pub hash: [u8; 32],
+    pub hash: ByteVec,
     #[n(2)]
     pub size: u64,
     #[n(3)]
@@ -169,9 +220,27 @@ pub struct WebArchiveMetadata {
 }
 
 impl FileRef {
+    /// Creates an inline-blob `FileRef` storing data directly in metadata.
+    /// Suitable for very small blobs; large blobs should use the blob store.
+    pub fn new_inline_blob(blob: Bytes) -> Self {
+        Self {
+            ref_type: FileRefType::InlineBlob,
+            hash: ByteVec::from(blob.to_vec()),
+            size: blob.len() as u64,
+            media_type: None,
+            timestamp: None,
+            timestamp_subsec_nanos: None,
+            locations: None,
+            extra: None,
+            prev: None,
+            warc: None,
+        }
+    }
+    /// Creates a hashed `FileRef` referencing content by Blake3 `hash` and `size`.
     pub fn new(hash: Hash, size: u64) -> Self {
         Self {
-            hash: hash.into(),
+            ref_type: FileRefType::Blake3Hash,
+            hash: ByteVec::from(hash.as_bytes().to_vec()),
             size,
             media_type: None,
             timestamp: None,
@@ -192,6 +261,9 @@ impl From<s5_core::BlobId> for FileRef {
 
 impl Into<s5_core::BlobId> for FileRef {
     fn into(self) -> s5_core::BlobId {
-        s5_core::BlobId::new(self.hash.into(), self.size)
+        s5_core::BlobId::new(
+            Hash::from_bytes(self.hash[0..32].try_into().expect("expected 32-byte Blake3 hash")),
+            self.size,
+        )
     }
 }

@@ -5,17 +5,20 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 chacha20poly1305 = "0.10.1"
 chrono = "0.4.42"
 dashmap = "6.1.0"
 fs4 = "0.13.1"
+futures.workspace = true
 log.workspace = true
 minicbor = { workspace = true }
 s5_core.workspace = true
 s5_store_local.workspace = true
 tempfile = "3.10.1"
 tokio.workspace = true
+tracing.workspace = true
+zeroize = "1.7"
 
 [dev-dependencies]
-blake3 = "1.5.1"

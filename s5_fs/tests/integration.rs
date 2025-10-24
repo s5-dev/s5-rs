@@ -17,6 +17,7 @@
 
 use s5_fs::{DirContext, FS5, FileRef};
 use tempfile::tempdir;
+use bytes::Bytes;
 
 #[tokio::test]
 async fn full_test() {
@@ -46,7 +47,7 @@ async fn full_test() {
     );
 
     // Test file_put to add a file to the root directory
-    fs.file_put("root_file.txt", file_ref.clone()).await;
+    fs.file_put("root_file.txt", file_ref.clone()).await.unwrap();
 
     // Test file_exists on an existing file
     assert!(
@@ -61,8 +62,8 @@ async fn full_test() {
         .expect("file_get should return the file we just put");
 
     assert_eq!(
-        retrieved_file.hash,
-        *file_hash.as_bytes(),
+        retrieved_file.hash.as_slice(),
+        file_hash.as_bytes(),
         "Retrieved file hash does not match original"
     );
     assert_eq!(
@@ -80,7 +81,8 @@ async fn full_test() {
 
     // Put a file inside the new encrypted directory.
     fs.file_put("secret/secret_file.txt", file_ref.clone())
-        .await;
+        .await
+        .unwrap();
 
     // Retrieve the file from the encrypted directory. The decryption should be transparent.
     let retrieved_secret_file = fs
@@ -90,8 +92,8 @@ async fn full_test() {
 
     // Verify the metadata of the decrypted file.
     assert_eq!(
-        retrieved_secret_file.hash,
-        *file_hash.as_bytes(),
+        retrieved_secret_file.hash.as_slice(),
+        file_hash.as_bytes(),
         "Decrypted file hash does not match original"
     );
     assert_eq!(
@@ -104,7 +106,8 @@ async fn full_test() {
 
     // First, place a file at a path that will later become a directory.
     fs.file_put("to_be_migrated/another_file.txt", another_file_ref.clone())
-        .await;
+        .await
+        .unwrap();
     assert!(
         fs.file_exists("to_be_migrated/another_file.txt").await,
         "File should exist before directory creation"
@@ -122,8 +125,8 @@ async fn full_test() {
         .expect("File should be accessible after migration into new directory");
 
     assert_eq!(
-        migrated_file.hash,
-        *another_file_hash.as_bytes(),
+        migrated_file.hash.as_slice(),
+        another_file_hash.as_bytes(),
         "Migrated file hash does not match"
     );
 
@@ -146,4 +149,69 @@ async fn full_test() {
             .is_some()
     );
     assert!(fs.file_get("non_existent_file.txt").await.is_none());
+}
+
+#[tokio::test]
+async fn sharding_basic_persists() {
+    let temp_dir = tempdir().expect("tmp");
+    let ctx = DirContext::open_local_root(temp_dir.path()).expect("ctx");
+    let fs = FS5::open(ctx);
+
+    // Create many small files to grow metadata
+    for i in 0..3000u32 {
+        let name = format!("bulk/{}.txt", i);
+        let fr = FileRef::new_inline_blob(Bytes::from_static(b"x"));
+        fs.file_put(&name, fr).await.unwrap();
+    }
+    fs.save().await.unwrap();
+
+    // Spot check a few entries
+    assert!(fs.file_exists("bulk/0.txt").await);
+    assert!(fs.file_exists("bulk/1024.txt").await);
+    assert!(fs.file_exists("bulk/2999.txt").await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn encrypted_round_trip() {
+    let temp_dir = tempdir().expect("tmp");
+    let base = temp_dir.path().to_path_buf();
+
+    {
+        let ctx = DirContext::open_local_root(&base).expect("ctx");
+        let fs = FS5::open(ctx);
+        fs.create_dir("enc", true).await.unwrap();
+        fs.file_put_sync("enc/one.txt", FileRef::new_inline_blob(Bytes::from_static(b"1")))
+            .await
+            .unwrap();
+        fs.save().await.unwrap();
+    }
+
+    // Re-open and read back
+    let ctx2 = DirContext::open_local_root(&base).expect("ctx2");
+    let fs2 = FS5::open(ctx2);
+    assert!(fs2.file_exists("enc/one.txt").await);
+}
+
+#[tokio::test]
+async fn concurrency_ordering_smoke() {
+    let temp_dir = tempdir().expect("tmp");
+    let ctx = DirContext::open_local_root(temp_dir.path()).expect("ctx");
+    let fs = FS5::open(ctx);
+
+    let mut handles = vec![];
+    for i in 0..20u32 {
+        let fs_i = fs.clone();
+        handles.push(tokio::spawn(async move {
+            let path = format!("c/t{}.txt", i);
+            fs_i
+                .file_put_sync(&path, FileRef::new_inline_blob(Bytes::from_static(b"v")))
+                .await
+                .unwrap();
+            fs_i.file_get(&path).await.is_some()
+        }));
+    }
+    for h in handles {
+        assert!(h.await.unwrap());
+    }
 }

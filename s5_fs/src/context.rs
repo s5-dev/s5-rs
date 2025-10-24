@@ -1,9 +1,9 @@
 //! Defines the context for a directory actor, including its storage and parent link.
 
 use crate::{
+    FSResult,
     actor::DirActorHandle,
     dir::{DirRef, DirV1},
-    FSResult,
 };
 use anyhow::Context;
 use dashmap::DashMap;
@@ -11,6 +11,12 @@ use fs4::fs_std::FileExt;
 use s5_core::{BlobStore, RedbRegistry, StreamKey};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::{collections::BTreeMap, fs::OpenOptions, path::Path, sync::Arc};
+use zeroize::Zeroize;
+
+/// Placeholder signing key type for registry updates.
+/// TODO implement
+#[derive(Clone, Debug)]
+pub struct SigningKey(pub [u8; 32]);
 
 /// The context required for a `DirActor` to operate.
 ///
@@ -29,7 +35,7 @@ pub enum DirContextParentLink {
     /// The directory is a child of another directory, identified by a registry key.
     RegistryKey {
         public_key: StreamKey,
-        signing_key: Option<()>,
+        signing_key: Option<SigningKey>,
     },
     /// The directory is the root of a local file system, backed by a file.
     LocalFile {
@@ -38,21 +44,34 @@ pub enum DirContextParentLink {
     },
     /// The directory is a child of another directory, accessed via an actor handle.
     DirHandle {
-        self_path: String,
+        path: DirHandlePath,
         handle: DirActorHandle,
         initial_hash: [u8; 32],
+        shard_level: u8,
     },
 }
 
+// TODO(perf): Avoid cloning; consider using an interner or lightweight ID index
+#[derive(Clone, Debug)]
+pub enum DirHandlePath {
+    Path(String),
+    Shard(u8),
+}
+
 impl DirContext {
-    /// Opens a local file system root directory.
+    /// Opens a local file system root under `path`.
+    ///
+    /// - Creates `root.fs5.cbor` if missing and locks it for exclusive access.
+    /// - Initializes a local blob store and registry co-located with `path`.
     pub fn open_local_root<P: AsRef<Path>>(path: P) -> FSResult<Self> {
         let path = path.as_ref().to_path_buf();
         let root_file = path.join("root.fs5.cbor");
 
-        if !std::fs::exists(&root_file)? {
+        if !root_file.exists() {
             std::fs::create_dir_all(
-                root_file.parent().context("path cannot be the root directory")?,
+                root_file
+                    .parent()
+                    .context("path cannot be the root directory")?,
             )?;
             std::fs::write(&root_file, DirV1::new().to_bytes()?)?;
         }
@@ -70,12 +89,12 @@ impl DirContext {
                 file,
                 path: root_file,
             },
-            BlobStore::new(Box::new(meta_store)),
+            BlobStore::new(meta_store),
             registry,
         ))
     }
 
-    /// Creates a new `DirContext`.
+    /// Creates a new `DirContext` with provided parent link, meta store, and registry.
     pub fn new(
         link: DirContextParentLink,
         meta_blob_store: BlobStore,
@@ -91,7 +110,10 @@ impl DirContext {
         }
     }
 
-    /// Creates a new context for a child directory, inheriting properties from the parent.
+    /// Derives a child directory context from this context and a `dir_ref`.
+    ///
+    /// - Inherits encryption type and keys, merging any keys in `dir_ref`.
+    /// - Shares the blob store and registry handles.
     pub fn with_new_ref(&self, dir_ref: &DirRef, link: DirContextParentLink) -> Self {
         let mut new_context = Self {
             encryption_type: dir_ref.encryption_type.or(self.encryption_type),
@@ -109,5 +131,13 @@ impl DirContext {
             }
         }
         new_context
+    }
+}
+
+impl Drop for DirContext {
+    fn drop(&mut self) {
+        for v in self.keys.values_mut() {
+            v.zeroize();
+        }
     }
 }
