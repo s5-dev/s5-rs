@@ -149,17 +149,7 @@ async fn main() -> anyhow::Result<()> {
                             )?;
                             importer.import_path(path).await?;
                         }
-
-                    let node_import_state_file = dirs
-                        .data_dir()
-                        .join("nodes")
-                        .join(&cli.node)
-                        .join("import_state.fs5.cbor");
-
-                    let http_importer =
-                        HttpImporter::new(node_import_state_file, store, concurrency);
-                    http_importer.import_url(url.parse()?).await?;
-                }
+                    }},
                 Commands::Start => {
                     s5_node::run_node(node_config_file, config).await?;
                 }

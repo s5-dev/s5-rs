@@ -5,6 +5,7 @@ members = [
   "blob_stores/memory",
   "blob_stores/s3",
   "blob_stores/sia",
+  "importers/local",
   "s5_blobs",
   "s5_cli",
   "s5_core",
@@ -31,6 +32,7 @@ log = "0.4.28"
 minicbor = { version = "2.1.1", features = ["alloc", "derive", "half"] }
 s5_blobs = { path = "s5_blobs" }
 s5_core = { path = "s5_core" }
+s5_importer_local = { path = "importers/local" }
 s5_node = { path = "s5_node" }
 s5_fs = { path = "s5_fs" }
 s5_store_local = { path = "blob_stores/local" }
