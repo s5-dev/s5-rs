@@ -6,22 +6,22 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
-bytes = { workspace = true }
+bytes.workspace = true
 dashmap = "6.1.0"
 ed25519-dalek = "2.2.0"
-futures = { workspace = true }
+futures.workspace = true
 futures-core = { version = "0.3.31", default-features = false }
 getrandom = "0.3.3"
 hex = "0.4.3"
 http = "0.2.12"
 log = "0.4.27"
 reqwest = { version = "0.12.23", features = ["json"] }
-s5_core = { workspace = true }
-serde = { workspace = true }
+s5_core.workspace = true
+serde.workspace = true
 serde_json = "1.0.142"
 thiserror = "2.0.12"
-tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dependencies.hyper]
 version = "0.14"

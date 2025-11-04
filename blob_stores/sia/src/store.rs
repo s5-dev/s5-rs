@@ -73,7 +73,7 @@ impl SiaStore {
             return Err(Error::RenterdPackingEnabled.into());
         }
 
-        let state_res = store.http_get(&format!("bus_api_url/state")).await?;
+        let state_res = store.http_get(&format!("{bus_api_url}/state")).await?;
         let bus_state: RenterdBusStateRes = serde_json::from_slice(&state_res)?;
         store.network_is_zen = bus_state.network == "zen";
 
@@ -472,6 +472,16 @@ impl Store for SiaStore {
         let loc = self.provide_sia_file(path).await?;
 
         Ok(vec![BlobLocation::SiaFile(loc)])
+    }
+
+    async fn size(&self, path: &str) -> StoreResult<u64> {
+        todo!("implement")
+    }
+    async fn list(
+        &self,
+    ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>
+    {
+        todo!("implement")
     }
 }
 

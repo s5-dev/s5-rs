@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use minicbor::{CborLen, Decode, Encode, bytes::ByteArray};
+use minicbor::{CborLen, Decode, Encode};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 impl BlobLocation {
@@ -14,7 +15,28 @@ impl BlobLocation {
     }
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum BlobLocationType {
+    IdentityRawBinary = 0,
+    IrohNode = 1,
+    Url = 2,
+    SiaFile = 0x41,
+}
+
+#[derive(
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    CborLen,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[cbor(flat)]
 pub enum BlobLocation {
     #[n(0)]
@@ -63,7 +85,20 @@ pub enum BlobLocation {
     ),
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    CborLen,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 pub struct IrohLocation {
     #[n(0)]
     pub host: [u8; 32], //NodeId,
@@ -74,7 +109,20 @@ pub struct IrohLocation {
     pub partial: bool,
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    CborLen,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[cbor(array)]
 pub struct SiaFile {
     #[n(0)]
@@ -92,7 +140,20 @@ pub struct SiaFile {
     pub slabs: Vec<SiaFileSlab>,
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    CborLen,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[cbor(array)]
 pub struct SiaFileHost {
     #[n(0)]
@@ -104,7 +165,20 @@ pub struct SiaFileHost {
     pub ephemeral_account_private_key: [u8; 32],
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
+    CborLen,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[cbor(array)]
 pub struct SiaFileSlab {
     #[n(0)]
@@ -112,5 +186,6 @@ pub struct SiaFileSlab {
     pub slab_encryption_key: [u8; 32],
 
     #[n(1)]
-    pub shard_roots: BTreeMap<u8, ByteArray<32>>,
+    // TODO minicbor should serialize these as byte arrays
+    pub shard_roots: BTreeMap<u8, [u8; 32]>,
 }

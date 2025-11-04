@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-futures = { workspace = true }
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
 rust-s3 = { version = "0.37.0" }
-s5_core = { workspace = true }
-serde = { workspace = true }
+s5_core.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }

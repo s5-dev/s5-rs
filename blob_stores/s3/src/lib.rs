@@ -133,4 +133,15 @@ impl s5_core::store::Store for S3Store {
         let res = self.bucket.presign_get(path, 86400, None).await?;
         Ok(vec![BlobLocation::Url(res)])
     }
+
+    async fn size(&self, path: &str) -> StoreResult<u64> {
+        todo!("implement")
+    }
+
+    async fn list(
+        &self,
+    ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>
+    {
+        todo!("implement")
+    }
 }

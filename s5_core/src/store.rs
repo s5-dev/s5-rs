@@ -6,6 +6,14 @@ use crate::blob::location::BlobLocation;
 
 pub type StoreResult<T, E = anyhow::Error> = std::result::Result<T, E>;
 
+#[derive(thiserror::Error, Debug)]
+pub enum StoreError {
+    #[error("not found")]
+    NotFound,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[async_trait]
 pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     async fn put_stream(
@@ -33,6 +41,14 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes>;
+
+    /// Returns the total size of the object at the given path.
+    async fn size(&self, path: &str) -> StoreResult<u64>;
+
+    /// Returns a stream of all object paths in the store.
+    async fn list(
+        &self,
+    ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>;
 
     async fn delete(&self, path: &str) -> StoreResult<()>;
 

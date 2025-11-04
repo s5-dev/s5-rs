@@ -1,12 +1,12 @@
 use bytes::Bytes;
-use minicbor::bytes::ByteVec;
 use minicbor::{CborLen, Decode, Encode};
 use s5_core::Hash;
 use s5_core::blob::location::BlobLocation;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(array)]
 pub struct DirV1 {
     #[n(0)]
@@ -68,7 +68,7 @@ impl DirV1 {
     }
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct DirHeader {
     #[n(0x4)]
@@ -96,7 +96,7 @@ impl DirHeader {
     }
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct DirRef {
     #[n(0)]
@@ -109,7 +109,8 @@ pub struct DirRef {
     #[n(4)]
     pub ts_nanos: Option<u32>,
     #[n(0x0c)]
-    pub keys: Option<BTreeMap<u8, ByteVec>>,
+    // TODO serialize these as cbor byte arrays
+    pub keys: Option<BTreeMap<u8, [u8; 32]>>,
     #[n(0x0e)]
     pub encryption_type: Option<u8>,
     #[n(0x16)]
@@ -119,7 +120,7 @@ pub struct DirRef {
 pub const ENCRYPTION_TYPE_XCHACHA20_POLY1305: u8 = 0x02;
 
 #[repr(u8)]
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(index_only)]
 pub enum DirRefType {
     #[n(0x03)]
@@ -160,24 +161,23 @@ impl DirRef {
 }
 
 #[repr(u8)]
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(index_only)]
 pub enum FileRefType {
-    #[n(0x00)]
-    InlineBlob = 0x00,
     #[n(0x03)]
     Blake3Hash = 0x03,
     #[n(0x11)]
     RegistryKey = 0x11,
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct FileRef {
     #[n(0)]
     pub ref_type: FileRefType,
     #[n(1)]
-    pub hash: ByteVec,
+    #[cbor(with = "minicbor::bytes")]
+    pub hash: [u8; 32],
     #[n(2)]
     pub size: u64,
     #[n(3)]
@@ -198,7 +198,7 @@ pub struct FileRef {
     pub prev: Option<Box<FileRef>>,
 }
 
-#[derive(Encode, Decode, CborLen, Clone, Debug, Default)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug, Default)]
 #[cbor(map)]
 pub struct WebArchiveMetadata {
     #[n(0)]
@@ -223,14 +223,15 @@ impl FileRef {
     /// Creates an inline-blob `FileRef` storing data directly in metadata.
     /// Suitable for very small blobs; large blobs should use the blob store.
     pub fn new_inline_blob(blob: Bytes) -> Self {
+        let hash = blake3::hash(&blob);
         Self {
-            ref_type: FileRefType::InlineBlob,
-            hash: ByteVec::from(blob.to_vec()),
+            ref_type: FileRefType::Blake3Hash,
+            hash: hash.into(),
             size: blob.len() as u64,
             media_type: None,
             timestamp: None,
             timestamp_subsec_nanos: None,
-            locations: None,
+            locations: Some(vec![BlobLocation::IdentityRawBinary(blob.to_vec())]),
             extra: None,
             prev: None,
             warc: None,
@@ -240,7 +241,7 @@ impl FileRef {
     pub fn new(hash: Hash, size: u64) -> Self {
         Self {
             ref_type: FileRefType::Blake3Hash,
-            hash: ByteVec::from(hash.as_bytes().to_vec()),
+            hash: *hash.as_bytes(),
             size,
             media_type: None,
             timestamp: None,
@@ -262,7 +263,11 @@ impl From<s5_core::BlobId> for FileRef {
 impl Into<s5_core::BlobId> for FileRef {
     fn into(self) -> s5_core::BlobId {
         s5_core::BlobId::new(
-            Hash::from_bytes(self.hash[0..32].try_into().expect("expected 32-byte Blake3 hash")),
+            Hash::from_bytes(
+                self.hash[0..32]
+                    .try_into()
+                    .expect("expected 32-byte Blake3 hash"),
+            ),
             self.size,
         )
     }

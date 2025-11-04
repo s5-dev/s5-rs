@@ -3,10 +3,11 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use s5_core::blob::location::BlobLocation;
 use s5_core::store::{PutResponse, StoreFeatures, StoreResult};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::{ReaderStream, StreamReader};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalStoreConfig {
@@ -16,12 +17,24 @@ pub struct LocalStoreConfig {
 #[derive(Debug, Clone)]
 pub struct LocalStore {
     base_path: PathBuf,
+    // TODO copy_files: bool,
 }
 
 impl LocalStore {
+    pub fn new(base_path: impl Into<PathBuf>) -> Self {
+        LocalStore {
+            base_path: base_path.into(),
+        }
+    }
+
+    pub fn to_blob_store(self) -> s5_core::BlobStore {
+        s5_core::BlobStore::new(self)
+    }
+
     pub fn create(config: LocalStoreConfig) -> Self {
         LocalStore {
             base_path: config.base_path.into(),
+            // TODO copy_files: config.copy_files,
         }
     }
     fn resolve_path(&self, path: &str) -> StoreResult<PathBuf> {
@@ -159,5 +172,35 @@ impl s5_core::store::Store for LocalStore {
 
     async fn provide(&self, _path: &str) -> StoreResult<Vec<BlobLocation>> {
         Ok(vec![])
+    }
+
+    async fn size(&self, path: &str) -> StoreResult<u64> {
+        Ok(std::fs::metadata(&self.resolve_path(path)?)?.len())
+    }
+
+    async fn list(
+        &self,
+    ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>
+    {
+        let base_path = self.base_path.clone();
+        let walker = WalkDir::new(&base_path).into_iter();
+        let stream = futures::stream::iter(walker).filter_map(move |entry| {
+            futures::future::ready(match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_file() {
+                        let path = entry.path();
+
+                        let relative_path = path.strip_prefix(&base_path).unwrap();
+                        let key = relative_path.to_string_lossy().into_owned();
+                        Some(Ok(key))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e.into())),
+            })
+        });
+
+        Ok(Box::new(stream))
     }
 }

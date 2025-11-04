@@ -12,6 +12,8 @@ use chacha20poly1305::{
     aead::{Aead, OsRng, rand_core::RngCore},
 };
 use chrono::Utc;
+use ed25519::signature::Signer;
+use ed25519_dalek::SigningKey as DalekSigningKey;
 use futures::future::join_all;
 use minicbor::bytes::ByteVec;
 use s5_core::{Hash, StreamKey, StreamMessage, api::streams::RegistryApi, stream::MessageType};
@@ -67,6 +69,13 @@ pub enum ActorMessage {
     },
     SaveIfDirty {
         responder: oneshot::Sender<()>,
+    },
+    ExportSnapshot {
+        responder: oneshot::Sender<FSResult<DirV1>>,
+    },
+    MergeSnapshot {
+        snapshot: DirV1,
+        responder: oneshot::Sender<FSResult<()>>,
     },
     MarkAsDirty,
 }
@@ -223,7 +232,7 @@ impl DirActor {
                             if enable_encryption {
                                 let key: [u8; 32] =
                                     XChaCha20Poly1305::generate_key(&mut OsRng).into();
-                                keys.insert(0x0e, ByteVec::from(key.to_vec()));
+                                keys.insert(0x0e, key);
                             }
                             let mut registry_pointer = [0u8; 32];
                             OsRng.fill_bytes(&mut registry_pointer);
@@ -299,6 +308,16 @@ impl DirActor {
                 }
                 let _ = responder.send(());
             }
+            ActorMessage::ExportSnapshot { responder } => {
+                let _ = responder.send(Ok(self.state.clone()));
+            }
+            ActorMessage::MergeSnapshot {
+                snapshot,
+                responder,
+            } => {
+                let result = self.merge_snapshot(snapshot).await;
+                let _ = responder.send(result);
+            }
             /*   ActorMessage::GetShardLevel { responder } => {
                 responder.send(self.state.header.shard_level).unwrap();
             } */
@@ -325,6 +344,35 @@ impl DirActor {
         }
     }
 
+    // TODO add versioning and proper conflict resolution
+    async fn merge_snapshot(&mut self, snapshot: DirV1) -> FSResult<()> {
+        let DirV1 {
+            header,
+            dirs,
+            files,
+            shards,
+            ..
+        } = snapshot;
+
+        for (name, dir_ref) in dirs {
+            self.dir_handles.remove(&name);
+            self.state.dirs.insert(name, dir_ref);
+        }
+
+        for (name, file_ref) in files {
+            self.state.files.insert(name, file_ref);
+        }
+
+        for (index, dir_ref) in shards {
+            self.dir_shard_handles.remove(&index);
+            self.state.shards.insert(index, dir_ref);
+        }
+
+        self.state.header = header;
+        self.mark_as_dirty().await;
+        Ok(())
+    }
+
     /// Gets a handle to a subdirectory actor, creating it if necessary.
     async fn open_dir(
         &mut self,
@@ -345,13 +393,13 @@ impl DirActor {
                 initial_hash: dir_ref.hash,
             },
             crate::dir::DirRefType::RegistryKey => {
-                let key = StreamKey::Local(dir_ref.hash);
+                let key = StreamKey::PublicKeyEd25519(dir_ref.hash);
                 if let Some(handle) = self.context.registry_dir_handles.get(&key) {
                     return Ok(handle.clone());
                 }
                 DirContextParentLink::RegistryKey {
                     public_key: key,
-                    signing_key: Some(crate::context::SigningKey([0u8; 32])),
+                    signing_key: self.context.signing_key.clone(),
                 }
             }
         };
@@ -365,7 +413,7 @@ impl DirActor {
                 self.dir_handles.insert(sub_path.to_owned(), handle.clone());
             }
             crate::dir::DirRefType::RegistryKey => {
-                let key = StreamKey::Local(dir_ref.hash);
+                let key = StreamKey::PublicKeyEd25519(dir_ref.hash);
                 self.context
                     .registry_dir_handles
                     .insert(key, handle.clone());
@@ -389,16 +437,18 @@ impl DirActor {
             .get(&shard_index)
             .context("shard not found")?;
 
-        let link = match dir_ref.ref_type {
-            crate::dir::DirRefType::Blake3Hash => DirContextParentLink::DirHandle {
-                shard_level: self.state.header.shard_level
-                    .ok_or_else(|| anyhow!("missing shard level in parent when opening shard"))? + 1,
-                path: DirHandlePath::Shard(shard_index),
-                handle: self.handle.clone().context("actor has no handle")?,
-                initial_hash: dir_ref.hash,
-            },
-            _ => return Err(anyhow!("dir shards can only be blake3 hash dir refs")),
-        };
+        let link =
+            match dir_ref.ref_type {
+                crate::dir::DirRefType::Blake3Hash => DirContextParentLink::DirHandle {
+                    shard_level: self.state.header.shard_level.ok_or_else(|| {
+                        anyhow!("missing shard level in parent when opening shard")
+                    })? + 1,
+                    path: DirHandlePath::Shard(shard_index),
+                    handle: self.handle.clone().context("actor has no handle")?,
+                    initial_hash: dir_ref.hash,
+                },
+                _ => return Err(anyhow!("dir shards can only be blake3 hash dir refs")),
+            };
 
         let context = self.context.with_new_ref(dir_ref, link);
         // TODO: Propagate autosave and ensure recursive save/dirty semantics are correct
@@ -560,11 +610,10 @@ impl DirActor {
     async fn save(&mut self) -> FSResult<()> {
         let bytes: Bytes = if let Some(enc_type) = self.context.encryption_type {
             if enc_type == ENCRYPTION_TYPE_XCHACHA20_POLY1305 {
-                let encryption_key = self
-                    .context
-                    .keys
-                    .get(&0x0e)
-                    .ok_or_else(|| anyhow!("missing encryption key 0x0e for XChaCha20-Poly1305"))?;
+                let encryption_key =
+                    self.context.keys.get(&0x0e).ok_or_else(|| {
+                        anyhow!("missing encryption key 0x0e for XChaCha20-Poly1305")
+                    })?;
                 let cipher = XChaCha20Poly1305::new(encryption_key.as_ref().into());
                 let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
                 let ciphertext = cipher
@@ -609,7 +658,7 @@ impl DirActor {
                         hash: hash.hash,
                     })
                     .await?;
-                 // TODO: Ensure parent save ordering is correct
+                // TODO: Ensure parent save ordering is correct
 
                 initial_hash.copy_from_slice(hash.hash.as_bytes());
             }
@@ -618,14 +667,25 @@ impl DirActor {
                 signing_key,
             } => {
                 let hash = self.context.meta_blob_store.import_bytes(bytes).await?;
-                if let Some(_) = signing_key.as_ref() {
+                if let Some(signing_key) = signing_key.as_ref() {
                     let current = self.context.registry.get(public_key).await?;
+                    let revision = current.as_ref().map_or(0, |entry| entry.revision + 1);
+                    let dalek_key = DalekSigningKey::from_bytes(signing_key.as_bytes());
+                    let (key_type, key_bytes) = public_key.to_bytes();
+                    let mut sign_bytes = Vec::with_capacity(1 + 1 + key_bytes.len() + 8 + 1 + 32);
+                    sign_bytes.push(MessageType::Registry as u8);
+                    sign_bytes.push(key_type);
+                    sign_bytes.extend_from_slice(key_bytes);
+                    sign_bytes.extend_from_slice(&revision.to_be_bytes());
+                    sign_bytes.push(0x21);
+                    sign_bytes.extend_from_slice(hash.hash.as_bytes());
+                    let signature = dalek_key.sign(&sign_bytes);
                     let entry = StreamMessage::new(
                         MessageType::Registry,
                         *public_key,
-                        current.map_or_else(|| 0, |v| v.revision + 1),
+                        revision,
                         hash.hash,
-                        Box::new([]),
+                        signature.to_bytes().to_vec().into_boxed_slice(),
                         None,
                     )?;
                     self.context.registry.set(entry).await?;
@@ -659,8 +719,7 @@ impl DirActorHandle {
 
     /// Sends a message to the actor.
     pub async fn send_msg(&self, msg: ActorMessage) -> FSResult<()> {
-        self
-            .sender
+        self.sender
             .send(msg)
             .await
             .map_err(|_| anyhow!("Actor task has been closed."))?;
@@ -681,11 +740,7 @@ impl DirActorHandle {
     }
 
     /// Submits a function to be executed by the actor on a `FileRef` at the given path.
-    pub async fn execute<F, R>(
-        &self,
-        path: String,
-        f: F,
-    ) -> FSResult<R>
+    pub async fn execute<F, R>(&self, path: String, f: F) -> FSResult<R>
     where
         F: FnOnce(&mut Value) -> R + Send + 'static,
         R: Send + 'static,

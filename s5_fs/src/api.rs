@@ -4,7 +4,7 @@ use crate::{
     FSResult,
     actor::{ActorMessage, ActorMessageOp, DirActorHandle},
     context::DirContext,
-    dir::FileRef,
+    dir::{DirV1, FileRef},
 };
 use anyhow::Context as _;
 use tokio::sync::oneshot;
@@ -62,6 +62,25 @@ impl FS5 {
     pub async fn save(&self) -> FSResult<()> {
         self.root.save_if_dirty().await?;
         Ok(())
+    }
+
+    /// Exports the current directory state as an immutable snapshot.
+    pub async fn export_snapshot(&self) -> FSResult<DirV1> {
+        let (responder, receiver) = oneshot::channel();
+        self.root
+            .send_msg(ActorMessage::ExportSnapshot { responder })
+            .await?;
+        receiver.await?
+    }
+
+    /// Merges an incoming snapshot into the current directory state, overwriting
+    /// files with matching paths.
+    pub async fn merge_from_snapshot(&self, snapshot: DirV1) -> FSResult<()> {
+        let (responder, receiver) = oneshot::channel();
+        self.root
+            .send_msg(ActorMessage::MergeSnapshot { snapshot, responder })
+            .await?;
+        receiver.await?
     }
 
     /// Creates a subdirectory at `path`, optionally enabling encryption.

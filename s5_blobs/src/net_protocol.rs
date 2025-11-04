@@ -1,73 +1,183 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::{
-    Endpoint,
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler},
-};
-use s5_core::{BlobStore, api::blobs::store};
+use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::endpoint::Connection;
+use irpc_iroh::read_request;
+use s5_core::{BlobStore, Hash};
 
-use crate::protocol::{Announce, Request, Response};
+use crate::config::PeerConfigBlobs;
+use crate::rpc::{DownloadBlob, Query, QueryResponse, RpcMessage, RpcProto, UploadBlob};
 
-#[derive(Debug)]
-pub(crate) struct BlobsInner {
-    pub(crate) store: BlobStore,
-    pub(crate) endpoint: Endpoint,
-}
+const CHUNK_SIZE: usize = 64 * 1024; // 64k
 
-/// A protocol handler for the blobs protocol.
 #[derive(Debug, Clone)]
-pub struct BlobsProtocol {
-    pub(crate) inner: Arc<BlobsInner>,
+pub struct BlobsServer {
+    stores: Arc<HashMap<String, BlobStore>>, // named stores
+    // Keyed by stringified remote id (Display or Debug form).
+    peer_cfg: Arc<HashMap<String, PeerConfigBlobs>>, // per-peer ACLs
 }
 
-impl BlobsProtocol {
-    pub fn new(store: BlobStore, endpoint: Endpoint) -> Self {
+impl BlobsServer {
+    pub fn new(
+        stores: HashMap<String, BlobStore>,
+        peer_cfg: HashMap<String, PeerConfigBlobs>,
+    ) -> Self {
         Self {
-            inner: Arc::new(BlobsInner { store, endpoint }),
+            stores: Arc::new(stores),
+            peer_cfg: Arc::new(peer_cfg),
         }
+    }
+
+    fn cfg_for(&self, node_key: &str) -> Option<&PeerConfigBlobs> {
+        self.peer_cfg.get(node_key)
     }
 }
 
-impl ProtocolHandler for BlobsProtocol {
-    /// The `accept` method is called for each incoming connection for our ALPN.
-    ///
-    /// The returned future runs on a newly spawned tokio task, so it can run as long as
-    /// the connection lasts.
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        // We can get the remote's node id from the connection.
-        let node_id = connection.remote_node_id()?;
-        log::debug!("accepted connection from {node_id}");
+impl ProtocolHandler for BlobsServer {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // Use remote_id if available on this iroh version
+        let node_id = conn.remote_id()?;
+        log::debug!("s5_blobs: accepted connection from {node_id:?}");
+        let node_key = format!("{node_id:?}");
 
-        while let (mut send, mut recv) = connection.accept_bi().await? {
-            let req_bytes = recv.read_to_end(64).await.map_err(AcceptError::from_err)?;
-
-            let req: Request = minicbor::decode(&req_bytes).map_err(AcceptError::from_err)?;
-            match req {
-                Request::Query(query) => {
-                    let res = if self.inner.store.contains(query.hash.into()).await.unwrap() {
-                        let store_res = self.inner.store.provide(query.hash.into()).await.unwrap();
-                        Response::Announce(Announce {
-                            hash: query.hash,
-                            locations: store_res,
-                            // TODO add timestamps
-                            timestamp: 0,
-                            subsec_nanos: 0,
-                        })
-                    } else {
-                        Response::NotFound(query.hash)
-                    };
-                    let res_bytes = minicbor::to_vec(res).map_err(AcceptError::from_err)?;
-                    send.write_all(&res_bytes).await.unwrap();
-                    send.finish()?;
+        while let Some(msg) = read_request::<RpcProto>(&conn).await? {
+            match msg {
+                RpcMessage::Query(msg) => {
+                    let irpc::WithChannels { inner, tx, .. } = msg;
+                    let _ = handle_query(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
+                        .await;
+                }
+                RpcMessage::UploadBlob(msg) => {
+                    let irpc::WithChannels { inner, rx, tx, .. } = msg;
+                    let _ = handle_upload(&node_key, &self.stores, self.cfg_for(&node_key), inner, rx, tx)
+                        .await;
+                }
+                RpcMessage::DownloadBlob(msg) => {
+                    let irpc::WithChannels { inner, tx, .. } = msg;
+                    let _ = handle_download(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
+                        .await;
                 }
             }
         }
-
-        // Wait until the remote closes the connection, which it does once it
-        // received the response.
-        connection.closed().await;
-
+        conn.closed().await;
         Ok(())
     }
 }
+
+async fn handle_query(
+    _node_key: &str,
+    stores: &HashMap<String, BlobStore>,
+    cfg: Option<&PeerConfigBlobs>,
+    query: Query,
+    tx: irpc::channel::oneshot::Sender<QueryResponse>,
+) {
+    let hash: Hash = query.hash.into();
+    let mut resp = QueryResponse::default();
+
+    if let Some(cfg) = cfg {
+        for name in &cfg.readable_stores {
+            if let Some(store) = stores.get(name) {
+                if let Ok(true) = store.contains(hash).await {
+                    resp.exists = true;
+                    if resp.size.is_none() {
+                        if let Ok(sz) = store.size(hash).await {
+                            resp.size = Some(sz);
+                        }
+                    }
+                    if let Ok(mut locs) = store.provide(hash).await {
+                        // TODO: optionally filter by query.location_types
+                        resp.locations.append(&mut locs);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = tx.send(resp).await;
+}
+
+async fn handle_upload(
+    _node_key: &str,
+    stores: &HashMap<String, BlobStore>,
+    cfg: Option<&PeerConfigBlobs>,
+    req: UploadBlob,
+    rx: irpc::channel::mpsc::Receiver<bytes::Bytes>,
+    tx: irpc::channel::oneshot::Sender<Result<(), String>>,
+) {
+    let Some(cfg) = cfg else {
+        let _ = tx.send(Err("permission denied".into())).await; return;
+    };
+    let Some(store_name) = &cfg.store_uploads_in else {
+        let _ = tx.send(Err("uploads not allowed".into())).await; return;
+    };
+    let Some(store) = stores.get(store_name) else {
+        let _ = tx.send(Err("invalid upload store".into())).await; return;
+    };
+
+    // Adapt rx into the expected Stream type for import_stream, owning the receiver.
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(Some(chunk)) => Some((Ok::<bytes::Bytes, std::io::Error>(chunk), rx)),
+            _ => None,
+        }
+    });
+
+    match store.import_stream(Box::new(Box::pin(stream))).await {
+        Ok((got_hash, got_size)) => {
+            if got_hash.as_bytes() != &req.expected_hash || got_size != req.size {
+                let _ = store.delete(got_hash).await; // best-effort cleanup on mismatch
+                let _ = tx.send(Err("hash/size mismatch".into())).await;
+            } else {
+                let _ = tx.send(Ok(())).await;
+            }
+        }
+        Err(e) => {
+            let _ = tx.send(Err(format!("upload failed: {e}"))).await;
+        }
+    }
+}
+
+async fn handle_download(
+    _node_key: &str,
+    stores: &HashMap<String, BlobStore>,
+    cfg: Option<&PeerConfigBlobs>,
+    req: DownloadBlob,
+    tx: irpc::channel::mpsc::Sender<bytes::Bytes>,
+) {
+    let Some(cfg) = cfg else { return; };
+    let hash: Hash = req.hash.into();
+
+    // find first readable store containing the blob
+    let mut size_opt = None;
+    let mut store_opt: Option<&BlobStore> = None;
+    for name in &cfg.readable_stores {
+        if let Some(s) = stores.get(name) {
+            if let Ok(true) = s.contains(hash).await {
+                if let Ok(sz) = s.size(hash).await { size_opt = Some(sz); }
+                store_opt = Some(s);
+                break;
+            }
+        }
+    }
+    let Some(store) = store_opt else { return; };
+    let Some(size) = size_opt else { return; };
+
+    if req.offset > size { return; }
+    let to_send = match req.max_len { Some(m) => m.min(size - req.offset), None => size - req.offset };
+
+    let mut sent: u64 = 0;
+    while sent < to_send {
+        let want = std::cmp::min(CHUNK_SIZE as u64, to_send - sent);
+        match store.read_as_bytes(hash, req.offset + sent, Some(want)).await {
+            Ok(bytes) => {
+                if bytes.is_empty() { break; }
+                if tx.send(bytes.clone()).await.is_err() { break; }
+                sent += bytes.len() as u64;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+

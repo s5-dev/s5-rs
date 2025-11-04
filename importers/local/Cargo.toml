@@ -1,15 +1,14 @@
 [package]
-name = "s5_store_local"
+name = "s5_importer_local"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
-bytes.workspace = true
 futures.workspace = true
+log.workspace = true
 s5_core.workspace = true
-serde.workspace = true
+s5_fs.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 walkdir = "2.5.0"

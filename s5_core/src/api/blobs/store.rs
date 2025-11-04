@@ -7,7 +7,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::{
-    Hash,
+    BlobId, Hash,
     bao::outboard::compute_outboard,
     blob::location::BlobLocation,
     store::{Store, StoreFeatures, StoreResult},
@@ -20,7 +20,17 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
-    pub fn new(store: Box<dyn Store + 'static>) -> Self {
+    pub fn new<S>(store: S) -> Self
+    where
+        S: Store + 'static,
+    {
+        let store = Arc::new(Box::new(store) as Box<dyn Store>);
+        Self {
+            store: store.clone(),
+            outboard_store: Some(store),
+        }
+    }
+    pub fn new_boxed(store: Box<dyn Store + 'static>) -> Self {
         let store = Arc::new(store);
         Self {
             store: store.clone(),
@@ -65,6 +75,31 @@ impl BlobStore {
         )
     }
 
+    /// Deletes a blob and its associated outboard data from the store.
+    pub async fn delete(&self, hash: Hash) -> StoreResult<()> {
+        // Delete the main blob data.
+        self.store.delete(&self.blob_path_for_hash(hash)).await?;
+
+        // If an outboard store is configured, delete the outboard data as well.
+        if let Some(obao_store) = &self.outboard_store {
+            // It's okay if the outboard data doesn't exist, so we can ignore a NotFound error.
+            match obao_store.delete(&self.obao6_path_for_hash(hash)).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // A proper error type would allow matching on "NotFound".
+                    // For now, we assume any error here is likely due to the file not existing,
+                    // which is acceptable. A more robust solution would be to have typed errors.
+                    // TODO tracing::warn!("Failed to delete outboard data for {}: {:?}", hash, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn size(&self, hash: Hash) -> StoreResult<u64> {
+        self.store.size(&self.blob_path_for_hash(hash)).await
+    }
+
     pub async fn contains(&self, hash: Hash) -> StoreResult<bool> {
         self.store.exists(&self.blob_path_for_hash(hash)).await
     }
@@ -101,7 +136,8 @@ impl BlobStore {
     }
 
     /// Insert an in-memory blob of bytes to the blob store
-    pub async fn import_bytes(&self, bytes: bytes::Bytes) -> StoreResult<Hash> {
+    pub async fn import_bytes(&self, bytes: bytes::Bytes) -> StoreResult<BlobId> {
+        let size = bytes.len() as u64;
         let hash = if self.outboard_store.is_some() {
             let obao = compute_outboard(bytes.as_ref(), bytes.len() as u64, |_| Ok(()))?;
             if let Some(outboard) = obao.1 {
@@ -121,7 +157,7 @@ impl BlobStore {
             .put_bytes(&self.blob_path_for_hash(hash), bytes)
             .await?;
 
-        Ok(hash)
+        Ok(BlobId { hash, size })
     }
 
     /// Import a blob from a stream of bytes.

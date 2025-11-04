@@ -8,15 +8,33 @@ use crate::{
 use anyhow::Context;
 use dashmap::DashMap;
 use fs4::fs_std::FileExt;
-use s5_core::{BlobStore, RedbRegistry, StreamKey};
+use s5_core::{
+    BlobStore,
+    RedbRegistry,
+    StreamKey,
+    api::streams::RegistryApi,
+};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::{collections::BTreeMap, fs::OpenOptions, path::Path, sync::Arc};
 use zeroize::Zeroize;
 
-/// Placeholder signing key type for registry updates.
-/// TODO implement
+/// Signing key type for registry updates (Ed25519 private key seed).
 #[derive(Clone, Debug)]
-pub struct SigningKey(pub [u8; 32]);
+pub struct SigningKey([u8; 32]);
+
+impl SigningKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; 32] {
+        &mut self.0
+    }
+}
 
 /// The context required for a `DirActor` to operate.
 ///
@@ -26,7 +44,8 @@ pub struct DirContext {
     pub encryption_type: Option<u8>,
     pub keys: BTreeMap<u8, [u8; 32]>,
     pub meta_blob_store: BlobStore,
-    pub registry: RedbRegistry,
+    pub registry: Arc<dyn RegistryApi + Send + Sync>,
+    pub signing_key: Option<SigningKey>,
     pub registry_dir_handles: Arc<DashMap<StreamKey, DirActorHandle>>,
 }
 
@@ -82,7 +101,7 @@ impl DirContext {
         let meta_store = LocalStore::create(LocalStoreConfig {
             base_path: path.to_string_lossy().into(),
         });
-        let registry = RedbRegistry::open(&path)?;
+        let registry = Arc::new(RedbRegistry::open(&path)?);
 
         Ok(Self::new(
             DirContextParentLink::LocalFile {
@@ -98,7 +117,7 @@ impl DirContext {
     pub fn new(
         link: DirContextParentLink,
         meta_blob_store: BlobStore,
-        registry: RedbRegistry,
+        registry: Arc<dyn RegistryApi + Send + Sync>,
     ) -> Self {
         Self {
             encryption_type: None,
@@ -106,6 +125,7 @@ impl DirContext {
             meta_blob_store,
             link,
             registry,
+            signing_key: None,
             registry_dir_handles: Arc::new(DashMap::new()),
         }
     }
@@ -115,11 +135,16 @@ impl DirContext {
     /// - Inherits encryption type and keys, merging any keys in `dir_ref`.
     /// - Shares the blob store and registry handles.
     pub fn with_new_ref(&self, dir_ref: &DirRef, link: DirContextParentLink) -> Self {
+        let inherited_signing_key = match &link {
+            DirContextParentLink::RegistryKey { signing_key, .. } => signing_key.clone(),
+            _ => self.signing_key.clone(),
+        };
         let mut new_context = Self {
             encryption_type: dir_ref.encryption_type.or(self.encryption_type),
             keys: self.keys.clone(),
             meta_blob_store: self.meta_blob_store.clone(),
             registry: self.registry.clone(),
+            signing_key: inherited_signing_key,
             registry_dir_handles: self.registry_dir_handles.clone(),
             link,
         };
@@ -138,6 +163,9 @@ impl Drop for DirContext {
     fn drop(&mut self) {
         for v in self.keys.values_mut() {
             v.zeroize();
+        }
+        if let Some(key) = self.signing_key.as_mut() {
+            key.as_bytes_mut().zeroize();
         }
     }
 }

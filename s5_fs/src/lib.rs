@@ -17,7 +17,7 @@ mod context;
 pub mod dir;
 
 pub use api::FS5;
-pub use context::DirContext;
+pub use context::{DirContext, DirContextParentLink, SigningKey};
 pub use dir::FileRef;
 
 /// Crate-wide result alias that bubbles up [`anyhow::Error`].

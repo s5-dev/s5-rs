@@ -16,11 +16,15 @@ clap-verbosity-flag = { version = "3.0.4", default-features = false, features = 
   "tracing",
 ] }
 directories = "6.0.0"
-http_importer = { workspace = true }
+http_importer.workspace = true
 rand = "0.9.2"
 s5_core.workspace = true
-s5_node = { workspace = true }
-tokio = { workspace = true }
+s5_fs.workspace = true
+# s5_import_warc.workspace = true
+s5_importer_local.workspace = true
+s5_node.workspace = true
+# s5_serve_web_archive.workspace = true
+tokio.workspace = true
 toml = "0.9.5"
 toml_edit = "0.23.4"
 tracing = "0.1.41"
