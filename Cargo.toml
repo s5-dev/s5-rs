@@ -5,6 +5,7 @@ members = [
   "blob_stores/memory",
   "blob_stores/s3",
   "blob_stores/sia",
+  "importers/http",
   "importers/local",
   "s5_blobs",
   "s5_cli",
@@ -12,7 +13,6 @@ members = [
   "s5_fs",
   "s5_node",
   "s5_registry",
-  "tools/http_importer",
 ]
 
 [workspace.dependencies]
@@ -24,7 +24,6 @@ blake3 = { version = "1.8.2", features = [
 ] }
 bytes = { version = "1.10.1" }
 futures = "0.3.31"
-http_importer = { path = "tools/http_importer" }
 iroh = { version = "0.94.0" }
 iroh-blobs = { version = "0.96.0" }
 irpc = "0.10.0"
@@ -36,6 +35,7 @@ redb = "3.1.0"
 s5_blobs = { path = "s5_blobs" }
 s5_core = { path = "s5_core" }
 s5_fs = { path = "s5_fs" }
+s5_importer_http = { path = "importers/http" }
 s5_importer_local = { path = "importers/local" }
 s5_node = { path = "s5_node" }
 s5_registry = { path = "s5_registry" }
