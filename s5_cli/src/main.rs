@@ -1,3 +1,4 @@
+use crate::init_config::CmdConfig;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::InfoLevel;
@@ -6,11 +7,7 @@ use http_importer::HttpImporter;
 use s5_fs::{DirContext, FS5};
 use s5_importer_local::LocalFileSystemImporter;
 use s5_node::config::S5NodeConfig;
-use std::{
-    fs,
-    path::{ PathBuf},
-};
-use crate::init_config::CmdConfig;
+use std::{fs, path::PathBuf};
 mod init_config;
 
 #[derive(Parser)]
@@ -42,7 +39,7 @@ enum Commands {
         cmd: ImportCmd,
     },
     /// Serve data (currently only web archives)
-  /*   Serve {
+    /*   Serve {
         #[command(subcommand)]
         cmd: ServeCmd,
     }, */
@@ -65,7 +62,7 @@ enum ImportCmd {
         #[arg(short, long, value_name = "COUNT", default_value_t = 4)]
         concurrency: usize,
     },
-   /*  Warc {
+    /*  Warc {
         path: PathBuf,
     }, */
 }
@@ -74,7 +71,6 @@ enum ImportCmd {
 enum ServeCmd {
     WebArchive {},
 } */
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -97,22 +93,16 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Commands::Config { cmd } => cmd.run(node_config_file, local_data_dir)?,
         _ => {
-            
             let toml_content = fs::read_to_string(&node_config_file)?;
             let config: S5NodeConfig = toml::from_str(&toml_content)?;
 
-
             // TODO support using custom fs meta path
-                       let path = dirs
-                                .data_dir()
-                                .join("fs_roots")
-                                .join("local.fs5");
-                    let context = DirContext::open_local_root(path)?;
-                    let fs =    FS5::open(context);
+            let path = dirs.data_dir().join("fs_roots").join("local.fs5");
+            let context = DirContext::open_local_root(path)?;
+            let fs = FS5::open(context);
 
             match cli.cmd {
                 Commands::Import { cmd, target_store } => {
-
                     let target_store  =
                             s5_node::create_store(
                                 config
@@ -122,31 +112,22 @@ async fn main() -> anyhow::Result<()> {
                                     .to_owned(),
                             )
                             .await?;
-                        
-                    
 
                     match cmd {
                         ImportCmd::Http { url, concurrency } => {
-                            let http_importer = HttpImporter::create(
-                                fs,
-                                target_store,
-                                concurrency,
-                            )?;
+                            let http_importer =
+                                HttpImporter::create(fs, target_store, concurrency)?;
                             http_importer.import_url(url.parse()?).await?;
                         }
                         ImportCmd::Local { path, concurrency } => {
-
                             // imported_local
                             // imported_http
                             // let root_dir = DirV1::open(fs).context("Failed to open FS5 directory state")?;
 
                             // let dir = root_dir.consume();
 
-                            let importer = LocalFileSystemImporter::create(
-                                fs,
-                                target_store,
-                                concurrency,
-                            )?;
+                            let importer =
+                                LocalFileSystemImporter::create(fs, target_store, concurrency)?;
                             importer.import_path(path).await?;
                         }
                     }},

@@ -1,19 +1,15 @@
 use std::{fmt, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use iroh::{
     endpoint::{Connection, Endpoint},
     protocol::{AcceptError, ProtocolHandler},
 };
-use irpc::{channel::oneshot, rpc_requests, Client as IrpcClient};
-use irpc_iroh::{read_request, IrohRemoteConnection};
+use irpc::{Client as IrpcClient, channel::oneshot, rpc_requests};
+use irpc_iroh::{IrohRemoteConnection, read_request};
 
-use s5_core::{
-    api::streams::RegistryApi,
-    stream::{StreamKey, StreamMessage},
-    RedbRegistry,
-};
+use s5_core::{RedbRegistry, RegistryApi, StreamKey, StreamMessage};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -84,8 +80,8 @@ impl RegistryServer {
     }
 
     async fn handle_set(&self, req: SetRequest) -> std::result::Result<(), String> {
-        let message = StreamMessage::deserialize(Bytes::from(req.message))
-            .map_err(|err| err.to_string())?;
+        let message =
+            StreamMessage::deserialize(Bytes::from(req.message)).map_err(|err| err.to_string())?;
 
         self.registry
             .set(message)
@@ -131,10 +127,7 @@ impl Client {
         let mut key_data = [0u8; 32];
         key_data.copy_from_slice(key_bytes);
 
-        let response = self
-            .inner
-            .rpc(GetRequest { key_type, key_data })
-            .await?;
+        let response = self.inner.rpc(GetRequest { key_type, key_data }).await?;
 
         if let Some(bytes) = response.message {
             let message = StreamMessage::deserialize(Bytes::from(bytes))
@@ -152,7 +145,8 @@ impl Client {
             .rpc(SetRequest {
                 message: bytes.to_vec(),
             })
-            .await? {
+            .await?
+        {
             Ok(()) => Ok(()),
             Err(err) => Err(anyhow!(err.to_string())),
         }
@@ -184,5 +178,10 @@ impl RegistryApi for RemoteRegistry {
 
     async fn set(&self, message: StreamMessage) -> Result<()> {
         self.client.set(message).await
+    }
+
+    async fn delete(&self, _key: &StreamKey) -> Result<()> {
+        // Remote deletion is not currently supported; treat as a no-op.
+        Ok(())
     }
 }

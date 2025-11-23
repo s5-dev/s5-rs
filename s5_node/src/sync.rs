@@ -4,15 +4,11 @@ use anyhow::Result;
 use blake3::derive_key;
 use ed25519_dalek::SigningKey as DalekSigningKey;
 use s5_blobs::Client as BlobsClient;
-use s5_core::{BlobStore, StreamKey, api::streams::RegistryApi};
+use s5_core::{BlobStore, RegistryApi, StreamKey};
 use s5_fs::{
+    DirContext, DirContextParentLink, FS5, SigningKey as FsSigningKey,
     dir::ENCRYPTION_TYPE_XCHACHA20_POLY1305,
-    DirContext,
-    DirContextParentLink,
-    FS5,
-    SigningKey as FsSigningKey,
 };
-
 
 use crate::{RemoteBlobStore, RemoteRegistry};
 

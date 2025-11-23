@@ -45,18 +45,32 @@ impl ProtocolHandler for BlobsServer {
             match msg {
                 RpcMessage::Query(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_query(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
-                        .await;
+                    let _ =
+                        handle_query(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
+                            .await;
                 }
                 RpcMessage::UploadBlob(msg) => {
                     let irpc::WithChannels { inner, rx, tx, .. } = msg;
-                    let _ = handle_upload(&node_key, &self.stores, self.cfg_for(&node_key), inner, rx, tx)
-                        .await;
+                    let _ = handle_upload(
+                        &node_key,
+                        &self.stores,
+                        self.cfg_for(&node_key),
+                        inner,
+                        rx,
+                        tx,
+                    )
+                    .await;
                 }
                 RpcMessage::DownloadBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_download(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
-                        .await;
+                    let _ = handle_download(
+                        &node_key,
+                        &self.stores,
+                        self.cfg_for(&node_key),
+                        inner,
+                        tx,
+                    )
+                    .await;
                 }
             }
         }
@@ -106,13 +120,16 @@ async fn handle_upload(
     tx: irpc::channel::oneshot::Sender<Result<(), String>>,
 ) {
     let Some(cfg) = cfg else {
-        let _ = tx.send(Err("permission denied".into())).await; return;
+        let _ = tx.send(Err("permission denied".into())).await;
+        return;
     };
     let Some(store_name) = &cfg.store_uploads_in else {
-        let _ = tx.send(Err("uploads not allowed".into())).await; return;
+        let _ = tx.send(Err("uploads not allowed".into())).await;
+        return;
     };
     let Some(store) = stores.get(store_name) else {
-        let _ = tx.send(Err("invalid upload store".into())).await; return;
+        let _ = tx.send(Err("invalid upload store".into())).await;
+        return;
     };
 
     // Adapt rx into the expected Stream type for import_stream, owning the receiver.
@@ -145,7 +162,9 @@ async fn handle_download(
     req: DownloadBlob,
     tx: irpc::channel::mpsc::Sender<bytes::Bytes>,
 ) {
-    let Some(cfg) = cfg else { return; };
+    let Some(cfg) = cfg else {
+        return;
+    };
     let hash: Hash = req.hash.into();
 
     // find first readable store containing the blob
@@ -154,30 +173,47 @@ async fn handle_download(
     for name in &cfg.readable_stores {
         if let Some(s) = stores.get(name) {
             if let Ok(true) = s.contains(hash).await {
-                if let Ok(sz) = s.size(hash).await { size_opt = Some(sz); }
+                if let Ok(sz) = s.size(hash).await {
+                    size_opt = Some(sz);
+                }
                 store_opt = Some(s);
                 break;
             }
         }
     }
-    let Some(store) = store_opt else { return; };
-    let Some(size) = size_opt else { return; };
+    let Some(store) = store_opt else {
+        return;
+    };
+    let Some(size) = size_opt else {
+        return;
+    };
 
-    if req.offset > size { return; }
-    let to_send = match req.max_len { Some(m) => m.min(size - req.offset), None => size - req.offset };
+    if req.offset > size {
+        return;
+    }
+    // TODO: If requests carry chunk bitmaps, use them to shape the read plan and coalesce chunks.
+    let to_send = match req.max_len {
+        Some(m) => m.min(size - req.offset),
+        None => size - req.offset,
+    };
 
     let mut sent: u64 = 0;
     while sent < to_send {
         let want = std::cmp::min(CHUNK_SIZE as u64, to_send - sent);
-        match store.read_as_bytes(hash, req.offset + sent, Some(want)).await {
+        match store
+            .read_as_bytes(hash, req.offset + sent, Some(want))
+            .await
+        {
             Ok(bytes) => {
-                if bytes.is_empty() { break; }
-                if tx.send(bytes.clone()).await.is_err() { break; }
+                if bytes.is_empty() {
+                    break;
+                }
+                if tx.send(bytes.clone()).await.is_err() {
+                    break;
+                }
                 sent += bytes.len() as u64;
             }
             Err(_) => break,
         }
     }
 }
-
-

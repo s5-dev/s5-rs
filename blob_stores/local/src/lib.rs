@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use s5_core::blob::location::BlobLocation;
-use s5_core::store::{PutResponse, StoreFeatures, StoreResult};
+use s5_core::store::{StoreFeatures, StoreResult};
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -81,7 +81,7 @@ impl s5_core::store::Store for LocalStore {
         tokio::fs::try_exists(&full_path).await.map_err(Into::into)
     }
 
-    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<PutResponse> {
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
         let full_path = self.resolve_path(path)?;
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;

@@ -8,12 +8,7 @@ use crate::{
 use anyhow::Context;
 use dashmap::DashMap;
 use fs4::fs_std::FileExt;
-use s5_core::{
-    BlobStore,
-    RedbRegistry,
-    StreamKey,
-    api::streams::RegistryApi,
-};
+use s5_core::{BlobStore, RedbRegistry, RegistryApi, StreamKey};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::{collections::BTreeMap, fs::OpenOptions, path::Path, sync::Arc};
 use zeroize::Zeroize;

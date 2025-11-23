@@ -176,7 +176,7 @@ impl HttpImporter {
         res: reqwest::Response,
         last_modified: Option<DateTime<chrono::FixedOffset>>,
     ) -> anyhow::Result<()> {
-        let (hash, size) = self
+        let blob_id = self
             .blob_store
             .import_stream(Box::new(
                 res.bytes_stream()
@@ -184,7 +184,7 @@ impl HttpImporter {
             ))
             .await?;
 
-        let mut file_ref = FileRef::new(hash, size);
+        let mut file_ref: FileRef = blob_id.into();
 
         // Use the file's modification time if available, otherwise use the current time.
         let ts = last_modified

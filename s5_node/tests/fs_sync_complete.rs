@@ -36,20 +36,12 @@ use std::collections::HashMap;
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::Endpoint;
-use s5_blobs::{BlobsServer, PeerConfigBlobs, ALPN as BLOBS_ALPN};
-use s5_core::{
-    api::streams::RegistryApi,
-    BlobStore,
-    RedbRegistry,
-};
+use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
+use s5_core::{BlobStore, RedbRegistry, api::streams::RegistryApi};
 use s5_fs::dir::FileRef;
 use s5_node::{
-    derive_sync_keys,
+    REGISTRY_ALPN, RegistryServer, RemoteBlobStore, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
-    RemoteBlobStore,
-    RemoteRegistry,
-    RegistryServer,
-    REGISTRY_ALPN,
 };
 use s5_store_local::LocalStore;
 use tempfile::tempdir;
@@ -102,7 +94,8 @@ async fn fs_sync_complete() -> Result<()> {
     let laptop_plain_dir = tempdir()?;
     let laptop_plain = open_plaintext_fs(laptop_plain_dir.path())?;
     let laptop_blob_client = s5_blobs::Client::connect(laptop_endpoint.clone(), cloud_addr.clone());
-    let laptop_registry_client = RemoteRegistry::connect(laptop_endpoint.clone(), cloud_addr.clone());
+    let laptop_registry_client =
+        RemoteRegistry::connect(laptop_endpoint.clone(), cloud_addr.clone());
     let laptop_encrypted = open_encrypted_fs(
         stream_key,
         &laptop_keys,
@@ -113,8 +106,10 @@ async fn fs_sync_complete() -> Result<()> {
     // Prepare desktop plaintext and encrypted file systems.
     let desktop_plain_dir = tempdir()?;
     let desktop_plain = open_plaintext_fs(desktop_plain_dir.path())?;
-    let desktop_blob_client = s5_blobs::Client::connect(desktop_endpoint.clone(), cloud_addr.clone());
-    let desktop_registry_client = RemoteRegistry::connect(desktop_endpoint.clone(), cloud_addr.clone());
+    let desktop_blob_client =
+        s5_blobs::Client::connect(desktop_endpoint.clone(), cloud_addr.clone());
+    let desktop_registry_client =
+        RemoteRegistry::connect(desktop_endpoint.clone(), cloud_addr.clone());
     let desktop_encrypted = open_encrypted_fs(
         stream_key,
         &desktop_keys,
@@ -160,7 +155,10 @@ async fn fs_sync_complete() -> Result<()> {
 
     // Compare inline file contents
     for (path, lp_ref) in &laptop_snapshot.files {
-        let dt_ref = desktop_snapshot.files.get(path).expect("missing path on desktop");
+        let dt_ref = desktop_snapshot
+            .files
+            .get(path)
+            .expect("missing path on desktop");
         use s5_core::blob::location::BlobLocation;
         let lp_bytes = match lp_ref.locations.as_ref().and_then(|v| v.first()) {
             Some(BlobLocation::IdentityRawBinary(b)) => b,
@@ -191,7 +189,11 @@ async fn fs_sync_complete() -> Result<()> {
         .await?;
     let plaintext_bytes = laptop_snapshot.to_bytes()?;
     assert_ne!(encrypted_bytes, plaintext_bytes);
-    assert!(!std::str::from_utf8(&encrypted_bytes).unwrap_or("").contains("Hello"));
+    assert!(
+        !std::str::from_utf8(&encrypted_bytes)
+            .unwrap_or("")
+            .contains("Hello")
+    );
 
     // Shutdown cloud services.
     cloud_router.shutdown().await?;

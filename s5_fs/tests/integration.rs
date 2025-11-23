@@ -15,9 +15,9 @@
 //! 7.  **Dependency Integration:** Implicitly tests the integration with `s5_core` (BlobId, Hash)
 //!     and `s5_store_local` (for the underlying blob and registry storage).
 
+use bytes::Bytes;
 use s5_fs::{DirContext, FS5, FileRef};
 use tempfile::tempdir;
-use bytes::Bytes;
 
 #[tokio::test]
 async fn full_test() {
@@ -47,7 +47,9 @@ async fn full_test() {
     );
 
     // Test file_put to add a file to the root directory
-    fs.file_put("root_file.txt", file_ref.clone()).await.unwrap();
+    fs.file_put("root_file.txt", file_ref.clone())
+        .await
+        .unwrap();
 
     // Test file_exists on an existing file
     assert!(
@@ -181,9 +183,12 @@ async fn encrypted_round_trip() {
         let ctx = DirContext::open_local_root(&base).expect("ctx");
         let fs = FS5::open(ctx);
         fs.create_dir("enc", true).await.unwrap();
-        fs.file_put_sync("enc/one.txt", FileRef::new_inline_blob(Bytes::from_static(b"1")))
-            .await
-            .unwrap();
+        fs.file_put_sync(
+            "enc/one.txt",
+            FileRef::new_inline_blob(Bytes::from_static(b"1")),
+        )
+        .await
+        .unwrap();
         fs.save().await.unwrap();
     }
 
@@ -204,8 +209,7 @@ async fn concurrency_ordering_smoke() {
         let fs_i = fs.clone();
         handles.push(tokio::spawn(async move {
             let path = format!("c/t{}.txt", i);
-            fs_i
-                .file_put_sync(&path, FileRef::new_inline_blob(Bytes::from_static(b"v")))
+            fs_i.file_put_sync(&path, FileRef::new_inline_blob(Bytes::from_static(b"v")))
                 .await
                 .unwrap();
             fs_i.file_get(&path).await.is_some()

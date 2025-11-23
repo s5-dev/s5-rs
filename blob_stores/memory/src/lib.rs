@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use futures::stream::{self, Stream, TryStreamExt};
 use s5_core::{
     blob::location::BlobLocation,
-    store::{PutResponse, StoreError, StoreFeatures, StoreResult},
+    store::{StoreFeatures, StoreResult},
 };
 
 use std::io;
@@ -35,11 +35,8 @@ impl s5_core::store::Store for MemoryStore {
         &self,
         path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
-    ) -> StoreResult<PutResponse> {
-        let chunks: Vec<Bytes> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
+    ) -> StoreResult<()> {
+        let chunks: Vec<Bytes> = stream.try_collect().await?;
         let bytes = Bytes::from(chunks.concat());
         self.files.insert(path.to_string(), bytes);
         Ok(())
@@ -60,7 +57,7 @@ impl s5_core::store::Store for MemoryStore {
     }
 
     /// Stores a `Bytes` object at the given path.
-    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<PutResponse> {
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
         self.files.insert(path.to_string(), bytes);
         Ok(())
     }
@@ -86,7 +83,9 @@ impl s5_core::store::Store for MemoryStore {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
-        let file = self.files.get(path).ok_or(StoreError::NotFound)?;
+        let file = self.files.get(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no such key: {path}"))
+        })?;
         let file_len = file.len();
         let start = offset as usize;
 
@@ -106,7 +105,9 @@ impl s5_core::store::Store for MemoryStore {
 
     /// Returns the total size of the object at the given path.
     async fn size(&self, path: &str) -> StoreResult<u64> {
-        let file = self.files.get(path).ok_or(StoreError::NotFound)?;
+        let file = self.files.get(path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no such key: {path}"))
+        })?;
         Ok(file.len() as u64)
     }
 
@@ -126,7 +127,7 @@ impl s5_core::store::Store for MemoryStore {
 
     /// Deletes the object at the given path.
     async fn delete(&self, path: &str) -> StoreResult<()> {
-        self.files.remove(path).ok_or(StoreError::NotFound)?;
+        self.files.remove(path);
         Ok(())
     }
 
@@ -135,7 +136,9 @@ impl s5_core::store::Store for MemoryStore {
         if old_path == new_path {
             return Ok(());
         }
-        let (_key, value) = self.files.remove(old_path).ok_or(StoreError::NotFound)?;
+        let (_key, value) = self.files.remove(old_path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no such key: {old_path}"))
+        })?;
         self.files.insert(new_path.to_string(), value);
         Ok(())
     }
@@ -143,7 +146,7 @@ impl s5_core::store::Store for MemoryStore {
     /// Returns locations for a blob. For an in-memory store, this is always empty.
     async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>> {
         if !self.files.contains_key(path) {
-            return Err(StoreError::NotFound.into());
+            return Ok(vec![]);
         }
         Ok(vec![])
     }

@@ -112,13 +112,13 @@ impl LocalFileSystemImporter {
 
         log::info!("Importing file: {}", key);
 
-        let (hash, size) = self
+        let blob_id = self
             .blob_store
-            .import_file(path.to_path_buf())
+            .import_file(path.to_path_buf(), |_processed| Ok(()))
             .await
             .with_context(|| format!("Failed to import file into blob store: {:?}", path))?;
 
-        let mut file_ref = FileRef::new(hash, size);
+        let mut file_ref: FileRef = blob_id.into();
 
         // TODO if hash changed, update prev field
         file_ref.timestamp = Some(meta.mtime().try_into()?);

@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use s5_blobs::Client as BlobsClient;
 use s5_core::{
-    blob::location::BlobLocation,
-    store::{PutResponse, Store, StoreFeatures, StoreResult},
     Hash,
+    blob::location::BlobLocation,
+    store::{Store, StoreFeatures, StoreResult},
 };
 
 const UPLOAD_CHANNEL_CAPACITY: usize = 8;
@@ -64,7 +64,6 @@ impl RemoteBlobStore {
             Err(err) => Err(anyhow!(err)),
         }
     }
-
 }
 
 impl fmt::Debug for RemoteBlobStore {
@@ -81,7 +80,7 @@ impl Store for RemoteBlobStore {
         mut stream: Box<
             dyn futures_core::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
         >,
-    ) -> StoreResult<PutResponse> {
+    ) -> StoreResult<()> {
         let hash = Self::hash_from_path(path)?;
         let mut total = 0u64;
         let mut chunks = Vec::new();
@@ -114,7 +113,7 @@ impl Store for RemoteBlobStore {
         Ok(response.exists)
     }
 
-    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<PutResponse> {
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
         let hash = Self::hash_from_path(path)?;
         let total = bytes.len() as u64;
         self.upload_chunks(hash, total, vec![bytes]).await?;
@@ -127,7 +126,9 @@ impl Store for RemoteBlobStore {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<
-        Box<dyn futures_core::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
+        Box<
+            dyn futures_core::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+        >,
     > {
         let hash = Self::hash_from_path(path)?;
         let mut receiver = self
@@ -181,13 +182,20 @@ impl Store for RemoteBlobStore {
             .query(hash, BTreeSet::new())
             .await
             .map_err(|err| anyhow!(err))?;
-        response.size.ok_or_else(|| anyhow!("size unavailable for blob {path}"))
+        response
+            .size
+            .ok_or_else(|| anyhow!("size unavailable for blob {path}"))
     }
 
     async fn list(
         &self,
     ) -> StoreResult<
-        Box<dyn futures_core::Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>,
+        Box<
+            dyn futures_core::Stream<Item = Result<String, std::io::Error>>
+                + Send
+                + Unpin
+                + 'static,
+        >,
     > {
         Err(anyhow!("list not supported for RemoteBlobStore"))
     }
