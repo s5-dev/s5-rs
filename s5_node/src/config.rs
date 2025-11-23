@@ -9,10 +9,14 @@ pub struct S5NodeConfig {
     pub name: Option<String>,
     pub identity: NodeConfigIdentity,
     pub store: BTreeMap<String, NodeConfigStore>,
+    #[serde(default)]
     pub peer: BTreeMap<String, NodeConfigPeer>,
     /// File sync configurations keyed by name (e.g., "music")
     #[serde(default)]
     pub sync: BTreeMap<String, NodeConfigSync>,
+    /// Optional registry data directory; defaults near config file or data dir
+    #[serde(default)]
+    pub registry_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -48,4 +52,7 @@ pub struct NodeConfigSync {
     pub via_untrusted: Vec<String>,
     /// Pre-shared secret for authorization
     pub shared_secret: String,
+    /// Optional continuous sync interval in seconds; if set, runs a loop
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
 }

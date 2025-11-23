@@ -36,11 +36,11 @@ use std::collections::HashMap;
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::Endpoint;
-use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
+use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, RemoteBlobStore};
 use s5_core::{BlobStore, RedbRegistry, api::streams::RegistryApi};
 use s5_fs::dir::FileRef;
 use s5_node::{
-    REGISTRY_ALPN, RegistryServer, RemoteBlobStore, RemoteRegistry, derive_sync_keys,
+    REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
 };
 use s5_store_local::LocalStore;

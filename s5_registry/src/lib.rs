@@ -1,3 +1,18 @@
+//! iroh-based registry protocol for S5.
+//!
+//! This crate exposes a small RPC protocol and helpers
+//! for accessing an [`s5_core::RegistryApi`] over an
+//! iroh transport:
+//!
+//! - [`RegistryServer`]: serves a local [`s5_core::RedbRegistry`]
+//!   over an [`iroh::Endpoint`].
+//! - [`Client`]: RPC client for the registry protocol.
+//! - [`RemoteRegistry`]: adapter that implements
+//!   [`s5_core::RegistryApi`] on top of [`Client`].
+//!
+//! The wire format is defined by [`RpcProto`] and the
+//! ALPN identifier is [`ALPN`].
+
 use std::{fmt, sync::Arc};
 
 use anyhow::{Result, anyhow};

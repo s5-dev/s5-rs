@@ -2,19 +2,25 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use base64::Engine;
 use bytes::Bytes;
+use futures::Stream;
 use futures_util::StreamExt;
-use s5_blobs::Client as BlobsClient;
 use s5_core::{
-    Hash,
     blob::location::BlobLocation,
     store::{Store, StoreFeatures, StoreResult},
+    Hash,
 };
+
+use crate::Client as BlobsClient;
 
 const UPLOAD_CHANNEL_CAPACITY: usize = 8;
 
+/// Remote blob-backed implementation of the low-level `Store` trait.
+///
+/// This type wraps an iroh-based `s5_blobs::Client` and interprets
+/// store paths as content hashes (e.g. `blob3/aa/bb/cccc...`).
 #[derive(Clone)]
 pub struct RemoteBlobStore {
     client: BlobsClient,
@@ -26,7 +32,7 @@ impl RemoteBlobStore {
     }
 
     fn hash_from_path(path: &str) -> Result<Hash> {
-        // Expect paths like "blob3/aa/bb/cccc..." or "blob3/<flatbase64>"
+        // Expect paths like "blob3/aa/bb/cccc..." or "blob3/<flatbase64>".
         // Reconstruct the base64 URL-safe string by removing slashes after the prefix.
         let relevant = match path.split_once('/') {
             Some((prefix, rest)) if prefix.ends_with("blob3") || prefix.ends_with("obao6") => rest,
@@ -78,7 +84,7 @@ impl Store for RemoteBlobStore {
         &self,
         path: &str,
         mut stream: Box<
-            dyn futures_core::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+            dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
         >,
     ) -> StoreResult<()> {
         let hash = Self::hash_from_path(path)?;
@@ -127,7 +133,7 @@ impl Store for RemoteBlobStore {
         max_len: Option<u64>,
     ) -> StoreResult<
         Box<
-            dyn futures_core::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+            dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
         >,
     > {
         let hash = Self::hash_from_path(path)?;
@@ -191,10 +197,7 @@ impl Store for RemoteBlobStore {
         &self,
     ) -> StoreResult<
         Box<
-            dyn futures_core::Stream<Item = Result<String, std::io::Error>>
-                + Send
-                + Unpin
-                + 'static,
+            dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static,
         >,
     > {
         Err(anyhow!("list not supported for RemoteBlobStore"))

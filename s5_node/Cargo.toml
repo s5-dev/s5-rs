@@ -20,6 +20,7 @@ log = "0.4.28"
 s5_blobs.workspace = true
 s5_core.workspace = true
 s5_fs.workspace = true
+s5_registry.workspace = true
 s5_store_local.workspace = true
 s5_store_memory.workspace = true
 s5_store_s3.workspace = true

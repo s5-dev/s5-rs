@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::endpoint::Connection;
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use irpc_iroh::read_request;
 use s5_core::{BlobStore, Hash};
 
@@ -86,6 +86,7 @@ async fn handle_query(
     query: Query,
     tx: irpc::channel::oneshot::Sender<QueryResponse>,
 ) {
+    // TODO: If/when target_types is added, support additional targets (e.g. Obao6) in queries/answers.
     let hash: Hash = query.hash.into();
     let mut resp = QueryResponse::default();
 
@@ -141,7 +142,9 @@ async fn handle_upload(
     });
 
     match store.import_stream(Box::new(Box::pin(stream))).await {
-        Ok((got_hash, got_size)) => {
+        Ok(blob) => {
+            let got_hash = blob.hash;
+            let got_size = blob.size;
             if got_hash.as_bytes() != &req.expected_hash || got_size != req.size {
                 let _ = store.delete(got_hash).await; // best-effort cleanup on mismatch
                 let _ = tx.send(Err("hash/size mismatch".into())).await;

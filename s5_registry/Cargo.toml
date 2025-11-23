@@ -1,26 +1,15 @@
 [package]
-name = "s5_blobs"
+name = "s5_registry"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-blake3.workspace = true
 bytes.workspace = true
-dashmap = "6.1.0"
-futures.workspace = true
-futures-util = "0.3.31"
 iroh.workspace = true
 irpc.workspace = true
 irpc-iroh.workspace = true
-log = "0.4.28"
-postcard.workspace = true
 s5_core.workspace = true
 serde.workspace = true
-serde-big-array = "0.5.1"
-thiserror = "2.0.16"
-tokio.workspace = true
-tokio-stream = "0.1.17"
 tracing.workspace = true
-base64 = "0.22"

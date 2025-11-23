@@ -11,6 +11,7 @@ members = [
   "s5_core",
   "s5_fs",
   "s5_node",
+  "s5_registry",
   "tools/http_importer",
 ]
 
@@ -37,6 +38,7 @@ s5_core = { path = "s5_core" }
 s5_fs = { path = "s5_fs" }
 s5_importer_local = { path = "importers/local" }
 s5_node = { path = "s5_node" }
+s5_registry = { path = "s5_registry" }
 s5_store_local = { path = "blob_stores/local" }
 s5_store_memory = { path = "blob_stores/memory" }
 s5_store_s3 = { path = "blob_stores/s3" }
