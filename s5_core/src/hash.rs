@@ -11,15 +11,7 @@ pub struct Hash(blake3::Hash);
 
 impl fmt::Debug for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Hash").field(&DD(self.to_hex())).finish()
-    }
-}
-
-struct DD<T: fmt::Display>(T);
-
-impl<T: fmt::Display> fmt::Debug for DD<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        f.debug_tuple("Hash").field(&self.to_hex()).finish()
     }
 }
 
@@ -29,6 +21,9 @@ impl Hash {
         175, 19, 73, 185, 245, 249, 161, 166, 160, 64, 77, 234, 54, 220, 201, 73, 155, 203, 37,
         201, 173, 193, 18, 183, 204, 154, 147, 202, 228, 31, 50, 98,
     ]);
+
+    /// The size of the hash in bytes.
+    pub const SIZE: usize = 32;
 
     /// Calculate the hash of the provided bytes.
     pub fn new(buf: impl AsRef<[u8]>) -> Self {
@@ -108,7 +103,7 @@ impl From<&[u8; 32]> for Hash {
 
 impl PartialOrd for Hash {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.0.as_bytes().cmp(other.0.as_bytes()))
+        Some(self.cmp(other))
     }
 }
 

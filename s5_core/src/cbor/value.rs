@@ -193,7 +193,7 @@ fn skip_byte(d: &mut minicbor::Decoder<'_>) {
     d.set_position(d.position() + 1)
 }
 
-impl<'b, C> Encode<C> for Value {
+impl<C> Encode<C> for Value {
     fn encode<W: Write>(
         &self,
         e: &mut Encoder<W>,
@@ -231,7 +231,7 @@ impl<'b, C> Encode<C> for Value {
     }
 }
 
-impl<'b, C> CborLen<C> for Value {
+impl<C> CborLen<C> for Value {
     fn cbor_len(&self, ctx: &mut C) -> usize {
         match self {
             Value::Bool(val) => val.cbor_len(ctx),

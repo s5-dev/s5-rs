@@ -1,6 +1,6 @@
 [package]
 name = "s5_core"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "types and traits shared by all S5 crates"
 repository = "https://github.com/s5-dev/s5-rs"
@@ -20,10 +20,10 @@ futures.workspace = true
 futures-core = "0.3.31"
 minicbor.workspace = true
 multibase = "0.9.1"
-redb = "3.1.0"
+redb.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1.17"
-tokio-util = { version = "0.7.16", features = ["codec", "io"] }
+tokio-util = { version = "0.7.16", features = ["codec", "io", "io-util"] }
 uuid = { version = "1.18.1", features = ["v4"] }

@@ -4,29 +4,26 @@ use futures_core::Stream;
 
 use crate::blob::location::BlobLocation;
 
-pub type StoreResult<T, E = anyhow::Error> = std::result::Result<T, E>;
+pub type StoreResult<T> = anyhow::Result<T>;
 
-#[derive(thiserror::Error, Debug)]
-pub enum StoreError {
-    #[error("not found")]
-    NotFound,
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
+/// Abstract key-value store used by S5 components.
+///
+/// `Store` is a low-level, path-based storage layer that higher-level
+/// components such as `BlobStore` build on. Implementations may use
+/// local filesystems, cloud object stores, databases, etc.
 #[async_trait]
 pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     async fn put_stream(
         &self,
         path: &str,
         stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
-    ) -> StoreResult<PutResponse>;
+    ) -> StoreResult<()>;
 
     fn features(&self) -> StoreFeatures;
 
     async fn exists(&self, path: &str) -> StoreResult<bool>;
 
-    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<PutResponse>;
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()>;
 
     async fn open_read_stream(
         &self,
@@ -55,10 +52,21 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     async fn rename(&self, old_path: &str, new_path: &str) -> StoreResult<()>;
 
     async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>>;
+
+    /// Stores a stream to a temporary location and returns the path.
+    ///
+    /// The default implementation generates a random path in a `.tmp` directory.
+    async fn put_temp(
+        &self,
+        stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
+    ) -> StoreResult<String> {
+        let path = format!(".tmp/{}", uuid::Uuid::new_v4());
+        self.put_stream(&path, stream).await?;
+        Ok(path)
+    }
 }
 
-pub type PutResponse = ();
-
+#[derive(Debug, Clone, Copy)]
 pub struct StoreFeatures {
     pub supports_rename: bool,
     pub case_sensitive: bool,

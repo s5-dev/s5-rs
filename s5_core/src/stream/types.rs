@@ -46,10 +46,11 @@ pub type PublicKeyEd25519 = [u8; KEY_SIZE];
 /// Represents the key for a stream or registry entry.
 ///
 /// A key identifies the "owner" or "topic" of a stream. It can either be a
-/// standard Ed25519 public key for signed, public entries, or a local,
+/// standard Ed25519 public key for signed, public entries, a local,
 /// randomly generated identifier for private or local-only use cases where
-/// cryptographic identity is not required.
+/// cryptographic identity is not required, or a BLAKE3 hash used for pins.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum StreamKey {
     /// A local, 32-byte identifier, not tied to a cryptographic keypair.
     /// Useful for local-only or ephemeral streams where cryptographic
@@ -59,11 +60,18 @@ pub enum StreamKey {
     /// An Ed25519 public key. Entries with this key type must be signed
     /// with the corresponding private key to be valid.
     PublicKeyEd25519(PublicKeyEd25519),
+
+    /// A 32-byte BLAKE3 hash, used for pin metadata.
+    /// For this key type, larger inline payloads are allowed so that
+    /// large pin sets can be stored without being constrained by the
+    /// default inline data limit.
+    Blake3HashPin([u8; KEY_SIZE]),
 }
 
 /// The type of a message on the wire, distinguishing between a Stream and a Registry entry.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum MessageType {
     /// A message that is part of a persistent, append-only log.
     Stream = 0,
@@ -89,6 +97,7 @@ pub struct StreamMessage {
     /// A 64-bit revision number.
     /// - For streams: typically a timestamp (upper 32 bits) + sequence (lower 32 bits)
     /// - For registry: monotonically increasing version number
+    ///
     /// Using u64 instead of separate timestamp/sequence fields provides flexibility.
     pub revision: u64,
 
@@ -113,6 +122,7 @@ pub struct StreamMessage {
 
 /// Errors that can occur during StreamMessage operations.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamMessageError {
     #[error("invalid key: {0}")]
     InvalidKey(#[from] StreamKeyDeserializeError),
@@ -131,10 +141,14 @@ pub enum StreamMessageError {
 
     #[error("insufficient bytes for deserialization")]
     InsufficientBytes,
+
+    #[error("signature verification failed")]
+    InvalidSignature,
 }
 
 /// Errors that can occur when deserializing a `StreamKey`.
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamKeyDeserializeError {
     #[error("invalid data length: expected {expected}, got {actual}")]
     InvalidLength { expected: usize, actual: usize },
@@ -150,6 +164,9 @@ impl StreamKey {
     /// Identifier for the `PublicKeyEd25519` variant.
     const PUBLIC_KEY_ED25519_ID: u8 = 1;
 
+    /// Identifier for the `Blake3HashPin` variant.
+    const BLAKE3_HASH_PIN_ID: u8 = 3;
+
     /// Serializes the `StreamKey` into its type ID and raw bytes.
     ///
     /// Returns a tuple containing the `u8` identifier and a slice of the 32-byte key.
@@ -157,6 +174,7 @@ impl StreamKey {
         match self {
             StreamKey::Local(data) => (Self::LOCAL_ID, data),
             StreamKey::PublicKeyEd25519(data) => (Self::PUBLIC_KEY_ED25519_ID, data),
+            StreamKey::Blake3HashPin(data) => (Self::BLAKE3_HASH_PIN_ID, data),
         }
     }
 
@@ -175,6 +193,7 @@ impl StreamKey {
         match id {
             Self::LOCAL_ID => Ok(StreamKey::Local(data_array)),
             Self::PUBLIC_KEY_ED25519_ID => Ok(StreamKey::PublicKeyEd25519(data_array)),
+            Self::BLAKE3_HASH_PIN_ID => Ok(StreamKey::Blake3HashPin(data_array)),
             _ => Err(StreamKeyDeserializeError::UnknownId(id)),
         }
     }
@@ -189,7 +208,16 @@ impl StreamKey {
         match &self {
             Self::Local(_) => 0,
             Self::PublicKeyEd25519(_) => SIGNATURE_SIZE,
+            Self::Blake3HashPin(_) => 0,
         }
+    }
+
+    /// Returns true if the inline data size limit should be enforced for this key.
+    ///
+    /// For `Blake3HashPin` keys, larger payloads are allowed to support
+    /// arbitrarily large pin sets.
+    pub fn enforce_inline_limit(&self) -> bool {
+        !matches!(self, StreamKey::Blake3HashPin(_))
     }
 }
 
@@ -240,14 +268,16 @@ impl StreamMessage {
             });
         }
 
-        // Validate inline data size
-        if let Some(ref d) = data {
-            if d.len() > MAX_INLINE_DATA_SIZE {
-                return Err(StreamMessageError::DataTooLarge {
-                    size: d.len(),
-                    max: MAX_INLINE_DATA_SIZE,
-                });
-            }
+        // Validate inline data size (except for Blake3HashPin keys which allow
+        // arbitrarily large inline payloads to support large pin sets).
+        if key.enforce_inline_limit()
+            && let Some(ref d) = data
+            && d.len() > MAX_INLINE_DATA_SIZE
+        {
+            return Err(StreamMessageError::DataTooLarge {
+                size: d.len(),
+                max: MAX_INLINE_DATA_SIZE,
+            });
         }
 
         Ok(Self {
@@ -275,7 +305,12 @@ impl StreamMessage {
         let (key_id, key_bytes) = self.key.to_bytes();
 
         let mut buf = BytesMut::with_capacity(
-            1 + 1 + KEY_SIZE + 8 + HASH_SIZE + self.signature.len() + self.data.as_ref().map_or(0, |d| d.len()),
+            1 + 1
+                + KEY_SIZE
+                + 8
+                + HASH_SIZE
+                + self.signature.len()
+                + self.data.as_ref().map_or(0, |d| d.len()),
         );
 
         buf.put_u8(self.type_id as u8);
@@ -317,7 +352,9 @@ impl StreamMessage {
         }
 
         let signature = if sig_len > 0 {
-            bytes.copy_to_bytes(sig_len).to_vec().into_boxed_slice()
+            let mut sig = vec![0u8; sig_len];
+            bytes.copy_to_slice(&mut sig);
+            sig.into_boxed_slice()
         } else {
             Box::new([])
         };
@@ -336,7 +373,7 @@ impl StreamMessage {
     pub fn should_store(&self, existing: Option<&Self>) -> bool {
         match self.type_id {
             MessageType::Stream => true, // Always store stream messages
-            MessageType::Registry => existing.map_or(true, |e| self > e),
+            MessageType::Registry => existing.is_none_or(|e| self > e),
         }
     }
 }
@@ -401,6 +438,13 @@ mod tests {
         assert_eq!(bytes.len(), KEY_SIZE);
         let deserialized = StreamKey::from_bytes(id, bytes).unwrap();
         assert_eq!(ed_key, deserialized);
+
+        let pin_key = StreamKey::Blake3HashPin([3; KEY_SIZE]);
+        let (id, bytes) = pin_key.to_bytes();
+        assert_eq!(id, StreamKey::BLAKE3_HASH_PIN_ID);
+        assert_eq!(bytes.len(), KEY_SIZE);
+        let deserialized = StreamKey::from_bytes(id, bytes).unwrap();
+        assert_eq!(pin_key, deserialized);
     }
 
     #[test]
@@ -428,6 +472,9 @@ mod tests {
 
         let ed = StreamKey::PublicKeyEd25519([0; KEY_SIZE]);
         assert!(ed.requires_signature());
+
+        let pin = StreamKey::Blake3HashPin([0; KEY_SIZE]);
+        assert!(!pin.requires_signature());
     }
 
     #[test]
@@ -519,7 +566,7 @@ mod tests {
         );
         assert!(msg.is_ok());
 
-        // Data too large should fail
+        // Data too large should fail for Local keys
         let large_data = Bytes::from(vec![0; 2000]); // > 1024 bytes
         let msg = StreamMessage::new(
             MessageType::Stream,
@@ -527,12 +574,23 @@ mod tests {
             1,
             [0; HASH_SIZE].into(),
             Box::new([]),
-            Some(large_data),
+            Some(large_data.clone()),
         );
         assert!(matches!(
             msg.unwrap_err(),
             StreamMessageError::DataTooLarge { .. }
         ));
+
+        // But should be allowed for Blake3HashPin keys
+        let msg = StreamMessage::new(
+            MessageType::Registry,
+            StreamKey::Blake3HashPin([0; KEY_SIZE]),
+            1,
+            [0; HASH_SIZE].into(),
+            Box::new([]),
+            Some(large_data),
+        );
+        assert!(msg.is_ok());
     }
 
     #[test]
