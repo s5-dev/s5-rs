@@ -2,6 +2,9 @@
 name = "s5_importer_http"
 version = "1.0.0-beta.1"
 edition = "2024"
+description = "HTTP importer for S5"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.99"
