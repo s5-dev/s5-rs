@@ -28,7 +28,3 @@ tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.16", features = ["codec", "io", "io-util"] }
 tracing.workspace = true
 uuid = { version = "1.18.1", features = ["v4"] }
-
-[dev-dependencies]
-criterion.workspace = true
-s5_store_memory.workspace = true
