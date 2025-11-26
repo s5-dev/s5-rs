@@ -72,7 +72,7 @@ pub async fn run_blobs(
 
             // Collect all content hashes reachable from this node's
             // primary FS5 root (current head + snapshots).
-            let root_key = config.keys.get(&0x0e);
+            let root_key = None;
             let reachable = s5_fs::gc::collect_fs_reachable_hashes(fs_root, root_key).await?;
 
             let report = s5_fs::gc::gc_store(&blob_store, &reachable, &pinner, dry_run).await?;
@@ -103,7 +103,7 @@ pub async fn run_blobs(
 
             // Collect all content hashes reachable from this node's
             // primary FS5 root (current head + snapshots).
-            let root_key = config.keys.get(&0x0e);
+            let root_key = None;
             let reachable = s5_fs::gc::collect_fs_reachable_hashes(fs_root, root_key).await?;
 
             let mut missing = Vec::new();

@@ -193,15 +193,13 @@ impl DirActor {
             } => {
                 let hash = self.context.meta_blob_store.import_bytes(bytes).await?;
 
-                if notify_parent {
-                    if let Some(handle) = handle.upgrade() {
-                        handle
-                            .send_msg(super::ActorMessage::UpdateDirRefHash {
-                                path: path.clone(),
-                                hash: hash.hash,
-                            })
-                            .await?;
-                    }
+                if notify_parent && let Some(handle) = handle.upgrade() {
+                    handle
+                        .send_msg(super::ActorMessage::UpdateDirRefHash {
+                            path: path.clone(),
+                            hash: hash.hash,
+                        })
+                        .await?;
                 }
 
                 initial_hash.copy_from_slice(hash.hash.as_bytes());

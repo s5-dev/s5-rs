@@ -34,7 +34,7 @@ iroh.workspace = true
 s5_blobs.workspace = true
 base64 = "0.22"
 hex = "0.4.3"
-s5_fuse = { path = "../s5_fuse" }
+s5_fuse.workspace = true
 s5_store_local.workspace = true
 url = "2.5"
 
