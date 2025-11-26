@@ -34,7 +34,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Http(#[from] http::Error),
+    Http(#[from] ::http::Error),
     #[error(transparent)]
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
@@ -44,5 +44,5 @@ pub enum Error {
     #[error(transparent)]
     Hex(#[from] FromHexError),
     #[error(transparent)]
-    HttpInvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
+    HttpInvalidHeaderValue(#[from] ::http::header::InvalidHeaderValue),
 }

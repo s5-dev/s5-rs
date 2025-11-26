@@ -1,6 +1,16 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub fn registry_path(node_config_file: &Path, config: &S5NodeConfig) -> PathBuf {
+    if let Some(p) = &config.registry_path {
+        p.into()
+    } else {
+        let base = node_config_file.parent().unwrap_or_else(|| Path::new("."));
+        base.join("registry")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct S5NodeConfig {
@@ -17,6 +27,10 @@ pub struct S5NodeConfig {
     /// Optional registry data directory; defaults near config file or data dir
     #[serde(default)]
     pub registry_path: Option<String>,
+    /// Optional FUSE mounts driven by this node
+    // TODO rename to mounts
+    #[serde(default)]
+    pub fuse: BTreeMap<String, NodeConfigFuseMount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,9 +51,13 @@ pub enum NodeConfigStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeConfigPeer {
-    /// Peer public ID (iroh node id, etc.)
+    /// Peer public ID string used for both ACLs and dialing.
+    /// This should be the `EndpointId` display string as printed
+    /// by `endpoint.id().to_string()`.
     #[serde(default)]
     pub id: String,
+    /// Optional blob ACL configuration; defaults to no access.
+    #[serde(default)]
     pub blobs: s5_blobs::PeerConfigBlobs,
 }
 
@@ -55,4 +73,20 @@ pub struct NodeConfigSync {
     /// Optional continuous sync interval in seconds; if set, runs a loop
     #[serde(default)]
     pub interval_secs: Option<u64>,
+    // TODO: Add hooks for each sync target (e.g. pre-sync, post-sync scripts)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NodeConfigFuseMount {
+    /// Path to the FS5 root directory (contains `root.fs5.cbor`)
+    // TODO rename to fs5_root_path or so
+    pub root_path: String,
+    /// Local mount point where this FS5 root should be mounted via FUSE
+    pub mount_path: String,
+    /// Whether to request auto-unmount on process exit
+    #[serde(default)]
+    pub auto_unmount: bool,
+    /// Whether to allow the system root user to access the mount
+    #[serde(default)]
+    pub allow_root: bool,
 }

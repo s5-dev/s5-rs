@@ -2,13 +2,13 @@
 
 use crate::{
     FSResult,
-    actor::DirActorHandle,
+    actor::{DirActorHandle, WeakDirActorHandle},
     dir::{DirRef, DirV1},
 };
 use anyhow::Context;
 use dashmap::DashMap;
 use fs4::fs_std::FileExt;
-use s5_core::{BlobStore, RedbRegistry, RegistryApi, StreamKey};
+use s5_core::{BlobStore, Pins, RedbRegistry, RegistryApi, RegistryPinner, StreamKey};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::{collections::BTreeMap, fs::OpenOptions, path::Path, sync::Arc};
 use zeroize::Zeroize;
@@ -40,6 +40,12 @@ pub struct DirContext {
     pub keys: BTreeMap<u8, [u8; 32]>,
     pub meta_blob_store: BlobStore,
     pub registry: Arc<dyn RegistryApi + Send + Sync>,
+    /// Optional pinning interface associated with this context's registry.
+    ///
+    /// For local FS5 roots opened via `open_local_root`, this is backed by a
+    /// `RegistryPinner<RedbRegistry>` and is used to track local pins such as
+    /// `PinContext::LocalFsHead` and `PinContext::LocalFsSnapshot`.
+    pub pins: Option<Arc<dyn Pins + Send + Sync>>,
     pub signing_key: Option<SigningKey>,
     pub registry_dir_handles: Arc<DashMap<StreamKey, DirActorHandle>>,
 }
@@ -59,7 +65,7 @@ pub enum DirContextParentLink {
     /// The directory is a child of another directory, accessed via an actor handle.
     DirHandle {
         path: DirHandlePath,
-        handle: DirActorHandle,
+        handle: WeakDirActorHandle,
         initial_hash: [u8; 32],
         shard_level: u8,
     },
@@ -80,6 +86,7 @@ impl DirContext {
     pub fn open_local_root<P: AsRef<Path>>(path: P) -> FSResult<Self> {
         let path = path.as_ref().to_path_buf();
         let root_file = path.join("root.fs5.cbor");
+        let snapshots_file = path.join("snapshots.fs5.cbor");
 
         if !root_file.exists() {
             std::fs::create_dir_all(
@@ -90,22 +97,36 @@ impl DirContext {
             std::fs::write(&root_file, DirV1::new().to_bytes()?)?;
         }
 
+        // Ensure a snapshots index root exists alongside `root.fs5.cbor`.
+        if !snapshots_file.exists() {
+            std::fs::write(&snapshots_file, DirV1::new().to_bytes()?)?;
+        }
+
         let file = OpenOptions::new().read(true).write(true).open(&root_file)?;
         file.lock_exclusive()?;
 
         let meta_store = LocalStore::create(LocalStoreConfig {
             base_path: path.to_string_lossy().into(),
         });
-        let registry = Arc::new(RedbRegistry::open(&path)?);
 
-        Ok(Self::new(
+        // Use a RegistryPinner over the local RedbRegistry so that the
+        // same registry DB is shared for both pin metadata and other
+        // registry usage.
+        let registry_db = RedbRegistry::open(&path)?;
+        let pinner = RegistryPinner::new(registry_db);
+        let registry: Arc<dyn RegistryApi + Send + Sync> = pinner.registry_arc();
+        let pins: Arc<dyn Pins + Send + Sync> = Arc::new(pinner);
+
+        let mut ctx = Self::new(
             DirContextParentLink::LocalFile {
                 file,
                 path: root_file,
             },
             BlobStore::new(meta_store),
             registry,
-        ))
+        );
+        ctx.pins = Some(pins);
+        Ok(ctx)
     }
 
     /// Creates a new `DirContext` with provided parent link, meta store, and registry.
@@ -120,6 +141,7 @@ impl DirContext {
             meta_blob_store,
             link,
             registry,
+            pins: None,
             signing_key: None,
             registry_dir_handles: Arc::new(DashMap::new()),
         }
@@ -139,6 +161,7 @@ impl DirContext {
             keys: self.keys.clone(),
             meta_blob_store: self.meta_blob_store.clone(),
             registry: self.registry.clone(),
+            pins: self.pins.clone(),
             signing_key: inherited_signing_key,
             registry_dir_handles: self.registry_dir_handles.clone(),
             link,
@@ -156,6 +179,7 @@ impl DirContext {
 
 impl Drop for DirContext {
     fn drop(&mut self) {
+        // Best-effort key scrubbing on drop.
         for v in self.keys.values_mut() {
             v.zeroize();
         }

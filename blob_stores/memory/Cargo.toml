@@ -1,6 +1,6 @@
 [package]
 name = "s5_store_memory"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2024"
 
 [dependencies]

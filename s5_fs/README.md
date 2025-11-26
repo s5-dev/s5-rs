@@ -29,12 +29,21 @@ async fn main() -> anyhow::Result<()> {
     fs.create_dir("secret", true).await?;
     fs.file_put_sync("secret/plan.txt", FileRef::new_inline_blob(Bytes::from("top secret"))).await?;
 
+    // Work with a scoped subdirectory handle
+    let project_fs = fs.subdir("projects/my-app").await?;
+    project_fs
+        .file_put_sync(
+            "config.toml",
+            FileRef::new_inline_blob(Bytes::from("name = \"my-app\"")),
+        )
+        .await?;
+
     // Batch multiple ops, then persist once
     fs.batch(|fs| async move {
         fs.file_put_sync("a.txt", FileRef::new_inline_blob(Bytes::from("A"))).await?;
         fs.file_put_sync("b.txt", FileRef::new_inline_blob(Bytes::from("B"))).await?;
-        fs.file_move("b.txt", "secret/b.txt").await?;
-        fs.delete("a.txt").await?;
+        fs.file_put_sync("secret/b.txt", FileRef::new_inline_blob(Bytes::from("B"))).await?;
+        fs.file_delete("a.txt").await?;
         Ok(())
     }).await?;
 
@@ -43,3 +52,76 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+### Scoped subdirectories
+
+- `FS5::subdir("path/to/dir")` returns a new `FS5` handle that is logically rooted at the given subdirectory.
+- If the subdirectory (or any of its parents) does not exist yet, it is created automatically.
+- When the parent directory is encrypted, newly created subdirectories inherit encryption.
+
+---
+
+
+## Features
+- Content addressed metadata snapshots (`DirV1` via CBOR) with durable persistence.
+- Actor-based single-writer per directory for deterministic ordering.
+- Optional directory encryption (XChaCha20-Poly1305; keys stored under `0x0e`).
+- Registry-backed directories (Ed25519) for decentralized pointers.
+- Cursor-based listing over large directories (flat logical view, even when sharded).
+- Per-file version chains with tombstone deletes and LWW snapshot merge.
+
+### Reachability and Garbage Collection
+- FS5 directory snapshots (`root.fs5.cbor`, `snapshots.fs5.cbor`, and metadata in the FS5 meta store) form the **reachability graph** for content blobs.
+- The helper `s5_fs::gc::collect_fs_reachable_hashes` walks these snapshots to produce the set of content hashes that are still live from an FS5 root (including historical versions).
+- The helper `s5_fs::gc::gc_store` runs a conservative mark-and-sweep over a blob store: any blob with at least one pin in the node registry or whose hash is reachable from the FS5 root is kept; everything else is a GC candidate.
+- The `s5 blobs gc-local` and `s5 blobs verify-local` CLI commands are thin wrappers around these helpers for local stores; higher-level snapshot GC policies are tracked in `s5_fs/TODO.md`.
+
+## Directory Listing (Cursors)
+```rust
+// First page
+let (entries, mut cursor) = fs.list(None, 100).await?;
+for (name, kind) in entries {
+    println!("{name} {:?}", kind);
+}
+// Next page (if any)
+if let Some(c) = cursor.take() {
+    let (more, next) = fs.list(Some(&c), 100).await?;
+    // ...
+    cursor = next;
+}
+```
+
+Cursors are base64url-encoded CBOR carrying the last position and kind. For
+large directories that have been sharded internally, `list` still presents a
+single flat logical namespace aggregated across all shards.
+
+## Versioning & Tombstones
+- Each `FileRef` can carry a version chain via `prev`, `first_version`, and
+  `version_count`.
+- Deleting a file uses tombstones: `FS5::file_delete(path)` creates a
+  `FileRefType::Tombstone` head that records when the delete happened and what
+  the previous live version was.
+- Live reads (`file_get`, `file_exists`) hide tombstones; historical versions
+  remain accessible via exported snapshots.
+- `merge_from_snapshot` applies last-write-wins (LWW) over timestamps and
+  preserves the entire winning version chain, including tombstones.
+
+## Sharding
+- Shard metadata lives in the header (`DirHeader.shards: Option<BTreeMap<u8, DirRef>>`).
+- Name→bucket routing uses XXH3-64 (fast, non-crypto) for index selection.
+- Directories are automatically sharded when their encoded `DirV1` exceeds
+  ~64 KiB; shard actors are created and saved behind the scenes.
+- Sharding is a storage/layout optimization only: the FS5 API (`file_get`,
+  `file_exists`, `list`, `list_at`, `export_snapshot(_at)`) always sees a flat
+  logical directory and transparently aggregates data across shards.
+
+## Encryption
+- `create_dir(path, enable_encryption = true)` derives/stores per-directory keys and transparently encrypts directory snapshots.
+- On load, metadata is decrypted with keys from the context (keys can be inherited/merged from parents).
+
+## Compatibility
+- This crate is pre‑v1; on‑disk schema may change between versions.
+- Snapshot format: CBOR; see `src/dir.rs` for field indices and types.
+
+## Roadmap
+See TODOs and proposed features in `s5_fs/TODO.md`.

@@ -161,20 +161,25 @@ async fn sharding_basic_persists() {
 
     // Create many small files to grow metadata
     for i in 0..3000u32 {
-        let name = format!("bulk/{}.txt", i);
+        let name = format!("file_{}.txt", i);
         let fr = FileRef::new_inline_blob(Bytes::from_static(b"x"));
         fs.file_put(&name, fr).await.unwrap();
     }
     fs.save().await.unwrap();
 
     // Spot check a few entries
-    assert!(fs.file_exists("bulk/0.txt").await);
-    assert!(fs.file_exists("bulk/1024.txt").await);
-    assert!(fs.file_exists("bulk/2999.txt").await);
+    assert!(fs.file_exists("file_0.txt").await);
+    assert!(fs.file_exists("file_1024.txt").await);
+    assert!(fs.file_exists("file_2999.txt").await);
+
+    // And verify listing sees sharded entries as a flat namespace.
+    let (entries, _) = fs.list(None, 10_000).await.unwrap();
+    assert!(entries.iter().any(|(name, _)| name == "file_0.txt"));
+    assert!(entries.iter().any(|(name, _)| name == "file_1024.txt"));
+    assert!(entries.iter().any(|(name, _)| name == "file_2999.txt"));
 }
 
 #[tokio::test]
-#[ignore]
 async fn encrypted_round_trip() {
     let temp_dir = tempdir().expect("tmp");
     let base = temp_dir.path().to_path_buf();
@@ -189,13 +194,123 @@ async fn encrypted_round_trip() {
         )
         .await
         .unwrap();
+
+        // Sanity check before shutdown: the encrypted file should exist.
+        assert!(fs.file_exists("enc/one.txt").await);
+
+        // Also verify the snapshot for the encrypted directory contains the file.
+        let snap_before = fs.export_snapshot_at("enc").await.unwrap();
+        assert!(snap_before.files.contains_key("one.txt"));
+
         fs.save().await.unwrap();
+        fs.shutdown().await.unwrap();
     }
 
-    // Re-open and read back
-    let ctx2 = DirContext::open_local_root(&base).expect("ctx2");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Copy to a new directory to avoid "Database already open" error from redb
+    // which seems to persist even after drop in the same process during tests.
+    let temp_dir2 = tempdir().expect("tmp2");
+    let status = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(base.to_str().unwrap())
+        .arg(temp_dir2.path().to_str().unwrap())
+        .status()
+        .expect("cp failed");
+    assert!(status.success());
+
+    // Re-open from the copy
+    // Note: cp -r copies the directory itself into the target if not careful.
+    // We want the contents.
+    // Let's just use the path we copied to.
+    // If base is /tmp/foo, cp -r /tmp/foo /tmp/bar results in /tmp/bar/foo.
+    let base2 = temp_dir2.path().join(base.file_name().unwrap());
+
+    let ctx2 = DirContext::open_local_root(&base2).expect("ctx2");
     let fs2 = FS5::open(ctx2);
+
+    // Root snapshot after reopen should still have the encrypted dir.
+    let root_after = fs2.export_snapshot().await.unwrap();
+    assert!(root_after.dirs.contains_key("enc"));
+
+    // After reopening, the encrypted directory snapshot should still contain the file.
+    let snap_after = fs2.export_snapshot_at("enc").await.unwrap();
+    assert!(snap_after.files.contains_key("one.txt"));
+
     assert!(fs2.file_exists("enc/one.txt").await);
+}
+
+#[tokio::test]
+async fn test_auto_promotion() {
+    let temp_dir = tempdir().expect("tmp");
+    let ctx = DirContext::open_local_root(temp_dir.path()).expect("ctx");
+    let fs = FS5::open(ctx);
+
+    // Insert FS5_PROMOTION_THRESHOLD files with prefix "promo/"
+    for i in 0..s5_fs::FS5_PROMOTION_THRESHOLD {
+        let name = format!("promo/{}.txt", i);
+        let fr = FileRef::new_inline_blob(Bytes::from_static(b"x"));
+        fs.file_put_sync(&name, fr).await.unwrap();
+    }
+
+    // Should still be files in root (or at least accessible)
+    // Since count equals the threshold (not >), no promotion yet.
+
+    let (entries, _) = fs.list(None, 100).await.unwrap();
+    // Should see "promo/0.txt" etc. if not promoted.
+    // If they are in `files` map, they show up as "promo/0.txt".
+    assert!(entries.iter().any(|(name, _)| name == "promo/0.txt"));
+
+    // Insert one more.
+    let name = format!("promo/{}.txt", s5_fs::FS5_PROMOTION_THRESHOLD);
+    let fr = FileRef::new_inline_blob(Bytes::from_static(b"x"));
+    fs.file_put_sync(&name, fr).await.unwrap();
+
+    // Now count is threshold + 1. Should promote.
+
+    let (entries, _) = fs.list(None, 100).await.unwrap();
+    // Should see "promo" as directory.
+    assert!(
+        entries
+            .iter()
+            .any(|(name, kind)| name == "promo" && matches!(kind, s5_fs::CursorKind::Directory))
+    );
+    // Should NOT see "promo/0.txt" in root listing.
+    assert!(!entries.iter().any(|(name, _)| name == "promo/0.txt"));
+
+    // But we should be able to list inside "promo"
+    let (sub_entries, _) = fs.list_at("promo", None, 100).await.unwrap();
+    assert_eq!(sub_entries.len(), s5_fs::FS5_PROMOTION_THRESHOLD + 1);
+    assert!(sub_entries.iter().any(|(name, _)| name == "0.txt"));
+}
+
+#[tokio::test]
+async fn test_auto_promotion_encrypted() {
+    let temp_dir = tempdir().expect("tmp");
+    let ctx = DirContext::open_local_root(temp_dir.path()).expect("ctx");
+    let fs = FS5::open(ctx);
+
+    fs.create_dir("enc", true).await.unwrap();
+
+    // Insert 17 files into "enc/promo/"
+    for i in 0..17 {
+        let name = format!("enc/promo/{}.txt", i);
+        let fr = FileRef::new_inline_blob(Bytes::from_static(b"x"));
+        fs.file_put_sync(&name, fr).await.unwrap();
+    }
+
+    // "enc/promo" should be promoted to a directory.
+
+    // Verify we can list it.
+    let (entries, _) = fs.list_at("enc", None, 100).await.unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|(name, kind)| name == "promo" && matches!(kind, s5_fs::CursorKind::Directory))
+    );
+
+    let (sub_entries, _) = fs.list_at("enc/promo", None, 100).await.unwrap();
+    assert_eq!(sub_entries.len(), 17);
 }
 
 #[tokio::test]

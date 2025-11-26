@@ -1,0 +1,60 @@
+# S5 Node Configuration Example
+# Copy to ~/.config/s5/local.toml and customize.
+# See docs/reference/configuration.md for full reference.
+
+# Human-readable name for this node
+name = "my-node"
+
+# --- Identity ---
+# The node's Ed25519 identity. Generate with: s5 config init
+# After running `s5 config init`, this will be set to `local.secretkey`
+# (a relative path next to this config file).
+[identity]
+secret_key_file = "local.secretkey"
+
+# --- Blob Storage ---
+# Local filesystem store (default)
+[store.default]
+type = "local"
+base_path = "~/.local/share/s5/blobs"
+
+# Uncomment to add S3-compatible storage:
+# [store.s3]
+# type = "s3"
+# endpoint = "https://s3.amazonaws.com"   # required S3-compatible endpoint
+# region = "us-east-1"                    # optional region
+# bucket_name = "my-s5-bucket"
+# access_key = "AKIAIOSFODNN7EXAMPLE"
+# secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+# Uncomment to add Sia renterd storage:
+# [store.sia]
+# type = "sia_renterd"
+# bucket = "s5-blobs"
+# worker_api_url = "http://localhost:9980/api/worker"
+# bus_api_url = "http://localhost:9980/api/bus"
+# password = "your-renterd-password"
+
+# --- Peers ---
+# Add known peers for blob exchange and sync routing.
+# [peer.friend]
+# id = "2kajba6o6aa3f53szgv5kq1bjbs5d7w6xjbowtafbxfvrmbjb4tq"  # Their Endpoint ID
+#
+# [peer.friend.blobs]
+# readable_stores = ["default"]
+# store_uploads_in = "default"
+
+# --- Sync ---
+# Continuous folder synchronization via untrusted relay.
+# [sync.documents]
+# local_path = "/home/user/Documents"
+# via_untrusted = ["friend"]
+# shared_secret = "correct-horse-battery-staple"
+# interval_secs = 60
+
+# --- FUSE Mounts ---
+# Auto-mount FS5 roots when the node starts.
+# [fuse.docs]
+# root_path = "~/.local/share/s5/roots/local.fs5"
+# mount_path = "/mnt/s5-docs"
+# auto_unmount = true

@@ -1,4 +1,13 @@
+//! Pure data structures and on-disk (CBOR) schema for FS5 directories.
+//!
+//! This module defines `DirV1` snapshots and related types. It contains no
+//! I/O or async code and is shared across readers/writers.
+
+use anyhow::anyhow;
 use bytes::Bytes;
+use chacha20poly1305::KeyInit;
+use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, AeadCore};
 use minicbor::{CborLen, Decode, Encode};
 use s5_core::Hash;
 use s5_core::blob::location::BlobLocation;
@@ -17,9 +26,12 @@ pub struct DirV1 {
     pub dirs: BTreeMap<String, DirRef>,
     #[n(3)]
     pub files: BTreeMap<String, FileRef>,
-    // TODO: Serialize only when non-empty
-    #[n(4)]
-    pub shards: BTreeMap<u8, DirRef>,
+}
+
+impl Default for DirV1 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirV1 {
@@ -30,7 +42,6 @@ impl DirV1 {
             header: DirHeader::new(),
             dirs: BTreeMap::new(),
             files: BTreeMap::new(),
-            shards: BTreeMap::new(),
         }
     }
     /// Creates a directory preconfigured for static web apps.
@@ -41,12 +52,12 @@ impl DirV1 {
                 shard_level: None,
                 try_files: Some(vec!["index.html".to_string()]),
                 error_pages: None,
-                random_id: None,
-                // extra: Extra::new(),
+                ops_counter: None,
+                last_written_by: None,
+                shards: None,
             },
             dirs: BTreeMap::new(),
             files: BTreeMap::new(),
-            shards: BTreeMap::new(),
         }
     }
     /* pub fn open<P: AsRef<Path>>(path: P) -> io::Result<OpenDirV1> {
@@ -73,15 +84,24 @@ impl DirV1 {
 pub struct DirHeader {
     #[n(0x4)]
     pub shard_level: Option<u8>,
+    #[n(0x05)]
+    pub shards: Option<BTreeMap<u8, DirRef>>,
 
     #[n(6)]
-    try_files: Option<Vec<String>>,
+    pub try_files: Option<Vec<String>>,
     #[n(14)]
-    error_pages: Option<BTreeMap<u16, String>>,
+    pub error_pages: Option<BTreeMap<u16, String>>,
 
-    #[n(0xff)]
-    #[cbor(with = "minicbor::bytes")]
-    pub random_id: Option<[u8; 16]>,
+    #[n(0x0c)]
+    pub ops_counter: Option<u64>,
+    #[n(0x0d)] // TODO implement
+    pub last_written_by: Option<BTreeMap<[u8; 16], u64>>,
+}
+
+impl Default for DirHeader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirHeader {
@@ -89,9 +109,11 @@ impl DirHeader {
     pub fn new() -> Self {
         Self {
             shard_level: None,
+            shards: None,
             error_pages: None,
             try_files: None,
-            random_id: None,
+            ops_counter: None,
+            last_written_by: None,
         }
     }
 }
@@ -100,7 +122,7 @@ impl DirHeader {
 #[cbor(map)]
 pub struct DirRef {
     #[n(0)]
-    pub ref_type: DirRefType,
+    pub ref_type: Option<DirRefType>,
     #[n(1)]
     #[cbor(with = "minicbor::bytes")]
     pub hash: [u8; 32],
@@ -134,7 +156,7 @@ impl DirRef {
     pub fn from_hash(hash: Hash) -> Self {
         Self {
             // link: DirLink::FixedHashBlake3(hash),
-            ref_type: DirRefType::Blake3Hash,
+            ref_type: None,
             hash: hash.into(),
             ts_seconds: None,
             ts_nanos: None,
@@ -144,12 +166,13 @@ impl DirRef {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_empty() -> Self {
         // let dir = DirV1::new();
         // let hash = blake3::hash(&dir.to_vec().unwrap());
         Self {
             // link: DirLink::FixedHashBlake3(hash),
-            ref_type: DirRefType::Blake3Hash,
+            ref_type: None,
             hash: [0; 32],
             ts_seconds: None,
             ts_nanos: None,
@@ -158,23 +181,31 @@ impl DirRef {
             keys: None,
         }
     }
+
+    pub fn ref_type(&self) -> DirRefType {
+        self.ref_type.clone().unwrap_or(DirRefType::Blake3Hash)
+    }
 }
 
 #[repr(u8)]
-#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug, PartialEq, Eq)]
 #[cbor(index_only)]
 pub enum FileRefType {
     #[n(0x03)]
     Blake3Hash = 0x03,
     #[n(0x11)]
     RegistryKey = 0x11,
+    /// Logical deletion marker; current head represents a delete, but
+    /// previous versions are retained via `prev`/`first_version`.
+    #[n(0x20)]
+    Tombstone = 0x20,
 }
 
 #[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug)]
 #[cbor(map)]
 pub struct FileRef {
     #[n(0)]
-    pub ref_type: FileRefType,
+    pub ref_type: Option<FileRefType>,
     #[n(1)]
     #[cbor(with = "minicbor::bytes")]
     pub hash: [u8; 32],
@@ -194,8 +225,15 @@ pub struct FileRef {
 
     #[n(0x16)]
     pub extra: Option<BTreeMap<String, ()>>,
+
     #[n(0x17)]
-    pub prev: Option<Box<FileRef>>,
+    pub prev: Option<Box<FileRef>>, // Immediate parent (Linked List). only set if not equal to the first_version
+    #[n(0x19)]
+    pub version_count: Option<u32>, // So UI knows "Version 50" without traversing
+
+    #[n(0x18)]
+    // The very first version
+    pub first_version: Option<Box<FileRef>>,
 }
 
 #[derive(Encode, Decode, Serialize, Deserialize, CborLen, Clone, Debug, Default)]
@@ -222,10 +260,13 @@ pub struct WebArchiveMetadata {
 impl FileRef {
     /// Creates an inline-blob `FileRef` storing data directly in metadata.
     /// Suitable for very small blobs; large blobs should use the blob store.
+    ///
+    /// TODO: Enforce a max size limit (e.g. 4096 bytes) here to prevent
+    /// metadata bloat, as suggested in s5_node/README.md.
     pub fn new_inline_blob(blob: Bytes) -> Self {
         let hash = blake3::hash(&blob);
         Self {
-            ref_type: FileRefType::Blake3Hash,
+            ref_type: None,
             hash: hash.into(),
             size: blob.len() as u64,
             media_type: None,
@@ -234,13 +275,15 @@ impl FileRef {
             locations: Some(vec![BlobLocation::IdentityRawBinary(blob.to_vec())]),
             extra: None,
             prev: None,
+            version_count: None,
             warc: None,
+            first_version: None,
         }
     }
     /// Creates a hashed `FileRef` referencing content by Blake3 `hash` and `size`.
     pub fn new(hash: Hash, size: u64) -> Self {
         Self {
-            ref_type: FileRefType::Blake3Hash,
+            ref_type: None,
             hash: *hash.as_bytes(),
             size,
             media_type: None,
@@ -249,7 +292,46 @@ impl FileRef {
             locations: None,
             extra: None,
             prev: None,
+            version_count: None,
             warc: None,
+            first_version: None,
+        }
+    }
+
+    pub fn ref_type(&self) -> FileRefType {
+        self.ref_type.clone().unwrap_or(FileRefType::Blake3Hash)
+    }
+
+    /// Returns true if this `FileRef` represents a logical deletion.
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self.ref_type(), FileRefType::Tombstone)
+    }
+
+    /// Creates a tombstone `FileRef` from the last live version.
+    ///
+    /// - `deleted_at_s` / `deleted_at_ns` indicate when the delete occurred.
+    /// - The previous live version is threaded into `prev` / `first_version`
+    ///   and `version_count` is incremented if present.
+    pub fn from_deleted(previous: FileRef, deleted_at_s: u32, deleted_at_ns: u32) -> Self {
+        let first_version = previous
+            .first_version
+            .clone()
+            .unwrap_or_else(|| Box::new(previous.clone()));
+        let version_count = previous.version_count.unwrap_or(1).saturating_add(1);
+
+        Self {
+            ref_type: Some(FileRefType::Tombstone),
+            hash: previous.hash,
+            size: previous.size,
+            media_type: previous.media_type.clone(),
+            timestamp: Some(deleted_at_s),
+            timestamp_subsec_nanos: Some(deleted_at_ns),
+            locations: None,
+            extra: previous.extra.clone(),
+            prev: Some(Box::new(previous.clone())),
+            version_count: Some(version_count),
+            warc: previous.warc.clone(),
+            first_version: Some(first_version),
         }
     }
 }
@@ -260,15 +342,52 @@ impl From<s5_core::BlobId> for FileRef {
     }
 }
 
-impl Into<s5_core::BlobId> for FileRef {
-    fn into(self) -> s5_core::BlobId {
+impl From<FileRef> for s5_core::BlobId {
+    fn from(val: FileRef) -> Self {
         s5_core::BlobId::new(
             Hash::from_bytes(
-                self.hash[0..32]
+                val.hash[0..32]
                     .try_into()
                     .expect("expected 32-byte Blake3 hash"),
             ),
-            self.size,
+            val.size,
         )
     }
+}
+
+/// Decrypts directory bytes if an encryption key is provided.
+pub fn decrypt_dir_bytes(bytes: Bytes, key: Option<&[u8; 32]>) -> anyhow::Result<Bytes> {
+    if let Some(key) = key {
+        let cipher = XChaCha20Poly1305::new(key.into());
+
+        if bytes.len() < 24 {
+            return Err(anyhow!(
+                "encrypted directory blob too short for nonce: {} bytes",
+                bytes.len()
+            ));
+        }
+
+        let nonce = &bytes[..24];
+        let ciphertext = &bytes[24..];
+        let plaintext = cipher
+            .decrypt(nonce.into(), ciphertext)
+            .map_err(|e| anyhow!("Failed to decrypt directory: {}", e))?;
+        Ok(plaintext.into())
+    } else {
+        Ok(bytes)
+    }
+}
+
+/// Encrypts directory bytes using XChaCha20Poly1305.
+pub fn encrypt_dir_bytes(key: &[u8; 32], plain: &[u8]) -> anyhow::Result<Bytes> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut chacha20poly1305::aead::OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plain)
+        .map_err(|e| anyhow!("Failed to encrypt directory: {}", e))?;
+    let mut buf = bytes::BytesMut::with_capacity(24 + ciphertext.len());
+    use bytes::BufMut;
+    buf.put_slice(&nonce);
+    buf.put_slice(&ciphertext);
+    Ok(buf.into())
 }

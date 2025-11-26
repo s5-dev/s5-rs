@@ -19,6 +19,22 @@ pub enum RpcProto {
     // Server streams bytes to client for ranged downloads.
     #[rpc(tx = mpsc::Sender<Bytes>)]
     DownloadBlob(DownloadBlob),
+    /// Request that the server unpin this client's reference to
+    /// a blob and, if no pins remain, delete it from storage.
+    ///
+    /// The response is `Ok(true)` if the blob became orphaned
+    /// and was deleted, `Ok(false)` if other pins remain, and
+    /// `Err(String)` on permission or other server-side errors.
+    // TODO this could be a privacy issue, because now any node knows if maybe someone else pinned the same hash on the remote node or not. do we actually need the bool?
+    #[rpc(tx = oneshot::Sender<Result<bool, String>>)]
+    DeleteBlob(DeleteBlob),
+}
+
+/// Delete request identified by the blob's content hash.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteBlob {
+    /// BLAKE3 hash of the blob to unpin/delete.
+    pub hash: [u8; 32],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,6 +44,7 @@ pub struct UploadBlob {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+// TODO: Consider extending with a chunk bitmap (RoaringBitmap) or chunk ranges for multi-source piece selection.
 pub struct DownloadBlob {
     pub hash: [u8; 32],
     pub offset: u64,
@@ -35,6 +52,10 @@ pub struct DownloadBlob {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
+// TODO: Extend discovery responses to carry richer metadata:
+// - validity / expiry timestamp for locations (like the old Announce.timestamp).
+// - origin metadata for locations (which peer/store provided them).
+// - optional chunk availability (e.g. RoaringBitmap) to aid partial downloads.
 pub struct QueryResponse {
     pub exists: bool,
     pub size: Option<u64>,
@@ -43,6 +64,10 @@ pub struct QueryResponse {
 
 /// Query a peer for a blob.
 #[derive(Debug, Serialize, Deserialize)]
+// TODO: Implement multi-target queries as in the original design:
+// - interpret `location_types` as requested location kinds (e.g. BlobContent, Obao6).
+// - have servers filter/populate `QueryResponse.locations` accordingly instead of
+//   always returning only "blob content" locations.
 pub struct Query {
     /// The blake3 hash we want to find blob locations for.
     pub hash: [u8; 32],
@@ -50,7 +75,12 @@ pub struct Query {
     pub location_types: BTreeSet<u8>,
 }
 
-/* // TODO maybe just use registry entries for signed announces
+// TODO: Decide on verifiable announces (SignedAnnounce) vs. external registry:
+// - keep this crate focused on online queries only, or
+// - reintroduce SignedAnnounce + AnnounceTarget (BlobContent, Obao6, etc.) with
+//   signatures and expiry, or
+// - move long-lived announces entirely into the S5 registry and delete this block.
+/*
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignedAnnounce {
     pub node_id: [u8; 32],

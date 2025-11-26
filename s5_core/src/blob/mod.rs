@@ -1,8 +1,15 @@
 pub mod identifier;
+pub mod import;
 pub mod location;
+pub mod paths;
+pub mod read;
 pub mod store;
 
-use crate::{BlobId, Hash};
+pub use identifier::BlobId;
+pub use location::BlobLocation;
+pub use store::BlobStore;
+
+use crate::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;

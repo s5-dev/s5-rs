@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 /// `RegistryPinner` stores pin information as CBOR-encoded `PinContext`
 /// sets in the registry, keyed by a `StreamKey::Blake3HashPin` derived
 /// from the blob `Hash`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RegistryPinner<R> {
     registry: Arc<R>,
     /// Ensures that `get -> modify -> set` is atomic for this instance.
@@ -22,7 +22,7 @@ pub struct RegistryPinner<R> {
 }
 
 #[async_trait::async_trait]
-impl<R: RegistryApi + Send + Sync> Pins for RegistryPinner<R> {
+impl<R: RegistryApi + Send + Sync + std::fmt::Debug + 'static> Pins for RegistryPinner<R> {
     async fn pin_hash(&self, hash: crate::Hash, context: PinContext) -> Result<()> {
         // 1. Acquire lock to serialize metadata updates
         let lock = self.lock_for_hash(hash);
@@ -40,7 +40,7 @@ impl<R: RegistryApi + Send + Sync> Pins for RegistryPinner<R> {
         self.save_internal(key, pinners, revision + 1).await
     }
 
-    async fn unpin_hash(&self, hash: crate::Hash, context: PinContext) -> Result<()> {
+    async fn unpin_hash(&self, hash: crate::Hash, context: PinContext) -> Result<bool> {
         let lock = self.lock_for_hash(hash);
         let _guard = lock.lock().await;
 
@@ -48,10 +48,12 @@ impl<R: RegistryApi + Send + Sync> Pins for RegistryPinner<R> {
         let (mut pinners, revision) = self.get_internal(&key).await?;
 
         if !pinners.remove(&context) {
-            return Ok(());
+            return Ok(pinners.is_empty());
         }
 
-        self.save_internal(key, pinners, revision + 1).await
+        let is_empty = pinners.is_empty();
+        self.save_internal(key, pinners, revision + 1).await?;
+        Ok(is_empty)
     }
 
     async fn unpin_hash_all(&self, hash: crate::Hash) -> Result<()> {
@@ -81,7 +83,7 @@ impl<R: RegistryApi + Send + Sync> Pins for RegistryPinner<R> {
     }
 }
 
-impl<R: RegistryApi + Send + Sync> RegistryPinner<R> {
+impl<R: RegistryApi + Send + Sync + 'static> RegistryPinner<R> {
     pub fn new(registry: R) -> Self {
         let mut locks = Vec::with_capacity(64);
         for _ in 0..64 {
@@ -91,6 +93,15 @@ impl<R: RegistryApi + Send + Sync> RegistryPinner<R> {
             registry: Arc::new(registry),
             write_locks: locks.try_into().unwrap(),
         }
+    }
+
+    /// Returns a clone of the underlying registry as a trait object.
+    ///
+    /// This is useful when a caller needs both a `RegistryApi`
+    /// handle and a `Pins` implementation over the same backing
+    /// database.
+    pub fn registry_arc(&self) -> Arc<dyn RegistryApi + Send + Sync> {
+        self.registry.clone() as Arc<dyn RegistryApi + Send + Sync>
     }
 
     /// Removes a user. Returns `true` if the blob is now orphaned (0 pinners).

@@ -68,10 +68,12 @@ async fn fs_sync_complete() -> Result<()> {
         readable_stores: vec!["meta".to_string()],
         store_uploads_in: Some("meta".to_string()),
     };
-    peer_cfg.insert(format!("{:?}", laptop_endpoint.id()), acl.clone());
-    peer_cfg.insert(format!("{:?}", desktop_endpoint.id()), acl);
+    // Use the EndpointId display string for ACL keys, matching the
+    // production server behaviour and config expectations.
+    peer_cfg.insert(laptop_endpoint.id().to_string(), acl.clone());
+    peer_cfg.insert(desktop_endpoint.id().to_string(), acl);
 
-    let blobs_server = BlobsServer::new(stores, peer_cfg);
+    let blobs_server = BlobsServer::new(stores, peer_cfg, None);
 
     // Registry storage on the cloud node.
     let registry_dir = tempdir()?;
@@ -110,12 +112,7 @@ async fn fs_sync_complete() -> Result<()> {
         s5_blobs::Client::connect(desktop_endpoint.clone(), cloud_addr.clone());
     let desktop_registry_client =
         RemoteRegistry::connect(desktop_endpoint.clone(), cloud_addr.clone());
-    let desktop_encrypted = open_encrypted_fs(
-        stream_key,
-        &desktop_keys,
-        desktop_blob_client.clone(),
-        desktop_registry_client.clone(),
-    );
+    // We will open desktop_encrypted later when we need to pull.
 
     // Create sample data on the laptop plaintext FS.
     laptop_plain.create_dir("docs", false).await?;
@@ -132,6 +129,12 @@ async fn fs_sync_complete() -> Result<()> {
             FileRef::new_inline_blob(Bytes::from_static(b"1. celebrate successful sync")),
         )
         .await?;
+    laptop_plain
+        .file_put_sync(
+            "root_note.txt",
+            FileRef::new_inline_blob(Bytes::from_static(b"Root file content")),
+        )
+        .await?;
     laptop_plain.save().await?;
 
     // Push laptop plaintext state into the encrypted FS (publishes to cloud).
@@ -143,6 +146,13 @@ async fn fs_sync_complete() -> Result<()> {
     drop(laptop_registry_client);
 
     // Pull the encrypted state into desktop plaintext FS via the cloud.
+    // Re-open desktop_encrypted to ensure it loads the latest state from the registry.
+    let desktop_encrypted = open_encrypted_fs(
+        stream_key,
+        &desktop_keys,
+        desktop_blob_client.clone(),
+        desktop_registry_client.clone(),
+    );
     pull_snapshot(&desktop_encrypted, &desktop_plain).await?;
 
     // Validate desktop plaintext matches laptop plaintext.

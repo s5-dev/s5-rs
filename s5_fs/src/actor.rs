@@ -3,33 +3,26 @@
 use crate::{
     FSResult,
     context::{DirContext, DirContextParentLink, DirHandlePath},
-    dir::{DirRef, DirV1, ENCRYPTION_TYPE_XCHACHA20_POLY1305, FileRef},
+    dir::{DirV1, FileRef},
 };
 use anyhow::{Context, anyhow};
-use bytes::{BufMut, Bytes, BytesMut};
-use chacha20poly1305::{
-    AeadCore, KeyInit, XChaCha20Poly1305,
-    aead::{Aead, OsRng, rand_core::RngCore},
-};
-use chrono::Utc;
-use ed25519::signature::Signer;
-use ed25519_dalek::SigningKey as DalekSigningKey;
-use futures::future::join_all;
-use minicbor::bytes::ByteVec;
-use s5_core::{Hash, StreamKey, StreamMessage, api::streams::RegistryApi, stream::MessageType};
-use std::{
-    collections::{BTreeMap, HashMap},
-    io::{self, Read, Write},
-};
-use tempfile::NamedTempFile;
+use s5_core::{Hash, StreamKey};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Duration;
+
+mod listing;
+mod merge;
+mod persistence;
+pub(crate) mod sharding;
+mod snapshots;
+
+pub(crate) type ListResult = FSResult<(Vec<(String, crate::api::CursorKind)>, Option<String>)>;
 
 type Value = Option<FileRef>;
 
-const MAX_DIR_BYTES_BEFORE_SHARD: usize = 65_536;
-
 /// A trait for tasks that can be executed on a `FileRef` value.
-pub trait Task: std::fmt::Debug {
+pub(crate) trait Task: std::fmt::Debug {
     fn execute(self: Box<Self>, value: &mut Value);
 }
 
@@ -56,7 +49,7 @@ impl<R: Send> Task for FunctionTask<R> {
 
 /// Messages sent from a `DirActorHandle` to a `DirActor`.
 #[derive(Debug)]
-pub enum ActorMessage {
+pub(crate) enum ActorMessage {
     /// An operation to be performed on a path within the directory.
     PathOp {
         path: String,
@@ -68,21 +61,76 @@ pub enum ActorMessage {
         hash: Hash,
     },
     SaveIfDirty {
-        responder: oneshot::Sender<()>,
+        responder: oneshot::Sender<FSResult<Option<Hash>>>,
+    },
+    /// Opens (or creates) a subdirectory at the given logical path
+    /// and returns a handle to its directory actor.
+    OpenSubdir {
+        path: String,
+        responder: oneshot::Sender<FSResult<DirActorHandle>>,
+    },
+    /// Computes and persists a snapshot blob for the current directory
+    /// state, returning its BLAKE3 hash. Works for any context.
+    ExportSnapshotHash {
+        responder: oneshot::Sender<FSResult<Hash>>,
+    },
+    /// Creates a named snapshot of the current root directory state.
+    /// Only meaningful for the local FS5 root (`DirContextParentLink::LocalFile`).
+    CreateSnapshot {
+        responder: oneshot::Sender<FSResult<(String, Hash)>>,
+    },
+    /// Deletes a named snapshot from `snapshots.fs5.cbor` and unpins its
+    /// `PinContext::LocalFsSnapshot` entry, if present.
+    DeleteSnapshot {
+        name: String,
+        responder: oneshot::Sender<FSResult<()>>,
+    },
+    /// Lists entries with a cursor and limit.
+    List {
+        cursor: Option<String>,
+        limit: usize,
+        responder: oneshot::Sender<ListResult>,
+    },
+    /// Lists entries at a nested path.
+    ListAt {
+        path: String,
+        cursor: Option<String>,
+        limit: usize,
+        responder: oneshot::Sender<ListResult>,
     },
     ExportSnapshot {
+        responder: oneshot::Sender<FSResult<DirV1>>,
+    },
+    ExportMergedSnapshot {
+        responder: oneshot::Sender<FSResult<DirV1>>,
+    },
+    /// Exports snapshot at a nested path.
+    ExportSnapshotAt {
+        path: String,
+        responder: oneshot::Sender<FSResult<DirV1>>,
+    },
+    /// Exports merged snapshot at a nested path.
+    ExportMergedSnapshotAt {
+        path: String,
         responder: oneshot::Sender<FSResult<DirV1>>,
     },
     MergeSnapshot {
         snapshot: DirV1,
         responder: oneshot::Sender<FSResult<()>>,
     },
+    SetAutosave {
+        debounce_ms: u64,
+    },
+    AutosaveTick,
     MarkAsDirty,
+    Shutdown {
+        responder: oneshot::Sender<()>,
+    },
 }
 
 /// The specific operations that can be performed via `ActorMessage::PathOp`.
 #[derive(Debug)]
-pub enum ActorMessageOp {
+pub(crate) enum ActorMessageOp {
     /// An operation on a file, encapsulated as a `Task`.
     FileOp { task: Box<dyn Task + Send> },
     /// Creates a new subdirectory.
@@ -94,17 +142,38 @@ pub enum ActorMessageOp {
 
 /// The actor that manages the state of a single directory.
 struct DirActor {
-    context: DirContext,
-    receiver: mpsc::Receiver<ActorMessage>,
-    handle: Option<DirActorHandle>,
-    state: DirV1,
-    autosave: bool,
-    dirty: bool,
-    initial_state: Option<DirV1>,
-    dir_handles: HashMap<String, DirActorHandle>,
-    dir_shard_handles: HashMap<u8, DirActorHandle>,
+    pub(super) context: DirContext,
+    pub(super) receiver: mpsc::Receiver<ActorMessage>,
+    pub(super) handle: Option<WeakDirActorHandle>,
+    pub(super) state: DirV1,
+    pub(super) autosave_debounce_ms: Option<u64>,
+    pub(super) autosave_timer_active: bool,
+    pub(super) dirty: bool,
+    pub(super) initial_state: Option<DirV1>,
+    pub(super) dir_handles: HashMap<String, DirActorHandle>,
+    pub(super) dir_shard_handles: HashMap<u8, DirActorHandle>,
 
-    hashes_to_delete: Vec<Hash>,
+    /// Current hash of this directory's persisted snapshot, if known.
+    ///
+    /// For the local FS5 root (`DirContextParentLink::LocalFile`), this
+    /// is used together with `DirContext.pins` to keep the live head
+    /// (`PinContext::LocalFsHead`) up to date.
+    pub(super) current_hash: Option<Hash>,
+
+    /// Cached length of the last serialized directory state (unencrypted).
+    /// Used as a cheap lower bound when deciding whether to shard.
+    pub(super) last_serialized_len: usize,
+
+    /// Approximate number of state mutations since the last sharding
+    /// size check. Incremented when the directory is marked dirty.
+    pub(super) shard_size_check_ops: u64,
+}
+
+impl Drop for DirActor {
+    fn drop(&mut self) {
+        // Actor teardown is silent; rely on tracing inside the
+        // actor loop for diagnostics rather than printing here.
+    }
 }
 
 impl DirActor {
@@ -113,7 +182,7 @@ impl DirActor {
         receiver: mpsc::Receiver<ActorMessage>,
         context: DirContext,
         initial_state: Option<DirV1>,
-        autosave: bool,
+        autosave_debounce_ms: Option<u64>,
     ) -> Self {
         Self {
             receiver,
@@ -124,8 +193,11 @@ impl DirActor {
             dir_handles: HashMap::new(),
             dir_shard_handles: HashMap::new(),
             initial_state,
-            autosave,
-            hashes_to_delete: vec![],
+            autosave_debounce_ms,
+            autosave_timer_active: false,
+            current_hash: None,
+            last_serialized_len: 0,
+            shard_size_check_ops: 0,
         }
     }
 
@@ -134,57 +206,93 @@ impl DirActor {
         if let Some(initial_state) = self.initial_state.take() {
             self.state = initial_state;
             // The first save will publish the hash to the parent/registry
-            if let Err(e) = self.save().await {
-                log::error!("Initial save failed: {}", e);
+            if let Err(e) = self.save(true).await {
+                tracing::error!("Initial save failed: {}", e);
             }
         } else if let Err(e) = self.load().await {
-            log::error!("Failed to load directory state: {}", e);
+            tracing::error!("Failed to load directory state: {}", e);
+            // Abort this actor so callers observe a hard error
+            // instead of an implicitly empty directory state.
+            return;
         }
 
         while let Some(msg) = self.receiver.recv().await {
+            if let ActorMessage::Shutdown { responder } = msg {
+                if self.dirty {
+                    self.shard_if_needed().await.ok();
+                    if let Err(e) = self.save(false).await {
+                        tracing::error!("shutdown save failed: {e}");
+                    }
+                }
+
+                for handle in self.dir_handles.values() {
+                    let _ = handle.shutdown().await;
+                }
+                for handle in self.dir_shard_handles.values() {
+                    let _ = handle.shutdown().await;
+                }
+                let _ = responder.send(());
+                break;
+            }
             if let Err(e) = self.process_msg(msg).await {
-                log::error!("Failed to process message: {}", e);
+                tracing::error!("Failed to process message: {}", e);
+            }
+        }
+
+        // Safety net: if the actor loop exits (e.g. channel closed), ensure we save if dirty.
+        if self.dirty {
+            self.shard_if_needed().await.ok();
+            if let Err(e) = self.save(false).await {
+                tracing::error!("shutdown save failed: {e}");
             }
         }
     }
 
+    /// Routes a path to a child actor (either a direct subdirectory or a shard).
+    /// Returns `Some((handle, remaining_path))` if a child is found, or `None` if
+    /// the path refers to a local entry (or doesn't exist).
+    async fn route_to_child(&mut self, path: &str) -> FSResult<Option<(DirActorHandle, String)>> {
+        let (dir_name, rest) = match path.split_once('/') {
+            Some((d, r)) => (d, r.to_string()),
+            None => (path, String::new()),
+        };
+
+        // Check sharding first (if enabled, dirs are in shards)
+        if let Some(shard_level) = self.state.header.shard_level {
+            let index = crate::actor::sharding::shard_bucket_for(dir_name, shard_level);
+            if let Some(shards) = &self.state.header.shards
+                && shards.contains_key(&index)
+            {
+                let handle = self.open_dir_shard(index, None).await?;
+                // When routing to a shard, we pass the FULL path, because the shard
+                // acts as a container for the entry.
+                return Ok(Some((handle, path.to_string())));
+            }
+        }
+
+        // Check direct child
+        if self.state.dirs.contains_key(dir_name) {
+            let handle = self.open_dir(dir_name, None).await?;
+            // When routing to a direct child directory, we pass the REST of the path,
+            // because we have already traversed 'dir_name'.
+            return Ok(Some((handle, rest)));
+        }
+
+        Ok(None)
+    }
+
     /// Processes a single message.
     async fn process_msg(&mut self, msg: ActorMessage) -> FSResult<()> {
-        /*    match &self.context.link {
-            DirContextParentLink::DirHandle { path, .. } => {
-                // Debug-only: log path and message
-                // println!("{:?} {msg:?}", path);
-            }
-            _ => {}
-        } */
-
         match msg {
             ActorMessage::PathOp { path, op } => {
-                if let Some((dir_name, rest_of_path)) = path.split_once('/') {
-                    if let Some(shard_level) = self.state.header.shard_level {
-                        let name_hash = blake3::hash(dir_name.as_bytes());
-                        let index = name_hash.as_bytes()[shard_level as usize];
-                        if let Some(_) = &self.state.shards.get(&index) {
-                            let handle = self.open_dir_shard(index, None).await?;
-                            let _ = handle
-                                .send_msg(ActorMessage::PathOp {
-                                    path: path.clone(),
-                                    op,
-                                })
-                                .await;
-                            return Ok(());
-                        }
-                    }
-                    if self.state.dirs.contains_key(dir_name) {
-                        let handle = self.open_dir(dir_name, None).await?;
-                        let _ = handle
-                            .send_msg(ActorMessage::PathOp {
-                                path: rest_of_path.to_string(),
-                                op,
-                            })
-                            .await;
-                        return Ok(());
-                    }
+                if let Some((handle, next_path)) = self.route_to_child(&path).await? {
+                    let _ = handle
+                        .send_msg(ActorMessage::PathOp {
+                            path: next_path,
+                            op,
+                        })
+                        .await;
+                    return Ok(());
                 }
 
                 match op {
@@ -193,7 +301,8 @@ impl DirActor {
                         let mut value = self.state.files.remove(&path);
                         task.execute(&mut value);
                         if let Some(file_ref) = value {
-                            self.state.files.insert(path, file_ref);
+                            self.state.files.insert(path.clone(), file_ref);
+                            self.check_auto_promote(&path).await?;
                         }
                         self.mark_as_dirty().await;
                     }
@@ -201,115 +310,117 @@ impl DirActor {
                         enable_encryption,
                         responder,
                     } => {
-                        let result = async {
-                            if self.state.dirs.contains_key(&path) {
-                                return Ok(()); // Idempotent
-                            }
-                            let prefix = format!("{}/", path);
-                            let (matching, other): (
-                                BTreeMap<String, FileRef>,
-                                BTreeMap<String, FileRef>,
-                            ) = self
-                                .state
-                                .files
-                                .clone()
-                                .into_iter()
-                                .partition(|(k, _v)| k.starts_with(&prefix));
-
-                            let mut new_dir_state = DirV1::new();
-                            for (file_path, file_ref) in matching {
-                                let sub_path = file_path
-                                    .strip_prefix(&prefix)
-                                    .expect("prefix already verified by partition")
-                                    .to_string();
-                                new_dir_state.files.insert(sub_path, file_ref);
-                            }
-
-                            // let signing_key = SigningKey::generate(&mut OsRng);
-                            // let public_key: VerifyingKey = (&signing_key).into();
-
-                            let mut keys = BTreeMap::new();
-                            if enable_encryption {
-                                let key: [u8; 32] =
-                                    XChaCha20Poly1305::generate_key(&mut OsRng).into();
-                                keys.insert(0x0e, key);
-                            }
-                            let mut registry_pointer = [0u8; 32];
-                            OsRng.fill_bytes(&mut registry_pointer);
-                            // keys.insert(0x0c, ByteVec::from(signing_key.as_bytes().to_vec()));
-
-                            let now = Utc::now();
-                            let dir_ref = DirRef {
-                                encryption_type: if enable_encryption {
-                                    Some(ENCRYPTION_TYPE_XCHACHA20_POLY1305)
-                                } else {
-                                    None
-                                },
-                                extra: None,
-                                hash: registry_pointer,
-                                ref_type: crate::dir::DirRefType::RegistryKey,
-                                keys: Some(keys),
-                                ts_seconds: Some(now.timestamp() as u32),
-                                ts_nanos: Some(now.timestamp_subsec_nanos() as u32),
-                            };
-                            self.state.dirs.insert(path.to_owned(), dir_ref);
-                            self.state.files = other;
-
-                            self.open_dir(&path, Some(new_dir_state)).await?;
-                            Ok(())
-                        }
-                        .await;
+                        let result = self.create_dir_at(&path, enable_encryption).await;
                         let _ = responder.send(result);
-                        self.mark_as_dirty().await;
                     }
                 }
             }
-            ActorMessage::UpdateDirRefHash { path, hash } => {
-                let mut dir_ref = match &path {
-                    DirHandlePath::Path(path) => {
-                        self.state.dirs.remove(path).context("dir does not exist")?
+            ActorMessage::OpenSubdir { path, responder } => {
+                let result: FSResult<DirActorHandle> = async {
+                    if let Some((handle, next_path)) = self.route_to_child(&path).await? {
+                        if next_path.is_empty() {
+                            return Ok(handle);
+                        }
+                        let (tx, rx) = oneshot::channel();
+                        handle
+                            .send_msg(ActorMessage::OpenSubdir {
+                                path: next_path,
+                                responder: tx,
+                            })
+                            .await?;
+                        return rx.await?;
                     }
-                    DirHandlePath::Shard(index) => self
+
+                    // If we are here, the first component of the path does not exist.
+                    // We must create it and recurse.
+                    let (first, rest) = match path.split_once('/') {
+                        Some((f, r)) => (f, r),
+                        None => (path.as_str(), ""),
+                    };
+
+                    if !self.state.dirs.contains_key(first) {
+                        let inherit_encryption = self.context.encryption_type.is_some();
+                        self.create_dir_at(first, inherit_encryption).await?;
+                    }
+                    let handle = self.open_dir(first, None).await?;
+
+                    if rest.is_empty() {
+                        Ok(handle)
+                    } else {
+                        let (tx, rx) = oneshot::channel();
+                        handle
+                            .send_msg(ActorMessage::OpenSubdir {
+                                path: rest.to_string(),
+                                responder: tx,
+                            })
+                            .await?;
+                        rx.await?
+                    }
+                }
+                .await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::UpdateDirRefHash { path, hash } => {
+                let dir_ref = match &path {
+                    DirHandlePath::Path(path) => self
                         .state
-                        .shards
-                        .remove(&index)
-                        .context("dir shard not exist")?,
+                        .dirs
+                        .get_mut(path)
+                        .context("dir does not exist")?,
+                    DirHandlePath::Shard(index) => {
+                        let shards = self
+                            .state
+                            .header
+                            .shards
+                            .as_mut()
+                            .context("dir shard not exist")?;
+                        shards.get_mut(index).context("dir shard not exist")?
+                    }
                 };
 
-                if dir_ref.hash != [0; 32] {
-                    self.hashes_to_delete.push(dir_ref.hash.into());
+                if dir_ref.hash == *hash.as_bytes() {
+                    return Ok(());
                 }
 
                 dir_ref.hash = hash.into();
 
-                match path {
-                    DirHandlePath::Path(path) => self.state.dirs.insert(path, dir_ref),
-                    DirHandlePath::Shard(index) => self.state.shards.insert(index, dir_ref),
-                };
                 self.mark_as_dirty().await;
             }
             ActorMessage::SaveIfDirty { responder } => {
-                if self.dirty {
-                    // println!("[fs] saving dir");
-                    self.shard_if_needed().await?;
-
-                    join_all(self.dir_shard_handles.values().map(|h| h.save_if_dirty())).await;
-
-                    join_all(self.dir_handles.values().map(|h| h.save_if_dirty())).await;
-
-                    self.save().await?;
-
-                    for hash in &self.hashes_to_delete {
-                        self.context.meta_blob_store.delete(*hash).await?;
-                    }
-                    self.hashes_to_delete.clear();
-
-                    self.dirty = false;
-                }
-                let _ = responder.send(());
+                let result = self.save_if_dirty().await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::List {
+                cursor,
+                limit,
+                responder,
+            } => {
+                let result = self.list_entries(cursor.as_deref(), limit).await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::ListAt {
+                path,
+                cursor,
+                limit,
+                responder,
+            } => {
+                let result = self.list_at_path(path, cursor, limit).await;
+                let _ = responder.send(result);
             }
             ActorMessage::ExportSnapshot { responder } => {
                 let _ = responder.send(Ok(self.state.clone()));
+            }
+            ActorMessage::ExportMergedSnapshot { responder } => {
+                let result = self.export_merged_snapshot().await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::ExportSnapshotAt { path, responder } => {
+                let result = self.export_snapshot_at(path).await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::ExportMergedSnapshotAt { path, responder } => {
+                let result = self.export_merged_snapshot_at(path).await;
+                let _ = responder.send(result);
             }
             ActorMessage::MergeSnapshot {
                 snapshot,
@@ -318,57 +429,104 @@ impl DirActor {
                 let result = self.merge_snapshot(snapshot).await;
                 let _ = responder.send(result);
             }
+            ActorMessage::SetAutosave { debounce_ms } => {
+                self.autosave_debounce_ms = Some(debounce_ms);
+                // Propagate to children
+                for handle in self.dir_handles.values() {
+                    let _ = handle
+                        .send_msg(ActorMessage::SetAutosave { debounce_ms })
+                        .await;
+                }
+                for handle in self.dir_shard_handles.values() {
+                    let _ = handle
+                        .send_msg(ActorMessage::SetAutosave { debounce_ms })
+                        .await;
+                }
+            }
+            ActorMessage::AutosaveTick => {
+                self.autosave_timer_active = false;
+                if self.dirty {
+                    self.shard_if_needed().await?;
+                    match self.save(true).await {
+                        Ok(_) => {
+                            self.dirty = false;
+                        }
+                        Err(e) => {
+                            tracing::error!("autosave failed: {e}");
+                        }
+                    }
+                }
+            }
             /*   ActorMessage::GetShardLevel { responder } => {
                 responder.send(self.state.header.shard_level).unwrap();
             } */
             ActorMessage::MarkAsDirty => {
                 self.mark_as_dirty().await;
             }
+            ActorMessage::ExportSnapshotHash { responder } => {
+                let result = self.export_snapshot_hash().await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::CreateSnapshot { responder } => {
+                let result = self.create_snapshot().await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::DeleteSnapshot { name, responder } => {
+                let result = self.delete_snapshot(name).await;
+                let _ = responder.send(result);
+            }
+            ActorMessage::Shutdown { .. } => {
+                // Handled in run loop
+            }
         }
-        if self.autosave {
-            self.shard_if_needed().await?;
-            self.save().await?;
+        if let Some(ms) = self.autosave_debounce_ms
+            && self.dirty
+            && !self.autosave_timer_active
+        {
+            self.autosave_timer_active = true;
+            if let Some(weak) = &self.handle {
+                let weak_handle = weak.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    if let Some(handle) = weak_handle.upgrade() {
+                        let _ = handle.sender.send(ActorMessage::AutosaveTick).await;
+                    }
+                });
+            }
         }
         Ok(())
     }
 
     async fn mark_as_dirty(&mut self) {
+        self.shard_size_check_ops = self.shard_size_check_ops.saturating_add(1);
         if !self.dirty {
             self.dirty = true;
-            match &self.context.link {
-                DirContextParentLink::DirHandle { handle, .. } => {
-                    let _ = handle.send_msg(ActorMessage::MarkAsDirty).await;
-                }
-                _ => {}
+            if let DirContextParentLink::DirHandle { handle, .. } = &self.context.link
+                && let Some(handle) = handle.upgrade()
+            {
+                let _ = handle.send_msg(ActorMessage::MarkAsDirty).await;
             }
         }
     }
 
-    // TODO add versioning and proper conflict resolution
-    async fn merge_snapshot(&mut self, snapshot: DirV1) -> FSResult<()> {
-        let DirV1 {
-            header,
-            dirs,
-            files,
-            shards,
-            ..
-        } = snapshot;
-
-        for (name, dir_ref) in dirs {
-            self.dir_handles.remove(&name);
-            self.state.dirs.insert(name, dir_ref);
+    /// Helper to create a logical subdirectory at `path` under this actor.
+    ///
+    /// - Idempotent: if the directory already exists, this is a no-op.
+    /// - Partitions files with the `path/` prefix into a new DirV1 for the
+    ///   subdirectory and wires up a `DirRef` in this directory.
+    async fn create_dir_at(&mut self, path: &str, enable_encryption: bool) -> FSResult<()> {
+        if self.state.dirs.contains_key(path) {
+            return Ok(());
         }
 
-        for (name, file_ref) in files {
-            self.state.files.insert(name, file_ref);
-        }
+        // Move `path/` files into a new child directory snapshot.
 
-        for (index, dir_ref) in shards {
-            self.dir_shard_handles.remove(&index);
-            self.state.shards.insert(index, dir_ref);
-        }
+        let new_dir_state = self.extract_child_dir_state(path);
 
-        self.state.header = header;
+        let dir_ref = self.build_child_dir_ref(enable_encryption);
+        self.state.dirs.insert(path.to_owned(), dir_ref);
+
+        self.open_dir(path, Some(new_dir_state)).await?;
         self.mark_as_dirty().await;
         Ok(())
     }
@@ -383,9 +541,10 @@ impl DirActor {
             return Ok(handle.clone());
         }
 
+        tracing::debug!("open_dir: opening {}", sub_path);
         let dir_ref = self.state.dirs.get(sub_path).context("dir not found")?;
 
-        let link = match dir_ref.ref_type {
+        let link = match dir_ref.ref_type() {
             crate::dir::DirRefType::Blake3Hash => DirContextParentLink::DirHandle {
                 shard_level: 0,
                 path: DirHandlePath::Path(sub_path.to_owned()),
@@ -406,9 +565,9 @@ impl DirActor {
 
         let context = self.context.with_new_ref(dir_ref, link);
         // TODO: Propagate autosave and ensure recursive save/dirty semantics are correct
-        let handle = DirActorHandle::spawn(context, initial_state, self.autosave);
+        let handle = DirActorHandle::spawn(context, initial_state, self.autosave_debounce_ms);
 
-        match dir_ref.ref_type {
+        match dir_ref.ref_type() {
             crate::dir::DirRefType::Blake3Hash => {
                 self.dir_handles.insert(sub_path.to_owned(), handle.clone());
             }
@@ -417,6 +576,8 @@ impl DirActor {
                 self.context
                     .registry_dir_handles
                     .insert(key, handle.clone());
+                // Track registry-backed dirs as children so saves cascade.
+                self.dir_handles.insert(sub_path.to_owned(), handle.clone());
             }
         }
         Ok(handle)
@@ -427,288 +588,27 @@ impl DirActor {
         shard_index: u8,
         initial_state: Option<DirV1>,
     ) -> anyhow::Result<DirActorHandle> {
-        if let Some(handle) = self.dir_shard_handles.get(&shard_index) {
-            return Ok(handle.clone());
-        }
-
-        let dir_ref = self
-            .state
-            .shards
-            .get(&shard_index)
-            .context("shard not found")?;
-
-        let link =
-            match dir_ref.ref_type {
-                crate::dir::DirRefType::Blake3Hash => DirContextParentLink::DirHandle {
-                    shard_level: self.state.header.shard_level.ok_or_else(|| {
-                        anyhow!("missing shard level in parent when opening shard")
-                    })? + 1,
-                    path: DirHandlePath::Shard(shard_index),
-                    handle: self.handle.clone().context("actor has no handle")?,
-                    initial_hash: dir_ref.hash,
-                },
-                _ => return Err(anyhow!("dir shards can only be blake3 hash dir refs")),
-            };
-
-        let context = self.context.with_new_ref(dir_ref, link);
-        // TODO: Propagate autosave and ensure recursive save/dirty semantics are correct
-        let handle = DirActorHandle::spawn(context, initial_state, self.autosave);
-
-        self.dir_shard_handles.insert(shard_index, handle.clone());
-        Ok(handle)
-    }
-
-    /// Loads the directory state from storage.
-    async fn load(&mut self) -> FSResult<()> {
-        self.state = match &mut self.context.link {
-            DirContextParentLink::LocalFile { file, .. } => {
-                let mut buffer = Vec::new();
-                file.read_to_end(&mut buffer)?;
-                DirV1::from_bytes(&buffer)?
-            }
-            DirContextParentLink::DirHandle { initial_hash, .. } => {
-                let bytes = self
-                    .context
-                    .meta_blob_store
-                    .read_as_bytes((*initial_hash).into(), 0, None)
-                    .await
-                    .context("while reading from blob store")?;
-                DirV1::from_bytes(&Self::decrypt_if_needed(bytes, &self.context)?)?
-            }
-            DirContextParentLink::RegistryKey { public_key, .. } => {
-                if let Some(entry) = self.context.registry.get(public_key).await? {
-                    let bytes = self
-                        .context
-                        .meta_blob_store
-                        .read_as_bytes(entry.hash.into(), 0, None)
-                        .await?;
-                    DirV1::from_bytes(&Self::decrypt_if_needed(bytes, &self.context)?)?
-                } else {
-                    DirV1::new()
-                }
-            }
-        };
-        Ok(())
-    }
-
-    /// Decrypts directory bytes if encryption is enabled.
-    fn decrypt_if_needed(bytes: Bytes, context: &DirContext) -> FSResult<Bytes> {
-        if let Some(enc_type) = context.encryption_type {
-            if enc_type == ENCRYPTION_TYPE_XCHACHA20_POLY1305 {
-                let encryption_key = context
-                    .keys
-                    .get(&0x0e)
-                    .ok_or_else(|| anyhow!("missing encryption key 0x0e for XChaCha20-Poly1305"))?;
-                let cipher = XChaCha20Poly1305::new(encryption_key.as_ref().into());
-                let nonce = &bytes[0..24];
-                let plaintext = cipher
-                    .decrypt(nonce.into(), &bytes[24..])
-                    .map_err(|e| anyhow!("Failed to decrypt directory: {}", e))?;
-                Ok(plaintext.into())
-            } else {
-                Err(anyhow!("encryption type {} not supported", enc_type))
-            }
-        } else {
-            Ok(bytes)
-        }
-    }
-
-    async fn shard_if_needed(&mut self) -> FSResult<()> {
-        // TODO: Account for encryption overhead in size threshold
-        if self.state.to_bytes()?.len() >= MAX_DIR_BYTES_BEFORE_SHARD {
-            self.shard().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn shard(&mut self) -> FSResult<()> {
-        tracing::debug!("shard");
-        // let mut shards = self.state.shards;
-
-        if self.state.header.shard_level.is_none() {
-            let shard_level = match &self.context.link {
-                DirContextParentLink::DirHandle { shard_level, .. } => {
-                    *shard_level
-                    /*  let (responder, receiver) = oneshot::channel();
-                    let msg = ActorMessage::GetShardLevel { responder };
-                    handle.send_msg(msg).await;
-
-                    if let Some(parent_shard_level) = receiver.await? {
-                        parent_shard_level + 1
-                    } else {
-                        0
-                    } */
-                }
-                _ => 0,
-            };
-            self.state.header.shard_level = Some(shard_level);
-            tracing::debug!("shard_level {shard_level}");
-
-            /* for i in 0..255 {
-                self.state.shards.insert(i, DirRef::new_empty());
-            } */
-
-            let mut dirs = vec![DirV1::new(); 256];
-
-            for dir in &self.state.dirs {
-                let name_hash = blake3::hash(dir.0.as_bytes());
-                let index = name_hash.as_bytes()[shard_level as usize];
-                // TODO(perf): Avoid cloning here; consider borrowing or moving
-                dirs[index as usize]
-                    .dirs
-                    .insert(dir.0.to_owned(), dir.1.to_owned());
-            }
-            for file in &self.state.files {
-                let name_hash = blake3::hash(file.0.as_bytes());
-                let index = name_hash.as_bytes()[shard_level as usize];
-                dirs[index as usize]
-                    .files
-                    .insert(file.0.to_owned(), file.1.to_owned());
-            }
-            tracing::debug!("created new dirs");
-
-            for (i, shard_state) in dirs.into_iter().enumerate() {
-                self.state.shards.insert(i as u8, DirRef::new_empty());
-                let shard = self.open_dir_shard(i as u8, Some(shard_state)).await?;
-                shard.save_if_dirty().await?;
-            }
-
-            tracing::debug!("creating shards..");
-            while let Some(msg) = self.receiver.recv().await {
-                let future = self.process_msg(msg);
-                if let Err(e) = Box::pin(future).await {
-                    log::error!("Failed to process message: {}", e);
-                }
-
-                let mut all_set = true;
-                for shard in &self.state.shards {
-                    if shard.1.hash == [0; 32] {
-                        all_set = false;
-                    }
-                }
-                if all_set {
-                    break;
-                };
-
-                /* if self.state.shards.len() == 256 {
-                    break;
-                } */
-            }
-            tracing::debug!("created shards!");
-
-            self.state.dirs.clear();
-            self.state.files.clear();
-        } else {
-            return Err(anyhow!("already sharded; cannot shard again"));
-        }
-
-        Ok(())
-    }
-
-    /// Saves the current directory state to storage.
-    async fn save(&mut self) -> FSResult<()> {
-        let bytes: Bytes = if let Some(enc_type) = self.context.encryption_type {
-            if enc_type == ENCRYPTION_TYPE_XCHACHA20_POLY1305 {
-                let encryption_key =
-                    self.context.keys.get(&0x0e).ok_or_else(|| {
-                        anyhow!("missing encryption key 0x0e for XChaCha20-Poly1305")
-                    })?;
-                let cipher = XChaCha20Poly1305::new(encryption_key.as_ref().into());
-                let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-                let ciphertext = cipher
-                    .encrypt(&nonce, &self.state.to_bytes()?[..])
-                    .map_err(|e| anyhow!("Failed to encrypt directory: {}", e))?;
-                let mut bytes = BytesMut::new();
-                bytes.put_slice(&nonce);
-                bytes.put_slice(&ciphertext);
-                bytes.into()
-            } else {
-                return Err(anyhow!("encryption type {} not supported", enc_type));
-            }
-        } else {
-            let mut random_id = [0u8; 16];
-            OsRng.fill_bytes(&mut random_id);
-
-            self.state.header.random_id = Some(random_id);
-
-            self.state.to_bytes()?
-        };
-
-        match &mut self.context.link {
-            DirContextParentLink::LocalFile { path, .. } => {
-                let parent_dir = path.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Could not find parent directory")
-                })?;
-                let mut temp_file = NamedTempFile::new_in(parent_dir)?;
-                temp_file.write_all(&bytes)?;
-                temp_file.as_file().sync_all()?;
-                temp_file.persist(path)?;
-            }
-            DirContextParentLink::DirHandle {
-                path,
-                handle,
-                shard_level: _,
-                initial_hash,
-            } => {
-                let hash = self.context.meta_blob_store.import_bytes(bytes).await?;
-                handle
-                    .send_msg(ActorMessage::UpdateDirRefHash {
-                        path: path.clone(),
-                        hash: hash.hash,
-                    })
-                    .await?;
-                // TODO: Ensure parent save ordering is correct
-
-                initial_hash.copy_from_slice(hash.hash.as_bytes());
-            }
-            DirContextParentLink::RegistryKey {
-                public_key,
-                signing_key,
-            } => {
-                let hash = self.context.meta_blob_store.import_bytes(bytes).await?;
-                if let Some(signing_key) = signing_key.as_ref() {
-                    let current = self.context.registry.get(public_key).await?;
-                    let revision = current.as_ref().map_or(0, |entry| entry.revision + 1);
-                    let dalek_key = DalekSigningKey::from_bytes(signing_key.as_bytes());
-                    let (key_type, key_bytes) = public_key.to_bytes();
-                    let mut sign_bytes = Vec::with_capacity(1 + 1 + key_bytes.len() + 8 + 1 + 32);
-                    sign_bytes.push(MessageType::Registry as u8);
-                    sign_bytes.push(key_type);
-                    sign_bytes.extend_from_slice(key_bytes);
-                    sign_bytes.extend_from_slice(&revision.to_be_bytes());
-                    sign_bytes.push(0x21);
-                    sign_bytes.extend_from_slice(hash.hash.as_bytes());
-                    let signature = dalek_key.sign(&sign_bytes);
-                    let entry = StreamMessage::new(
-                        MessageType::Registry,
-                        *public_key,
-                        revision,
-                        hash.hash,
-                        signature.to_bytes().to_vec().into_boxed_slice(),
-                        None,
-                    )?;
-                    self.context.registry.set(entry).await?;
-                }
-            }
-        }
-        Ok(())
+        self.open_dir_shard_impl(shard_index, initial_state).await
     }
 }
 
 /// A handle for communicating with a `DirActor`. It can be cloned and sent across threads.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DirActorHandle {
     sender: mpsc::Sender<ActorMessage>,
 }
 
 impl DirActorHandle {
     /// Spawns a new `DirActor` task and returns a handle to it.
-    pub fn spawn(context: DirContext, initial_state: Option<DirV1>, autosave: bool) -> Self {
+    pub(crate) fn spawn(
+        context: DirContext,
+        initial_state: Option<DirV1>,
+        autosave_debounce_ms: Option<u64>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(1024);
-        let mut actor = DirActor::new(receiver, context, initial_state, autosave);
+        let mut actor = DirActor::new(receiver, context, initial_state, autosave_debounce_ms);
         let handle = Self { sender };
-        actor.handle = Some(handle.clone());
+        actor.handle = Some(handle.downgrade());
 
         tokio::spawn(async move {
             actor.run().await;
@@ -718,7 +618,7 @@ impl DirActorHandle {
     }
 
     /// Sends a message to the actor.
-    pub async fn send_msg(&self, msg: ActorMessage) -> FSResult<()> {
+    pub(crate) async fn send_msg(&self, msg: ActorMessage) -> FSResult<()> {
         self.sender
             .send(msg)
             .await
@@ -726,21 +626,19 @@ impl DirActorHandle {
         Ok(())
     }
 
-    pub async fn save_if_dirty(&self) -> FSResult<()> {
+    pub(crate) async fn save_if_dirty(&self) -> FSResult<Option<Hash>> {
         let (responder, receiver) = oneshot::channel();
         let msg = ActorMessage::SaveIfDirty { responder };
 
-        // tracing::info!("save_if_dirty1");
         if self.sender.send(msg).await.is_err() {
             return Err(anyhow!("Actor task has been closed."));
         }
-        // tracing::info!("save_if_dirty2");
 
-        Ok(receiver.await?)
+        receiver.await?
     }
 
     /// Submits a function to be executed by the actor on a `FileRef` at the given path.
-    pub async fn execute<F, R>(&self, path: String, f: F) -> FSResult<R>
+    pub(crate) async fn execute<F, R>(&self, path: String, f: F) -> FSResult<R>
     where
         F: FnOnce(&mut Value) -> R + Send + 'static,
         R: Send + 'static,
@@ -761,8 +659,9 @@ impl DirActorHandle {
 
         Ok(receiver.await?)
     }
+
     /// Submits a function to be executed by the actor on a `FileRef` at the given path.
-    pub async fn execute_and_forget<F, R>(&self, path: String, f: F) -> FSResult<()>
+    pub(crate) async fn execute_and_forget<F, R>(&self, path: String, f: F) -> FSResult<()>
     where
         F: FnOnce(&mut Value) -> R + Send + 'static,
         R: Send + 'static,
@@ -781,5 +680,34 @@ impl DirActorHandle {
             return Err(anyhow!("Actor task has been closed."));
         }
         Ok(())
+    }
+
+    pub(crate) async fn shutdown(&self) -> FSResult<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .sender
+            .send(ActorMessage::Shutdown { responder: tx })
+            .await;
+        let _ = rx.await;
+        Ok(())
+    }
+
+    pub fn downgrade(&self) -> WeakDirActorHandle {
+        WeakDirActorHandle {
+            sender: self.sender.downgrade(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WeakDirActorHandle {
+    sender: mpsc::WeakSender<ActorMessage>,
+}
+
+impl WeakDirActorHandle {
+    pub fn upgrade(&self) -> Option<DirActorHandle> {
+        self.sender
+            .upgrade()
+            .map(|sender| DirActorHandle { sender })
     }
 }

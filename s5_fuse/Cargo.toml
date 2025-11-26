@@ -1,0 +1,27 @@
+[package]
+name = "s5_fuse"
+version = "1.0.0-beta.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+bytes.workspace = true
+clap = "4.5.40"
+dashmap = "6.1.0"
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
+libc = "0.2.174"
+chacha20poly1305 = "0.10"
+
+# workspace crates
+s5_core.workspace = true
+s5_fs.workspace = true
+s5_store_local.workspace = true
+
+# fuse
+fuser = "0.11.1"
+fuser-async = "0.1.1"
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

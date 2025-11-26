@@ -8,7 +8,7 @@ use anyhow::Context;
 use clap::Subcommand;
 use rand::RngCore;
 use toml_edit::{DocumentMut, Item, Table};
-use tracing::{debug, info};
+use tracing::info;
 
 #[derive(Subcommand)]
 pub enum CmdConfig {
@@ -70,16 +70,6 @@ impl CmdConfig {
                     .unwrap()
                     .insert("local", fs_entry_local_table.into());
 
-                /*  doc.entry("fs")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap()
-                .entry("entry")
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .unwrap()
-                .insert("type", "local"); */
-
                 if !secretkey_file.exists() {
                     info!("generating secure random secret key for node");
                     let mut bytes = [0u8; 32];
@@ -95,6 +85,7 @@ impl CmdConfig {
         let mut tmp = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&tmp_path)?;
         tmp.write_all(doc.to_string().as_bytes())?;
         tmp.sync_all()?;

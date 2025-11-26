@@ -1,6 +1,6 @@
 [package]
 name = "s5_blobs"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2024"
 
 [dependencies]
@@ -24,3 +24,6 @@ tokio.workspace = true
 tokio-stream = "0.1.17"
 tracing.workspace = true
 base64 = "0.22"
+
+[dev-dependencies]
+s5_store_memory.workspace = true

@@ -1,7 +1,10 @@
 [package]
 name = "s5_cli"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2024"
+description = "Command line interface for the S5 decentralized storage network"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 bench = false
@@ -16,16 +19,25 @@ clap-verbosity-flag = { version = "3.0.4", default-features = false, features = 
   "tracing",
 ] }
 directories = "6.0.0"
-http_importer.workspace = true
+s5_importer_http.workspace = true
 rand = "0.9.2"
 s5_core.workspace = true
 s5_fs.workspace = true
-# s5_import_warc.workspace = true
 s5_importer_local.workspace = true
 s5_node.workspace = true
-# s5_serve_web_archive.workspace = true
 tokio.workspace = true
 toml = "0.9.5"
 toml_edit = "0.23.4"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+iroh.workspace = true
+s5_blobs.workspace = true
+base64 = "0.22"
+hex = "0.4.3"
+s5_fuse = { path = "../s5_fuse" }
+s5_store_local.workspace = true
+url = "2.5"
+
+[dev-dependencies]
+blake3.workspace = true
+bytes.workspace = true

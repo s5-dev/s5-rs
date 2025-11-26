@@ -4,6 +4,10 @@ use minicbor::data::{Int, Tag, Type};
 use minicbor::decode::{Decode, Error};
 use minicbor::encode::{self, Encode, Encoder, Write};
 
+/// Maximum size for bytes/string values to prevent memory exhaustion from
+/// untrusted CBOR input. 16 MiB is generous for typical use cases.
+const MAX_BYTES_STRING_LEN: usize = 16 * 1024 * 1024;
+
 /// Representation of possible CBOR values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -128,10 +132,22 @@ impl<'b, C> Decode<'b, C> for Value {
             Type::F16 => d.f16().map(Value::F16),
             Type::F32 => d.f32().map(Value::F32),
             Type::F64 => d.f64().map(Value::F64),
-            Type::Bytes => d
-                .bytes()
-                .map(|val| Value::Bytes(bytes::Bytes::copy_from_slice(val))),
-            Type::String => d.str().map(|val| Value::String(val.into())),
+            Type::Bytes => {
+                let p = d.position();
+                let val = d.bytes()?;
+                if val.len() > MAX_BYTES_STRING_LEN {
+                    return Err(Error::message("bytes value exceeds size limit").at(p));
+                }
+                Ok(Value::Bytes(bytes::Bytes::copy_from_slice(val)))
+            }
+            Type::String => {
+                let p = d.position();
+                let val = d.str()?;
+                if val.len() > MAX_BYTES_STRING_LEN {
+                    return Err(Error::message("string value exceeds size limit").at(p));
+                }
+                Ok(Value::String(val.into()))
+            }
             Type::Tag => d.tag().map(Value::Tag),
             Type::Simple => d.simple().map(Value::Simple),
             Type::Array => {
@@ -149,7 +165,7 @@ impl<'b, C> Decode<'b, C> for Value {
                 if let Some(n) = d.map()? {
                     Ok(Value::Map(n))
                 } else {
-                    Err(Error::type_mismatch(Type::Array)
+                    Err(Error::type_mismatch(Type::Map)
                         .at(p)
                         .with_message("missing map length"))
                 }

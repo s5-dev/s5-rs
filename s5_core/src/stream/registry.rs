@@ -16,7 +16,27 @@ impl RedbRegistry {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let db = Database::create(path.join("registry.redb"))?;
+
+        // Ensure the primary `registry` table exists before returning.
+        // This avoids runtime errors when the first access is a read
+        // (e.g. via `RegistryPinner` during FS5 autosave) on a fresh DB.
+        {
+            let write_txn = db.begin_write()?;
+            {
+                // `open_table` on a write transaction creates the table
+                // if it does not already exist.
+                let _ = write_txn.open_table(TABLE)?;
+            }
+            write_txn.commit()?;
+        }
+
         Ok(Self { db: Arc::new(db) })
+    }
+}
+
+impl std::fmt::Debug for RedbRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedbRegistry").finish()
     }
 }
 

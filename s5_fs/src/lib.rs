@@ -14,11 +14,19 @@
 mod actor;
 mod api;
 mod context;
+pub mod debug;
 pub mod dir;
+pub mod gc;
+pub mod snapshots;
 
-pub use api::FS5;
+pub use api::{CursorKind, FS5};
 pub use context::{DirContext, DirContextParentLink, SigningKey};
 pub use dir::FileRef;
+
+/// Number of entries sharing a path prefix
+/// required before FS5 auto-promotes that prefix
+/// into a dedicated subdirectory.
+pub const FS5_PROMOTION_THRESHOLD: usize = 10;
 
 /// Crate-wide result alias that bubbles up [`anyhow::Error`].
 pub type FSResult<T> = anyhow::Result<T>;

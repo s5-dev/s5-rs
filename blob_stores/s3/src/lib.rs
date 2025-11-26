@@ -6,7 +6,6 @@ use s5_core::{
     blob::location::BlobLocation,
     store::{StoreFeatures, StoreResult},
 };
-use std::u64;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,22 +88,19 @@ impl s5_core::store::Store for S3Store {
         max_len: Option<u64>,
     ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>
     {
-        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+        let mut bucket = *self.bucket.clone();
 
-        let bucket = self.bucket.clone();
-        let path = path.to_owned();
-        tokio::spawn(async move {
-            let _ = bucket
-                .get_object_range_to_writer(
-                    path,
-                    offset,
-                    max_len.map(|len| len - offset - 1),
-                    &mut writer,
-                )
-                .await;
-        });
+        let range_val = if let Some(len) = max_len {
+            format!("bytes={}-{}", offset, offset + len - 1)
+        } else {
+            format!("bytes={}-", offset)
+        };
+        bucket.add_header("Range", &range_val);
 
-        Ok(Box::new(ReaderStream::new(reader)))
+        let response_data = bucket.get_object_stream(path).await?;
+        let stream = ReaderStream::new(response_data);
+
+        Ok(Box::new(stream))
     }
 
     async fn open_read_bytes(
@@ -113,10 +109,8 @@ impl s5_core::store::Store for S3Store {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
-        let res = self
-            .bucket
-            .get_object_range(path, offset, max_len.map(|len| len - offset - 1))
-            .await?;
+        let end = max_len.map(|len| offset + len - 1);
+        let res = self.bucket.get_object_range(path, offset, end).await?;
         Ok(res.into_bytes())
     }
 
@@ -126,7 +120,7 @@ impl s5_core::store::Store for S3Store {
     }
 
     async fn rename(&self, _: &str, _: &str) -> StoreResult<()> {
-        panic!("not supported by this store")
+        Err(anyhow!("rename not supported by S3Store"))
     }
 
     async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>> {
@@ -135,13 +129,28 @@ impl s5_core::store::Store for S3Store {
     }
 
     async fn size(&self, path: &str) -> StoreResult<u64> {
-        todo!("implement")
+        let (head, code) = self.bucket.head_object(path).await?;
+        if code != 200 {
+            return Err(anyhow!("unexpected http status code {code}"));
+        }
+        let len = head
+            .content_length
+            .ok_or_else(|| anyhow!("missing content-length"))?;
+        Ok(len.try_into()?)
     }
 
     async fn list(
         &self,
     ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>
     {
-        todo!("implement")
+        let results = self.bucket.list("".to_string(), None).await?;
+        let paths: Vec<String> = results
+            .into_iter()
+            .flat_map(|res| res.contents)
+            .map(|obj| obj.key)
+            .collect();
+
+        let stream = futures::stream::iter(paths.into_iter().map(Ok));
+        Ok(Box::new(stream))
     }
 }

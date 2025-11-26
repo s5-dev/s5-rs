@@ -118,3 +118,63 @@ impl fmt::Display for Hash {
         f.write_str(&self.to_hex())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_empty() {
+        let hash = Hash::new(b"");
+        assert_eq!(hash, Hash::EMPTY);
+    }
+
+    #[test]
+    fn test_hash_known_value() {
+        // BLAKE3 hash of "hello" is well-known
+        let hash = Hash::new(b"hello");
+        let expected_hex = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+        assert_eq!(hash.to_hex(), expected_hex);
+    }
+
+    #[test]
+    fn test_hash_roundtrip_bytes() {
+        let original = Hash::new(b"test data");
+        let bytes: [u8; 32] = original.into();
+        let recovered = Hash::from(bytes);
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_hash_from_bytes() {
+        let bytes = [0u8; 32];
+        let hash = Hash::from_bytes(bytes);
+        assert_eq!(hash.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn test_hash_fmt_short() {
+        let hash = Hash::new(b"hello");
+        let short = hash.fmt_short();
+        // fmt_short returns first 5 bytes as hex (10 chars)
+        assert_eq!(short.len(), 10);
+        assert!(hash.to_hex().starts_with(&short));
+    }
+
+    #[test]
+    fn test_hash_ordering() {
+        let h1 = Hash::from_bytes([0u8; 32]);
+        let h2 = Hash::from_bytes([1u8; 32]);
+        let h3 = Hash::from_bytes([0xff; 32]);
+        assert!(h1 < h2);
+        assert!(h2 < h3);
+    }
+
+    #[test]
+    fn test_hash_debug() {
+        let hash = Hash::new(b"test");
+        let debug = format!("{:?}", hash);
+        assert!(debug.starts_with("Hash("));
+        assert!(debug.contains(&hash.to_hex()));
+    }
+}
