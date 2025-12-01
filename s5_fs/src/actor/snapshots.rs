@@ -1,9 +1,12 @@
-use std::io;
-
 use anyhow::anyhow;
 
-use crate::{FSResult, context::DirContextParentLink, dir::DirV1};
-use s5_core::{Hash, PinContext};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::context::DirContextParentLink;
+use crate::{FSResult, dir::DirV1};
+#[cfg(not(target_arch = "wasm32"))]
+use s5_core::Hash;
+#[cfg(not(target_arch = "wasm32"))]
+use s5_core::PinContext;
 
 use super::{ActorMessage, DirActor};
 
@@ -86,7 +89,12 @@ impl DirActor {
 
     /// Creates a new snapshot entry in `snapshots.fs5.cbor` and pins the
     /// current root hash as `PinContext::LocalFsSnapshot`.
+    ///
+    /// This is only available on native platforms as it requires filesystem access.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) async fn create_snapshot(&mut self) -> FSResult<(String, Hash)> {
+        use std::io;
+
         // Only supported on the local FS5 root.
         let snapshots_path = match &self.context.link {
             DirContextParentLink::LocalFile { path, .. } => {
@@ -142,7 +150,12 @@ impl DirActor {
     /// `PinContext::LocalFsSnapshot` entry, if present. This is a
     /// best-effort operation: failures to read or decode the snapshots
     /// index are treated as no-ops rather than hard errors.
+    ///
+    /// This is only available on native platforms as it requires filesystem access.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) async fn delete_snapshot(&mut self, name: String) -> FSResult<()> {
+        use std::io;
+
         // Only supported on the local FS5 root.
         let snapshots_path = match &self.context.link {
             DirContextParentLink::LocalFile { path, .. } => {

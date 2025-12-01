@@ -20,16 +20,19 @@ iroh.workspace = true
 irpc.workspace = true
 irpc-iroh.workspace = true
 log = "0.4.28"
-s5_blobs.workspace = true
+s5_blobs = { workspace = true, features = ["server"] }
 s5_core.workspace = true
 s5_fs.workspace = true
 s5_registry.workspace = true
+s5_registry_redb.workspace = true
+s5_registry_store.workspace = true
 s5_store_local.workspace = true
 s5_store_memory.workspace = true
 s5_store_s3.workspace = true
 s5_store_sia.workspace = true
 serde = { version = "1.0.219", features = ["derive"] }
-tokio.workspace = true
+# Node needs full tokio (native-only crate)
+tokio = { version = "1.48.0", features = ["full"] }
 tokio-stream = "0.1"
 tracing.workspace = true
 

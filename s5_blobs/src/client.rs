@@ -1,20 +1,25 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
-use anyhow::anyhow;
-use async_trait::async_trait;
 use bytes::Bytes;
-use futures::Stream;
-use futures_util::StreamExt;
 use iroh::Endpoint;
 use irpc::Client as IrpcClient;
 use irpc_iroh::IrohRemoteConnection;
-use s5_core::blob::{BlobResult, BlobsRead, BlobsWrite};
-use s5_core::{BlobId, Hash};
-use std::io::Cursor;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use s5_core::Hash;
 
-use crate::rpc::{DeleteBlob, DownloadBlob, Query, QueryResponse, RpcProto, UploadBlob};
+use crate::rpc::{DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse, RpcProto, UploadBlob};
+
+#[cfg(feature = "server")]
+use {
+    anyhow::anyhow,
+    async_trait::async_trait,
+    futures::Stream,
+    futures_util::StreamExt,
+    s5_core::BlobId,
+    s5_core::blob::{BlobResult, BlobsRead, BlobsWrite},
+    std::io::Cursor,
+    std::path::PathBuf,
+    tokio::io::{AsyncRead, AsyncReadExt},
+};
 
 #[derive(Clone)]
 // TODO: Support multi-peer connections (pool of remote peers) with per-peer trust/health scores and reuse connections.
@@ -50,6 +55,17 @@ impl Client {
             .await
     }
 
+    /// Requests that the remote peer pin the given blob hash.
+    ///
+    /// Returns `Ok(true)` if the blob was found and pinned, `Ok(false)` if not found.
+    pub async fn pin_blob(&self, hash: Hash) -> Result<Result<bool, String>, irpc::Error> {
+        self.inner
+            .rpc(PinBlob {
+                hash: *hash.as_bytes(),
+            })
+            .await
+    }
+
     // TODO: Maintain per-hash location cache with TTL; merge results from multiple peers; rate-limit repeated queries.
 
     // TODO: Track per-peer blob availability state to avoid repeatedly querying non-holders.
@@ -63,6 +79,25 @@ impl Client {
             .rpc(Query {
                 hash: *hash.as_bytes(),
                 location_types,
+                blinded: false,
+            })
+            .await
+    }
+
+    /// Query using a blinded hash for privacy.
+    ///
+    /// The server only learns the real hash if it has the blob.
+    /// If the blob exists, `QueryResponse.actual_hash` will contain the real hash.
+    pub async fn query_blinded(
+        &self,
+        blinded_hash: [u8; 32],
+        location_types: BTreeSet<u8>,
+    ) -> Result<QueryResponse, irpc::Error> {
+        self.inner
+            .rpc(Query {
+                hash: blinded_hash,
+                location_types,
+                blinded: true,
             })
             .await
     }
@@ -110,8 +145,56 @@ impl Client {
             )
             .await
     }
+
+    /// Upload bytes directly (simpler API for WASM).
+    ///
+    /// Computes the BLAKE3 hash, streams the data, and returns the BlobId on success.
+    pub async fn upload_bytes(&self, bytes: Bytes) -> Result<(Hash, u64), String> {
+        let size = bytes.len() as u64;
+        let hash: Hash = blake3::hash(&bytes).into();
+        let (tx, rx) = self
+            .upload_begin(hash, size, 8)
+            .await
+            .map_err(|e| format!("upload_begin failed: {e}"))?;
+
+        tx.send(bytes)
+            .await
+            .map_err(|e| format!("failed to send upload chunk: {e}"))?;
+        drop(tx);
+
+        match rx
+            .await
+            .map_err(|e| format!("upload response failed: {e}"))?
+        {
+            Ok(()) => Ok((hash, size)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Download a blob to bytes (simpler API for WASM).
+    pub async fn download_bytes(
+        &self,
+        hash: Hash,
+        offset: u64,
+        max_len: Option<u64>,
+    ) -> Result<Bytes, String> {
+        let mut receiver = self
+            .download(hash, offset, max_len)
+            .await
+            .map_err(|e| format!("download failed: {e}"))?;
+        let mut buffer = Vec::new();
+        loop {
+            match receiver.recv().await {
+                Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(err) => return Err(format!("download stream failed: {err}")),
+            }
+        }
+        Ok(Bytes::from(buffer))
+    }
 }
 
+#[cfg(feature = "server")]
 #[async_trait]
 impl BlobsRead for Client {
     async fn blob_contains(&self, hash: Hash) -> BlobResult<bool> {
@@ -162,6 +245,7 @@ impl BlobsRead for Client {
     }
 }
 
+#[cfg(feature = "server")]
 #[async_trait]
 impl BlobsWrite for Client {
     async fn blob_upload_bytes(&self, bytes: Bytes) -> BlobResult<BlobId> {

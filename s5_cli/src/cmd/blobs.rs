@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use s5_blobs::Client as BlobsClient;
-use s5_core::{BlobsRead, BlobsWrite, RedbRegistry, RegistryPinner};
+use s5_core::{BlobsRead, BlobsWrite, RegistryPinner};
 use s5_node::config::S5NodeConfig;
+use s5_registry_redb::RedbRegistry;
 
 use super::util::{open_store, registry_path};
 use crate::BlobsCmd;
@@ -15,9 +16,10 @@ pub async fn run_blobs(
     node_config_file: &std::path::Path,
     fs_root: &PathBuf,
 ) -> Result<()> {
+    let config_dir = node_config_file.parent();
     match cmd {
         BlobsCmd::Upload { peer, path } => {
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let blob = client
@@ -27,7 +29,7 @@ pub async fn run_blobs(
             println!("uploaded blob: hash={} size={}", blob.hash, blob.size);
         }
         BlobsCmd::Download { peer, hash, out } => {
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;
@@ -41,7 +43,7 @@ pub async fn run_blobs(
             println!("downloaded {} bytes to {}", bytes.len(), out.display());
         }
         BlobsCmd::Delete { peer, hash } => {
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;

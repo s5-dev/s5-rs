@@ -1,16 +1,28 @@
 //! Defines the context for a directory actor, including its storage and parent link.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{FSResult, dir::DirV1};
 use crate::{
-    FSResult,
     actor::{DirActorHandle, WeakDirActorHandle},
-    dir::{DirRef, DirV1},
+    dir::DirRef,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use dashmap::DashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use fs4::fs_std::FileExt;
-use s5_core::{BlobStore, Pins, RedbRegistry, RegistryApi, RegistryPinner, StreamKey};
+#[cfg(not(target_arch = "wasm32"))]
+use s5_core::RegistryPinner;
+use s5_core::{BlobStore, Pins, RegistryApi, StreamKey};
+#[cfg(not(target_arch = "wasm32"))]
+use s5_registry_redb::RedbRegistry;
+#[cfg(not(target_arch = "wasm32"))]
 use s5_store_local::{LocalStore, LocalStoreConfig};
-use std::{collections::BTreeMap, fs::OpenOptions, path::Path, sync::Arc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::OpenOptions;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::{collections::BTreeMap, sync::Arc};
 use zeroize::Zeroize;
 
 /// Signing key type for registry updates (Ed25519 private key seed).
@@ -58,6 +70,7 @@ pub enum DirContextParentLink {
         signing_key: Option<SigningKey>,
     },
     /// The directory is the root of a local file system, backed by a file.
+    #[cfg(not(target_arch = "wasm32"))]
     LocalFile {
         file: std::fs::File,
         path: std::path::PathBuf,
@@ -83,6 +96,7 @@ impl DirContext {
     ///
     /// - Creates `root.fs5.cbor` if missing and locks it for exclusive access.
     /// - Initializes a local blob store and registry co-located with `path`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_local_root<P: AsRef<Path>>(path: P) -> FSResult<Self> {
         let path = path.as_ref().to_path_buf();
         let root_file = path.join("root.fs5.cbor");

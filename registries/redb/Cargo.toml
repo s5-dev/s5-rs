@@ -1,0 +1,16 @@
+[package]
+name = "s5_registry_redb"
+version = "1.0.0-beta.1"
+edition = "2024"
+description = "Redb-backed registry implementation for S5"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+redb.workspace = true
+s5_core.workspace = true
+# Redb registry uses spawn_blocking (native-only crate)
+tokio = { version = "1.48.0", features = ["sync", "macros", "rt", "rt-multi-thread"] }

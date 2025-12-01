@@ -144,6 +144,10 @@ impl FS5 {
     /// Exports the current directory state as an immutable snapshot and
     /// records it in `snapshots.fs5.cbor`, returning the snapshot name and
     /// root hash.
+    ///
+    /// This method is only available on native platforms as it requires
+    /// filesystem access.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn create_snapshot(&self) -> FSResult<(String, Hash)> {
         // Ensure all pending changes are flushed and the head hash is up to date.
         self.save().await?;
@@ -158,6 +162,10 @@ impl FS5 {
     /// Deletes a named snapshot from the local FS5 root's
     /// `snapshots.fs5.cbor` index and unpins its `LocalFsSnapshot`
     /// pin, if present. Deleting an unknown snapshot name is a no-op.
+    ///
+    /// This method is only available on native platforms as it requires
+    /// filesystem access.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn delete_snapshot(&self, name: &str) -> FSResult<()> {
         let (responder, receiver) = oneshot::channel();
         self.root

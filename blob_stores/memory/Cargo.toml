@@ -12,3 +12,7 @@ bytes.workspace = true
 dashmap = "6.1.0"
 futures.workspace = true
 s5_core.workspace = true
+
+[dev-dependencies]
+s5_core = { workspace = true, features = ["testutil"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

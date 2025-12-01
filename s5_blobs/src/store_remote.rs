@@ -104,6 +104,18 @@ impl Store for RemoteBlobStore {
         mut stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
     ) -> StoreResult<()> {
         let expected_hash = Self::hash_from_path(path)?;
+
+        // Optimization: Try to pin first (single round-trip).
+        // If the blob already exists on the remote, pin_blob returns Ok(Ok(true))
+        // and we're done without consuming the stream.
+        match self.client.pin_blob(expected_hash).await {
+            Ok(Ok(true)) => return Ok(()), // Blob exists and is now pinned
+            Ok(Ok(false)) => {}            // Blob not found, need to upload
+            Ok(Err(e)) => return Err(anyhow!("pin_blob error: {}", e)),
+            Err(e) => return Err(anyhow!("pin_blob RPC failed: {}", e)),
+        }
+
+        // Blob doesn't exist - consume stream and upload
         let mut total = 0u64;
         let mut chunks = Vec::new();
         let mut hasher = blake3::Hasher::new();
@@ -148,6 +160,17 @@ impl Store for RemoteBlobStore {
 
     async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
         let hash = Self::hash_from_path(path)?;
+
+        // Optimization: Try to pin first (single round-trip).
+        // If the blob already exists on the remote, pin_blob returns Ok(Ok(true))
+        // and we're done. Otherwise we need to upload.
+        match self.client.pin_blob(hash).await {
+            Ok(Ok(true)) => return Ok(()), // Blob exists and is now pinned
+            Ok(Ok(false)) => {}            // Blob not found, need to upload
+            Ok(Err(e)) => return Err(anyhow!("pin_blob error: {}", e)),
+            Err(e) => return Err(anyhow!("pin_blob RPC failed: {}", e)),
+        }
+
         let total = bytes.len() as u64;
         self.upload_chunks(hash, total, vec![bytes]).await?;
         Ok(())

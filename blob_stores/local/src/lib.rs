@@ -204,3 +204,16 @@ impl s5_core::store::Store for LocalStore {
         Ok(Box::new(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s5_core::testutil::StoreTests;
+
+    #[tokio::test]
+    async fn test_local_store() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(temp_dir.path());
+        StoreTests::new(&store).run_all().await.unwrap();
+    }
+}

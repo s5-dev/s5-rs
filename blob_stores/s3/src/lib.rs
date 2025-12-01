@@ -154,3 +154,27 @@ impl s5_core::store::Store for S3Store {
         Ok(Box::new(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // S3 tests require a running S3-compatible server (e.g., MinIO)
+    // They are ignored by default
+    #[allow(unused_imports)]
+    use super::*;
+    #[allow(unused_imports)]
+    use s5_core::testutil::StoreTests;
+
+    #[tokio::test]
+    #[ignore = "requires S3-compatible server"]
+    async fn test_s3_store() {
+        let config = S3StoreConfig {
+            endpoint: "http://localhost:9000".to_string(),
+            region: "us-east-1".to_string(),
+            bucket_name: "test-bucket".to_string(),
+            access_key: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
+        };
+        let store = S3Store::create(config);
+        StoreTests::new(&store).run_all().await.unwrap();
+    }
+}

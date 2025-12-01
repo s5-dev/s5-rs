@@ -1,3 +1,10 @@
+//! Garbage collection utilities for local FS5 roots.
+//!
+//! This module is only available on native platforms (not WASM) as it
+//! requires filesystem access via `s5_store_local`.
+
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
@@ -78,12 +85,15 @@ pub async fn collect_fs_reachable_hashes<P: AsRef<Path>>(
     let mut visited_dirs: HashSet<Hash> = HashSet::new();
 
     // 1. Current live root from root.fs5.cbor
+    // SAFETY: If decryption or parsing fails, we abort GC entirely rather than
+    // treating the root as empty (which would mark all blobs as GC candidates).
     let root_path = fs_root.join("root.fs5.cbor");
     if let Ok(bytes) = std::fs::read(&root_path) {
-        let decrypted = decrypt_dir_bytes(bytes.into(), root_key).unwrap_or_default();
-        if let Ok(dir) = DirV1::from_bytes(&decrypted) {
-            dir_queue.push_back(dir);
-        }
+        let decrypted = decrypt_dir_bytes(bytes.into(), root_key)
+            .map_err(|e| anyhow::anyhow!("failed to decrypt root.fs5.cbor: {}", e))?;
+        let dir = DirV1::from_bytes(&decrypted)
+            .map_err(|e| anyhow::anyhow!("failed to parse root.fs5.cbor: {}", e))?;
+        dir_queue.push_back(dir);
     }
 
     // 2. Snapshot roots from snapshots.fs5.cbor (if present)

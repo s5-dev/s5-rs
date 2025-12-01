@@ -1,19 +1,25 @@
 [workspace]
 resolver = "3"
 members = [
-  "blob_stores/local",
-  "blob_stores/memory",
-  "blob_stores/s3",
-  "blob_stores/sia",
-  "importers/http",
-  "importers/local",
+  # Core crates
   "s5_blobs",
   "s5_cli",
   "s5_core",
   "s5_fs",
+  "s5_fuse",
   "s5_node",
   "s5_registry",
-  "s5_fuse",
+  # Blob stores
+  "blob_stores/local",
+  "blob_stores/memory",
+  "blob_stores/s3",
+  "blob_stores/sia",
+  # Registries
+  "registries/redb",
+  "registries/store",
+  # Importers
+  "importers/http",
+  "importers/local",
 ]
 
 [workspace.dependencies]
@@ -33,7 +39,7 @@ log = "0.4.28"
 minicbor = { version = "2.1.1", features = ["alloc", "derive", "half"] }
 postcard = "1.1.3"
 redb = "3.1.0"
-s5_blobs = { path = "s5_blobs", version = "1.0.0-beta.1" }
+s5_blobs = { path = "s5_blobs", version = "1.0.0-beta.1", default-features = false }
 s5_core = { path = "s5_core", version = "1.0.0-beta.1" }
 s5_fs = { path = "s5_fs", version = "1.0.0-beta.1" }
 s5_fuse = { path = "s5_fuse", version = "1.0.0-beta.1" }
@@ -41,13 +47,17 @@ s5_importer_http = { path = "importers/http", version = "1.0.0-beta.1" }
 s5_importer_local = { path = "importers/local", version = "1.0.0-beta.1" }
 s5_node = { path = "s5_node", version = "1.0.0-beta.1" }
 s5_registry = { path = "s5_registry", version = "1.0.0-beta.1" }
+s5_registry_redb = { path = "registries/redb", version = "1.0.0-beta.1" }
+s5_registry_store = { path = "registries/store", version = "1.0.0-beta.1" }
 s5_store_local = { path = "blob_stores/local", version = "1.0.0-beta.1" }
 s5_store_memory = { path = "blob_stores/memory", version = "1.0.0-beta.1" }
 s5_store_s3 = { path = "blob_stores/s3", version = "1.0.0-beta.1" }
 s5_store_sia = { path = "blob_stores/sia", version = "1.0.0-beta.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["full"] }
+# WASM-compatible tokio features: sync, macros, io-util, rt, time
+# Native crates that need more features should add them explicitly
+tokio = { version = "1.48.0", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tracing = "0.1.41"
 criterion = { version = "0.5.1", features = ["async_tokio"], default-features = false }

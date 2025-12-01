@@ -18,6 +18,7 @@ pub mod debug;
 pub mod dir;
 pub mod gc;
 pub mod snapshots;
+mod spawn;
 
 pub use api::{CursorKind, FS5};
 pub use context::{DirContext, DirContextParentLink, SigningKey};

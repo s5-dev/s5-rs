@@ -14,5 +14,9 @@ futures.workspace = true
 rust-s3 = { version = "0.37.0" }
 s5_core.workspace = true
 serde.workspace = true
-tokio.workspace = true
+# S3 store uses async io
+tokio = { version = "1.48.0", features = ["sync", "macros", "io-util", "rt"] }
 tokio-util = { workspace = true, features = ["io"] }
+
+[dev-dependencies]
+s5_core = { workspace = true, features = ["testutil"] }

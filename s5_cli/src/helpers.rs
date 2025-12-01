@@ -5,9 +5,12 @@ use s5_node::config::{NodeConfigIdentity, S5NodeConfig};
 use s5_node::identity;
 use std::str::FromStr;
 
-pub async fn build_endpoint(identity: &NodeConfigIdentity) -> Result<Endpoint> {
+pub async fn build_endpoint(
+    identity: &NodeConfigIdentity,
+    config_dir: Option<&std::path::Path>,
+) -> Result<Endpoint> {
     let mut builder = Endpoint::builder();
-    if let Some(sec) = identity::load_secret_key(identity) {
+    if let Some(sec) = identity::load_secret_key(identity, config_dir) {
         builder = builder.secret_key(sec);
     }
     let endpoint = builder.bind().await?;

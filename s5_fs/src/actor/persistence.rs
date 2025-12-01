@@ -1,11 +1,10 @@
-use std::io::{self, Read, Write};
-
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::OsRng;
 use ed25519::signature::Signer;
+#[cfg(not(target_arch = "wasm32"))]
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -13,7 +12,9 @@ use crate::{
     context::DirContextParentLink,
     dir::{DirV1, ENCRYPTION_TYPE_XCHACHA20_POLY1305},
 };
-use s5_core::{Hash, MessageType, PinContext, StreamMessage};
+#[cfg(not(target_arch = "wasm32"))]
+use s5_core::PinContext;
+use s5_core::{Hash, MessageType, StreamMessage};
 
 use super::{DirActor, DirActorHandle};
 use futures::future::join_all;
@@ -25,7 +26,9 @@ impl DirActor {
     pub(super) async fn load(&mut self) -> FSResult<()> {
         tracing::debug!("load: starting load");
         self.state = match &mut self.context.link {
+            #[cfg(not(target_arch = "wasm32"))]
             DirContextParentLink::LocalFile { file, .. } => {
+                use std::io::Read;
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer)?;
                 // Track the current hash of the root snapshot so that we can
@@ -151,7 +154,9 @@ impl DirActor {
         let bytes = self.encode_state_bytes()?;
 
         match &mut self.context.link {
+            #[cfg(not(target_arch = "wasm32"))]
             DirContextParentLink::LocalFile { path, .. } => {
+                use std::io::Write;
                 log::debug!(
                     "saving local root snapshot: files={} dirty={}",
                     self.state.files.len(),
@@ -177,7 +182,10 @@ impl DirActor {
                 }
 
                 let parent_dir = path.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Could not find parent directory")
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Could not find parent directory",
+                    )
                 })?;
                 let mut temp_file = NamedTempFile::new_in(parent_dir)?;
                 temp_file.write_all(&bytes)?;
@@ -244,7 +252,10 @@ impl DirActor {
     /// its children, even if the root itself is not marked dirty,
     /// so that pending changes in subtrees are not lost.
     pub(super) async fn save_if_dirty(&mut self) -> FSResult<Option<Hash>> {
+        #[cfg(not(target_arch = "wasm32"))]
         let is_root = matches!(self.context.link, DirContextParentLink::LocalFile { .. });
+        #[cfg(target_arch = "wasm32")]
+        let is_root = false;
 
         if self.dirty || is_root {
             self.shard_if_needed().await?;

@@ -13,13 +13,14 @@ use anyhow::Result;
 use bytes::Bytes;
 use iroh::Endpoint;
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
-use s5_core::{BlobsWrite, RedbRegistry};
+use s5_core::BlobsWrite;
 use s5_fs::dir::FileRef;
 use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
 };
 use s5_store_local::LocalStore;
+use s5_registry_redb::RedbRegistry;
 use tempfile::tempdir;
 
 #[tokio::test]

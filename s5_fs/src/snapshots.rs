@@ -1,3 +1,10 @@
+//! Snapshot index management for local FS5 roots.
+//!
+//! This module is only available on native platforms (not WASM) as it
+//! requires filesystem access.
+
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::io;
 use std::path::{Path, PathBuf};
 

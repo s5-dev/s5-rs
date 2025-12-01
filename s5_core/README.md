@@ -25,7 +25,7 @@ These are Rust-level abstractions for building S5 applications and nodes.
     - Manages `BlobLocation` resolution.
     - Implements `BlobsRead` and `BlobsWrite` for ergonomic byte streaming.
 - **`RegistryApi`**: Trait for interacting with mutable pointers (S5 Registry).
-    - **`RedbRegistry`**: A provided local implementation using `redb`.
+    - Implementations available in `s5_registry` (MemoryRegistry, TeeRegistry, MultiRegistry) and `s5_registry_redb` (RedbRegistry, native-only).
 - **`Pins`**: Trait for preventing garbage collection of blobs.
     - **`RegistryPinner`**: An implementation that pins blobs referenced by local registry entries.
 

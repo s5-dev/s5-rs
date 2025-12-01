@@ -57,7 +57,7 @@ pub async fn run_command(
                     run_blobs(cmd, &config, &node_config_file, &fs_root).await
                 }
                 crate::Commands::Snapshots { cmd } => {
-                    run_snapshots(cmd, &config, &fs, &fs_handle, &fs_root).await
+                    run_snapshots(cmd, &config, &node_config_file, &fs, &fs_handle, &fs_root).await
                 }
                 crate::Commands::Mount {
                     mount_point,

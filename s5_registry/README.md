@@ -16,6 +16,36 @@ The registry protocol uses `irpc` over Iroh.
     - `Get(key_type, key_data)` -> `Option<StreamMessage>`
     - `Set(StreamMessage)` -> `Result<()>`
 
+## Status
+
+### Platform Support
+
+| Component | Native | WASM |
+|-----------|--------|------|
+| `Client` | Yes | Yes |
+| `RemoteRegistry` | Yes | Yes |
+| `RegistryServer` | Yes | Yes |
+| `MemoryRegistry` | Yes | Yes |
+| `TeeRegistry` | Yes | Yes |
+| `MultiRegistry` | Yes | Yes |
+
+All components in this crate are WASM-compatible.
+
+### Registry Implementations
+
+- **`RemoteRegistry`**: Proxies to a remote peer via `Client`
+- **`MemoryRegistry`**: In-memory storage (useful for testing/caching)
+- **`TeeRegistry`**: Writes to both local and remote registries
+- **`MultiRegistry`**: Fan-out writes to N backends with configurable write policy
+
+Note: `RedbRegistry` (persistent local storage) is in the separate `s5_registry_redb` crate (native-only).
+
+### Key Types
+
+- `StreamKey::PublicKeyEd25519([u8; 32])` - Ed25519 public key for user identity
+- `StreamKey::Local([u8; 32])` - Local-only identifier
+- `StreamKey::Blake3HashPin([u8; 32])` - For pin metadata
+
 ## Usage
 
 ```rust

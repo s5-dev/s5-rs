@@ -123,5 +123,44 @@ single flat logical namespace aggregated across all shards.
 - This crate is pre‑v1; on‑disk schema may change between versions.
 - Snapshot format: CBOR; see `src/dir.rs` for field indices and types.
 
+## Status
+
+### Platform Support
+
+| Component | Native | WASM |
+|-----------|--------|------|
+| `DirV1`, `FileRef`, `DirRef` types | Yes | Yes |
+| `FS5` API (file ops, listing) | Yes | Yes |
+| `DirContext::open_local_root()` | Yes | **No** |
+| `DirContextParentLink::LocalFile` | Yes | **No** |
+| `DirContextParentLink::RegistryKey` | Yes | Yes |
+| `DirContextParentLink::DirHandle` | Yes | Yes |
+| `create_snapshot()`, `delete_snapshot()` | Yes | **No** |
+| `gc` module | Yes | **No** |
+| `snapshots` module | Yes | **No** |
+
+### Parent Link Types
+
+FS5 directories can be rooted in three ways:
+
+1. **`LocalFile`** (native only) - Local filesystem root backed by `root.fs5.cbor`
+2. **`RegistryKey`** (all platforms) - Registry-backed directory using Ed25519 public key
+3. **`DirHandle`** (all platforms) - Child directory accessed via parent actor handle
+
+For WASM/browser use, use `RegistryKey` with `RemoteRegistry` and `RemoteBlobStore`.
+
+### Known Limitations
+
+- Local file operations (`open_local_root`, snapshots, GC) require native platform
+- `current_hash` field in `DirActor` is unused on WASM (no warning suppression)
+- Streaming large file uploads not yet optimized for browser
+
+### Key Types
+
+- `FileRef.size` is `u64` (not `Option<u64>`)
+- `FileRef.timestamp` is `Option<u32>` (not `ts_seconds`)
+- `FileRef.locations` is `Option<Vec<BlobLocation>>` (not `blob_location`)
+- `CursorKind::File` and `CursorKind::Directory` (not `Dir`)
+
 ## Roadmap
 See TODOs and proposed features in `s5_fs/TODO.md`.

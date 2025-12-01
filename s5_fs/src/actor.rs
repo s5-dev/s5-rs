@@ -9,7 +9,6 @@ use anyhow::{Context, anyhow};
 use s5_core::{Hash, StreamKey};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Duration;
 
 mod listing;
 mod merge;
@@ -76,11 +75,15 @@ pub(crate) enum ActorMessage {
     },
     /// Creates a named snapshot of the current root directory state.
     /// Only meaningful for the local FS5 root (`DirContextParentLink::LocalFile`).
+    /// This message is only available on native platforms.
+    #[cfg(not(target_arch = "wasm32"))]
     CreateSnapshot {
         responder: oneshot::Sender<FSResult<(String, Hash)>>,
     },
     /// Deletes a named snapshot from `snapshots.fs5.cbor` and unpins its
     /// `PinContext::LocalFsSnapshot` entry, if present.
+    /// This message is only available on native platforms.
+    #[cfg(not(target_arch = "wasm32"))]
     DeleteSnapshot {
         name: String,
         responder: oneshot::Sender<FSResult<()>>,
@@ -467,10 +470,12 @@ impl DirActor {
                 let result = self.export_snapshot_hash().await;
                 let _ = responder.send(result);
             }
+            #[cfg(not(target_arch = "wasm32"))]
             ActorMessage::CreateSnapshot { responder } => {
                 let result = self.create_snapshot().await;
                 let _ = responder.send(result);
             }
+            #[cfg(not(target_arch = "wasm32"))]
             ActorMessage::DeleteSnapshot { name, responder } => {
                 let result = self.delete_snapshot(name).await;
                 let _ = responder.send(result);
@@ -486,8 +491,7 @@ impl DirActor {
             self.autosave_timer_active = true;
             if let Some(weak) = &self.handle {
                 let weak_handle = weak.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                crate::spawn::spawn_delayed(ms, async move {
                     if let Some(handle) = weak_handle.upgrade() {
                         let _ = handle.sender.send(ActorMessage::AutosaveTick).await;
                     }
@@ -610,7 +614,7 @@ impl DirActorHandle {
         let handle = Self { sender };
         actor.handle = Some(handle.downgrade());
 
-        tokio::spawn(async move {
+        crate::spawn::spawn_task(async move {
             actor.run().await;
         });
 

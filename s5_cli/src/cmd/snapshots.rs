@@ -12,10 +12,12 @@ use crate::helpers::{build_endpoint, parse_hash_hex, peer_endpoint_addr};
 pub async fn run_snapshots(
     cmd: SnapshotsCmd,
     config: &S5NodeConfig,
+    node_config_file: &std::path::Path,
     fs: &FS5,
     fs_handle: &FS5,
     fs_root: &PathBuf,
 ) -> Result<()> {
+    let config_dir = node_config_file.parent();
     match cmd {
         SnapshotsCmd::Head { sync } => {
             let sync_cfg = config
@@ -30,7 +32,7 @@ pub async fn run_snapshots(
                 .peer
                 .get(first)
                 .with_context(|| format!("via_untrusted peer '{first}' not found"))?;
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, first)?;
             let keys = derive_sync_keys(&sync_cfg.shared_secret);
             let stream_key = keys.stream_key();
@@ -45,7 +47,7 @@ pub async fn run_snapshots(
             }
         }
         SnapshotsCmd::Download { peer, hash, out } => {
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;
@@ -63,7 +65,7 @@ pub async fn run_snapshots(
             );
         }
         SnapshotsCmd::Restore { root, peer, hash } => {
-            let endpoint = build_endpoint(&config.identity).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;

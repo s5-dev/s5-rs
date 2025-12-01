@@ -151,3 +151,15 @@ impl s5_core::store::Store for MemoryStore {
         Ok(vec![])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s5_core::testutil::StoreTests;
+
+    #[tokio::test]
+    async fn test_memory_store() {
+        let store = MemoryStore::new();
+        StoreTests::new(&store).run_all().await.unwrap();
+    }
+}

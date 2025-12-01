@@ -1,7 +1,9 @@
-use super::RegistryApi;
-use crate::{StreamKey, StreamMessage};
+//! RedbRegistry - A local registry implementation backed by redb.
+
 use bytes::Bytes;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use s5_core::stream::RegistryApi;
+use s5_core::{StreamKey, StreamMessage};
 use std::{path::Path, sync::Arc};
 
 const TABLE: TableDefinition<(u8, &[u8]), &[u8]> = TableDefinition::new("registry");

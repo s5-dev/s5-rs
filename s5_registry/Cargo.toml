@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 iroh.workspace = true
 irpc.workspace = true
 irpc-iroh.workspace = true

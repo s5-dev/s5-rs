@@ -25,6 +25,7 @@ s5_store_local.workspace = true
 fuser = "0.11.1"
 fuser-async = "0.1.1"
 
-tokio.workspace = true
+# FUSE needs full tokio (native-only crate)
+tokio = { version = "1.48.0", features = ["full"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

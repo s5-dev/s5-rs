@@ -8,10 +8,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
-dashmap = "6.1.0"
 futures.workspace = true
 futures-util = "0.3.31"
 iroh.workspace = true
@@ -23,10 +21,21 @@ s5_core.workspace = true
 serde.workspace = true
 serde-big-array = "0.5.1"
 thiserror = "2.0.16"
-tokio.workspace = true
-tokio-stream = "0.1.17"
 tracing.workspace = true
 base64 = "0.22"
+
+# Core dependencies (always available)
+async-trait.workspace = true
+
+# Server-only dependencies
+dashmap = { version = "6.1.0", optional = true }
+tokio = { workspace = true, optional = true }
+tokio-stream = { version = "0.1.17", optional = true }
+
+[features]
+default = ["server"]
+# Server-side functionality (requires tokio, not WASM-compatible)
+server = ["dep:tokio", "dep:tokio-stream", "dep:dashmap"]
 
 [dev-dependencies]
 s5_store_memory.workspace = true

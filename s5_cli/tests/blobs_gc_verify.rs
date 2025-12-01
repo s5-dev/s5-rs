@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use s5_core::RedbRegistry;
 use s5_core::RegistryPinner;
 use s5_core::{BlobStore, PinContext, Pins};
+use s5_registry_redb::RedbRegistry;
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::fs;
 use std::path::PathBuf;

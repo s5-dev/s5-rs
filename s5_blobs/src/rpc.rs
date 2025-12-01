@@ -28,6 +28,19 @@ pub enum RpcProto {
     // TODO this could be a privacy issue, because now any node knows if maybe someone else pinned the same hash on the remote node or not. do we actually need the bool?
     #[rpc(tx = oneshot::Sender<Result<bool, String>>)]
     DeleteBlob(DeleteBlob),
+    /// Request that the server pin a blob that already exists.
+    ///
+    /// The response is `Ok(true)` if the blob was found and pinned,
+    /// `Ok(false)` if the blob was not found, and `Err(String)` on error.
+    #[rpc(tx = oneshot::Sender<Result<bool, String>>)]
+    PinBlob(PinBlob),
+}
+
+/// Pin request identified by the blob's content hash.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PinBlob {
+    /// BLAKE3 hash of the blob to pin.
+    pub hash: [u8; 32],
 }
 
 /// Delete request identified by the blob's content hash.
@@ -60,6 +73,13 @@ pub struct QueryResponse {
     pub exists: bool,
     pub size: Option<u64>,
     pub locations: Vec<BlobLocation>,
+    /// If the query was blinded and the blob exists, this contains the actual hash.
+    /// This allows the client to learn the real hash only when the server has the blob.
+    ///
+    /// Note: We cannot use `skip_serializing_if` here because postcard (used by irpc)
+    /// is a non-self-describing binary format that requires all fields to be present.
+    #[serde(default)]
+    pub actual_hash: Option<[u8; 32]>,
 }
 
 /// Query a peer for a blob.
@@ -70,9 +90,15 @@ pub struct QueryResponse {
 //   always returning only "blob content" locations.
 pub struct Query {
     /// The blake3 hash we want to find blob locations for.
+    /// If `blinded` is true, this is `blake3(actual_hash)` for privacy.
     pub hash: [u8; 32],
     /// The location types we support on the caller side.
     pub location_types: BTreeSet<u8>,
+    /// If true, `hash` is a blinded hash (`blake3(actual_hash)`).
+    /// Server will only reveal blob info if it has a blob matching the blinded hash.
+    /// This provides zero-knowledge availability checks.
+    #[serde(default)]
+    pub blinded: bool,
 }
 
 // TODO: Decide on verifiable announces (SignedAnnounce) vs. external registry:
@@ -107,3 +133,58 @@ pub enum AnnounceTarget {
     Obao6 = 6,
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that QueryResponse serializes/deserializes correctly with postcard.
+    /// This verifies the format used by irpc for RPC messages.
+    #[test]
+    fn test_query_response_postcard_roundtrip() {
+        // Empty response
+        let response = QueryResponse {
+            exists: false,
+            size: None,
+            locations: vec![],
+            actual_hash: None,
+        };
+
+        let bytes = postcard::to_allocvec(&response).expect("serialize empty");
+        let decoded: QueryResponse = postcard::from_bytes(&bytes).expect("deserialize empty");
+        assert_eq!(decoded.exists, false);
+        assert_eq!(decoded.size, None);
+        assert_eq!(decoded.locations.len(), 0);
+        assert_eq!(decoded.actual_hash, None);
+
+        // Response with data
+        let response2 = QueryResponse {
+            exists: true,
+            size: Some(1024),
+            locations: vec![BlobLocation::MultihashBlake3([0xab; 32])],
+            actual_hash: Some([0x42; 32]),
+        };
+
+        let bytes2 = postcard::to_allocvec(&response2).expect("serialize with data");
+        let decoded2: QueryResponse = postcard::from_bytes(&bytes2).expect("deserialize with data");
+        assert_eq!(decoded2.exists, true);
+        assert_eq!(decoded2.size, Some(1024));
+        assert_eq!(decoded2.locations.len(), 1);
+        assert_eq!(decoded2.actual_hash, Some([0x42; 32]));
+    }
+
+    /// Test Query serialization
+    #[test]
+    fn test_query_postcard_roundtrip() {
+        let query = Query {
+            hash: [0x42; 32],
+            location_types: BTreeSet::new(),
+            blinded: false,
+        };
+
+        let bytes = postcard::to_allocvec(&query).expect("serialize query");
+        let decoded: Query = postcard::from_bytes(&bytes).expect("deserialize query");
+        assert_eq!(decoded.hash, [0x42; 32]);
+        assert_eq!(decoded.blinded, false);
+    }
+}
