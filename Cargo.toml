@@ -23,6 +23,7 @@ members = [
   # Bindings
   "bindings/s5_client",
   "bindings/s5_wasm",
+  "bindings/s5_flutter",
 ]
 
 [workspace.dependencies]

@@ -1,0 +1,40 @@
+name: s5_flutter
+description: S5 Flutter bindings - encrypted storage on the decentralized web. Rust-based bindings for the S5 protocol.
+version: 1.0.0-beta.1
+homepage: https://s5.ninja
+repository: https://github.com/s5-dev/s5-rs
+issue_tracker: https://github.com/s5-dev/s5-rs/issues
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+  flutter_rust_bridge: ^2.11.1
+  freezed_annotation: ^2.4.1
+  meta: ^1.11.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  build_runner: ^2.4.8
+  freezed: ^2.4.6
+  flutter_lints: ^3.0.1
+  ffigen: ^8.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true

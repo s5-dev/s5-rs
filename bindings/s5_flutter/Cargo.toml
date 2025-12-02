@@ -1,0 +1,43 @@
+[package]
+name = "s5_flutter"
+version = "1.0.0-beta.1"
+edition = "2021"
+description = "S5 Flutter bindings via flutter_rust_bridge - encrypted storage on the decentralized web"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Flutter Rust Bridge
+flutter_rust_bridge = "=2.11.1"
+
+# S5 dependencies
+s5_core.workspace = true
+s5_fs.workspace = true
+s5_blobs = { workspace = true, default-features = false }
+s5_registry.workspace = true
+s5_client = { workspace = true, features = ["std"] }
+
+# Async runtime - Flutter bindings (native) need full tokio
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Crypto
+blake3.workspace = true
+
+# Serialization
+bytes.workspace = true
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Networking
+iroh.workspace = true
+
+[build-dependencies]
+flutter_rust_bridge_codegen = "=2.11.1"

@@ -1,0 +1,9 @@
+# flutter_rust_bridge configuration
+# See: https://cjycode.com/flutter_rust_bridge/
+
+rust_input: crate::api
+rust_root: ./
+dart_output: lib/src/rust
+c_output: lib/src/rust/frb_generated.h
+full_dep: true
+build_runner: false
