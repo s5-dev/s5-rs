@@ -248,14 +248,19 @@ impl DirActor {
 
     /// Flushes this directory and children when dirty.
     ///
-    /// The root directory (backed by a local file) always walks
+    /// The root directory (backed by a local file or registry key) always walks
     /// its children, even if the root itself is not marked dirty,
     /// so that pending changes in subtrees are not lost.
     pub(super) async fn save_if_dirty(&mut self) -> FSResult<Option<Hash>> {
+        // Root directories need to walk children even if not dirty, to catch
+        // changes in subdirectories. Both LocalFile (native) and RegistryKey (WASM)
+        // are root-level storage backends.
+        let is_root = matches!(
+            self.context.link,
+            DirContextParentLink::RegistryKey { .. }
+        );
         #[cfg(not(target_arch = "wasm32"))]
-        let is_root = matches!(self.context.link, DirContextParentLink::LocalFile { .. });
-        #[cfg(target_arch = "wasm32")]
-        let is_root = false;
+        let is_root = is_root || matches!(self.context.link, DirContextParentLink::LocalFile { .. });
 
         if self.dirty || is_root {
             self.shard_if_needed().await?;

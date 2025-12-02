@@ -1,4 +1,4 @@
-# @s5-dev/s5-wasm
+# @redsolver/s5-wasm
 
 S5 WebAssembly client for browser-based end-to-end encrypted (E2EE) cloud storage.
 
@@ -12,11 +12,11 @@ This package provides TypeScript/JavaScript bindings for the S5 Rust client, ena
 ## Installation
 
 ```bash
-npm install @s5-dev/s5-wasm
+npm install @redsolver/s5-wasm
 # or
-yarn add @s5-dev/s5-wasm
+yarn add @redsolver/s5-wasm
 # or
-bun add @s5-dev/s5-wasm
+bun add @redsolver/s5-wasm
 ```
 
 ## Quick Start
@@ -26,7 +26,7 @@ import init, {
   S5Client, 
   generate_seed_phrase, 
   validate_seed_phrase 
-} from '@s5-dev/s5-wasm';
+} from '@redsolver/s5-wasm';
 
 // Initialize WASM module (required before any other calls)
 await init();
@@ -69,7 +69,7 @@ await client.disconnect();
 Initialize the WASM module. **Must be called before using any other functions.**
 
 ```typescript
-import init from '@s5-dev/s5-wasm';
+import init from '@redsolver/s5-wasm';
 await init();
 ```
 

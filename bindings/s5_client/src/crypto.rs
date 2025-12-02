@@ -30,6 +30,16 @@ pub fn hash_blake3(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+/// Generate a random 32-byte encryption key.
+///
+/// This function is only available when the `std` feature is enabled.
+#[cfg(feature = "std")]
+pub fn generate_key() -> Result<[u8; 32], CryptoError> {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|_| CryptoError::RngFailed)?;
+    Ok(key)
+}
+
 /// Encrypt data with XChaCha20-Poly1305 (requires random nonce generation).
 ///
 /// This function is only available when the `std` feature is enabled,

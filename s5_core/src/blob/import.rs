@@ -30,11 +30,14 @@ pub async fn import_bytes(
     bytes: bytes::Bytes,
 ) -> StoreResult<BlobId> {
     let size = bytes.len() as u64;
-    // Only compute Bao outboard data for blobs >= 2^16 bytes.
-    let compute_outboard_flag = outboard_store.is_some() && size >= (1u64 << 16);
-    let bytes_clone = bytes.clone();
 
-    let (hash, obao) =
+    // Platform-specific hash and outboard computation
+    #[cfg(not(target_arch = "wasm32"))]
+    let (hash, obao) = {
+        // Only compute Bao outboard data for blobs >= 2^16 bytes.
+        let compute_outboard_flag = outboard_store.is_some() && size >= (1u64 << 16);
+        let bytes_clone = bytes.clone();
+
         tokio::task::spawn_blocking(move || -> std::io::Result<(Hash, Option<Vec<u8>>)> {
             if compute_outboard_flag {
                 let (hash, obao) = compute_outboard(bytes_clone.as_ref(), size, |_| Ok(()))?;
@@ -43,7 +46,16 @@ pub async fn import_bytes(
                 Ok((blake3::hash(&bytes_clone).into(), None))
             }
         })
-        .await??;
+        .await??
+    };
+
+    #[cfg(target_arch = "wasm32")]
+    let (hash, obao): (Hash, Option<Vec<u8>>) = {
+        // In WASM, compute hash synchronously (no spawn_blocking available).
+        // Skip Bao outboard - it's for verified streaming which isn't needed
+        // for WASM clients that download complete blobs.
+        (blake3::hash(&bytes).into(), None)
+    };
 
     if let Some(ref outboard) = obao
         && let Some(outboard_store) = outboard_store

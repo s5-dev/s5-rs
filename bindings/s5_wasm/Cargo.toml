@@ -43,3 +43,6 @@ bytes = { workspace = true }
 
 [features]
 default = []
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
