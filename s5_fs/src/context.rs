@@ -161,6 +161,43 @@ impl DirContext {
         }
     }
 
+    /// Creates an encrypted `DirContext` backed by a registry key.
+    ///
+    /// This is the standard setup for E2EE client usage (both native and WASM).
+    /// The context is configured with:
+    /// - `DirContextParentLink::RegistryKey` using the provided stream key
+    /// - XChaCha20-Poly1305 encryption (type 0x02) with key in slot 0x0e
+    /// - Signing key for registry updates
+    ///
+    /// # Arguments
+    /// * `stream_key` - The public key used as the registry stream key (user identity)
+    /// * `signing_key` - Ed25519 signing key for registry updates
+    /// * `encryption_key` - 32-byte XChaCha20-Poly1305 encryption key
+    /// * `meta_blob_store` - Blob store for directory metadata
+    /// * `registry` - Registry API for stream key lookups and updates
+    pub fn new_encrypted_registry(
+        stream_key: StreamKey,
+        signing_key: SigningKey,
+        encryption_key: [u8; 32],
+        meta_blob_store: BlobStore,
+        registry: Arc<dyn RegistryApi + Send + Sync>,
+    ) -> Self {
+        use crate::dir::ENCRYPTION_TYPE_XCHACHA20_POLY1305;
+
+        let mut ctx = Self::new(
+            DirContextParentLink::RegistryKey {
+                public_key: stream_key,
+                signing_key: Some(signing_key.clone()),
+            },
+            meta_blob_store,
+            registry,
+        );
+        ctx.encryption_type = Some(ENCRYPTION_TYPE_XCHACHA20_POLY1305);
+        ctx.keys.insert(0x0e, encryption_key);
+        ctx.signing_key = Some(signing_key);
+        ctx
+    }
+
     /// Derives a child directory context from this context and a `dir_ref`.
     ///
     /// - Inherits encryption type and keys, merging any keys in `dir_ref`.

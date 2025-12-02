@@ -20,6 +20,9 @@ members = [
   # Importers
   "importers/http",
   "importers/local",
+  # Bindings
+  "bindings/s5_client",
+  "bindings/s5_wasm",
 ]
 
 [workspace.dependencies]
@@ -53,6 +56,7 @@ s5_store_local = { path = "blob_stores/local", version = "1.0.0-beta.1" }
 s5_store_memory = { path = "blob_stores/memory", version = "1.0.0-beta.1" }
 s5_store_s3 = { path = "blob_stores/s3", version = "1.0.0-beta.1" }
 s5_store_sia = { path = "blob_stores/sia", version = "1.0.0-beta.1" }
+s5_client = { path = "bindings/s5_client", version = "1.0.0-beta.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 # WASM-compatible tokio features: sync, macros, io-util, rt, time

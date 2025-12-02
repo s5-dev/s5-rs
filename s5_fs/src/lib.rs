@@ -31,3 +31,26 @@ pub const FS5_PROMOTION_THRESHOLD: usize = 10;
 
 /// Crate-wide result alias that bubbles up [`anyhow::Error`].
 pub type FSResult<T> = anyhow::Result<T>;
+
+/// Derives sync keys (encryption key, signing key, public key) from a shared secret.
+///
+/// This is the canonical derivation used by all S5 clients (native and WASM).
+///
+/// # Key Derivation
+/// - `encryption_key` = BLAKE3 derive_key("s5/fs/sync/xchacha20", secret)
+/// - `signing_key` = BLAKE3 derive_key("s5/fs/sync/ed25519", secret)
+/// - `public_key` = Ed25519 public key from signing_key
+///
+/// # Returns
+/// Tuple of (encryption_key, signing_key_bytes, public_key) as `[u8; 32]` arrays.
+pub fn derive_sync_keys(secret: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    use blake3::derive_key;
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+
+    let encryption_key = derive_key("s5/fs/sync/xchacha20", secret);
+    let signing_key_bytes = derive_key("s5/fs/sync/ed25519", secret);
+    let signing_key = Ed25519SigningKey::from_bytes(&signing_key_bytes);
+    let public_key: [u8; 32] = *signing_key.verifying_key().as_bytes();
+
+    (encryption_key, signing_key_bytes, public_key)
+}

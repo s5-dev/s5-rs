@@ -1,16 +1,15 @@
 use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
-use blake3::derive_key;
 use ed25519_dalek::SigningKey as DalekSigningKey;
 use s5_blobs::{Client as BlobsClient, RemoteBlobStore};
 use s5_core::{BlobStore, RegistryApi, StreamKey};
-use s5_fs::{
-    DirContext, DirContextParentLink, FS5, SigningKey as FsSigningKey,
-    dir::ENCRYPTION_TYPE_XCHACHA20_POLY1305,
-};
+use s5_fs::{DirContext, FS5, SigningKey as FsSigningKey};
 
 use crate::{RemoteRegistry, S5Node};
+
+// Re-export from s5_fs for convenience
+pub use s5_fs::derive_sync_keys as derive_sync_keys_raw;
 
 /// Derived cryptographic material for FS sync between trusted peers.
 #[derive(Clone)]
@@ -33,16 +32,16 @@ impl SyncKeys {
 }
 
 /// Derives the XChaCha20 encryption key and Ed25519 signing key from a shared secret.
+///
+/// Uses `s5_fs::derive_sync_keys` internally to ensure consistent
+/// key derivation across all clients.
 pub fn derive_sync_keys(shared_secret: impl AsRef<[u8]>) -> SyncKeys {
-    let material = shared_secret.as_ref();
-    let encryption_key = derive_key("s5/fs/sync/xchacha20", material);
-    let signing_seed = derive_key("s5/fs/sync/ed25519", material);
-    let signing_key = DalekSigningKey::from_bytes(&signing_seed);
-    let public_key = *signing_key.verifying_key().as_bytes();
+    let (encryption_key, signing_key_bytes, public_key) =
+        s5_fs::derive_sync_keys(shared_secret.as_ref());
 
     SyncKeys {
         encryption_key,
-        signing_key,
+        signing_key: DalekSigningKey::from_bytes(&signing_key_bytes),
         public_key,
     }
 }
@@ -62,16 +61,15 @@ pub fn open_encrypted_fs(
 ) -> FS5 {
     let remote_store = RemoteBlobStore::new(blob_client);
     let blob_store = BlobStore::new(remote_store);
-    let signing_key = derived.fs_signing_key();
-    let link = DirContextParentLink::RegistryKey {
-        public_key: stream_key,
-        signing_key: Some(signing_key.clone()),
-    };
     let registry_arc: Arc<dyn RegistryApi + Send + Sync> = Arc::new(registry);
-    let mut context = DirContext::new(link, blob_store, registry_arc);
-    context.encryption_type = Some(ENCRYPTION_TYPE_XCHACHA20_POLY1305);
-    context.keys.insert(0x0e, derived.encryption_key);
-    context.signing_key = Some(signing_key);
+
+    let context = DirContext::new_encrypted_registry(
+        stream_key,
+        derived.fs_signing_key(),
+        derived.encryption_key,
+        blob_store,
+        registry_arc,
+    );
     FS5::open(context)
 }
 

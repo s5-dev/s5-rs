@@ -164,14 +164,13 @@ async fn handle_pin(
     match store.contains(hash).await {
         Ok(true) => {
             // Blob exists, try to pin it
-            if let Some(pinner) = pinner {
-                if let Err(e) = pinner
+            if let Some(pinner) = pinner
+                && let Err(e) = pinner
                     .pin_hash(hash, PinContext::NodeId(node_id_bytes))
                     .await
-                {
-                    let _ = tx.send(Err(format!("pinning failed: {e}"))).await;
-                    return;
-                }
+            {
+                let _ = tx.send(Err(format!("pinning failed: {e}"))).await;
+                return;
             }
             let _ = tx.send(Ok(true)).await;
         }
@@ -209,10 +208,10 @@ async fn handle_query(
                         resp.exists = true;
                         resp.actual_hash = Some(*actual_hash.as_bytes());
 
-                        if resp.size.is_none() {
-                            if let Ok(sz) = store.size(actual_hash).await {
-                                resp.size = Some(sz);
-                            }
+                        if resp.size.is_none()
+                            && let Ok(sz) = store.size(actual_hash).await
+                        {
+                            resp.size = Some(sz);
                         }
 
                         if let Ok(mut locs) = store.provide(actual_hash).await {

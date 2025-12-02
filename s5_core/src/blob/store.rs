@@ -1,10 +1,12 @@
 use bytes::Bytes;
 use futures_core::Stream;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
 
 use crate::{
     BlobId, Hash,
@@ -171,6 +173,7 @@ impl BlobStore {
     }
 
     /// Imports a file from a local path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn import_file(
         &self,
         path: PathBuf,
@@ -260,6 +263,7 @@ impl BlobsWrite for BlobStore {
         self.import_stream(Box::new(stream)).await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn blob_upload_file(&self, path: PathBuf) -> StoreResult<BlobId> {
         self.import_file(path, |_| Ok(())).await
     }

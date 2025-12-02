@@ -5,14 +5,19 @@ use crate::{
 };
 use bytes::Bytes;
 use futures_core::Stream;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
-use tokio_stream::StreamExt;
-use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::{StreamReader, SyncIoBridge};
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_stream::StreamExt;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 use super::paths::{blob_path_for_hash, obao6_path_for_hash};
 
@@ -112,6 +117,7 @@ pub async fn import_stream(
     Ok(BlobId { hash, size })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn import_file(
     store: &Arc<dyn Store>,
     outboard_store: &Option<Arc<dyn Store>>,

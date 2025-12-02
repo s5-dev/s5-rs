@@ -13,8 +13,11 @@ use crate::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
-use std::{io, path::PathBuf};
+use std::io;
 use tokio::io::AsyncRead;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
 
 pub type BlobResult<T> = anyhow::Result<T>;
 
@@ -67,5 +70,6 @@ pub trait BlobsWrite: Sync + Send {
         S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static;
 
     /// Upload a local file as a blob.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn blob_upload_file(&self, path: PathBuf) -> BlobResult<BlobId>;
 }
