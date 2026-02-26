@@ -20,6 +20,8 @@ members = [
   # Importers
   "importers/http",
   "importers/local",
+  # Compression
+  "s5_compression",
   # Bindings
   "bindings/s5_client",
   "bindings/s5_wasm",
