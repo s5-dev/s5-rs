@@ -8,11 +8,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 futures.workspace = true
 log.workspace = true
 s5_core.workspace = true
 s5_fs.workspace = true
 ignore = "0.4"
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10.1"
