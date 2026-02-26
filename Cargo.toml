@@ -22,6 +22,8 @@ members = [
   "importers/local",
   # Compression
   "s5_compression",
+  # CLI tools
+  "vup_cli",
   # Bindings
   "bindings/s5_client",
   "bindings/s5_wasm",
