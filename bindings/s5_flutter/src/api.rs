@@ -201,7 +201,7 @@ impl S5Client {
         let node_id = secret_key.public().to_string();
 
         // Build endpoint
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(vec![s5_blobs::ALPN.to_vec(), s5_registry::ALPN.to_vec()])
             .relay_mode(RelayMode::Default)

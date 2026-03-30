@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use s5_core::Hash;
 use s5_node::config::{NodeConfigIdentity, S5NodeConfig};
 use s5_node::identity;
@@ -9,7 +9,7 @@ pub async fn build_endpoint(
     identity: &NodeConfigIdentity,
     config_dir: Option<&std::path::Path>,
 ) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder();
+    let mut builder = Endpoint::builder(presets::N0);
     if let Some(sec) = identity::load_secret_key(identity, config_dir) {
         builder = builder.secret_key(sec);
     }

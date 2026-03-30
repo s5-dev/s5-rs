@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use iroh::Endpoint;
+use iroh::{Endpoint, endpoint::presets};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, RemoteBlobStore};
@@ -29,7 +29,7 @@ async fn setup_node_with_endpoint(
 )> {
     let endpoint = match endpoint {
         Some(ep) => ep,
-        None => Endpoint::builder().bind().await?,
+        None => Endpoint::builder(presets::N0).bind().await?,
     };
     let store_dir = tempdir()?;
     let local_store = LocalStore::new(store_dir.path());
@@ -79,7 +79,7 @@ async fn workflow_dead_drop() -> Result<()> {
     let dropbox_addr = dropbox_endpoint.addr();
 
     // 2. Setup "Sender" (client only)
-    let sender_endpoint = Endpoint::builder().bind().await?;
+    let sender_endpoint = Endpoint::builder(presets::N0).bind().await?;
     let sender_client = s5_blobs::Client::connect(sender_endpoint.clone(), dropbox_addr.clone());
 
     // 3. Sender uploads a blob
@@ -108,7 +108,7 @@ async fn workflow_time_travel() -> Result<()> {
     // 1. Setup Backend Node
     let mut peer_cfg = HashMap::new();
     // We'll add the client explicitly here, though we could use wildcard
-    let client_endpoint = Endpoint::builder().bind().await?;
+    let client_endpoint = Endpoint::builder(presets::N0).bind().await?;
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
@@ -190,8 +190,8 @@ async fn workflow_time_travel() -> Result<()> {
 async fn workflow_build_cache() -> Result<()> {
     // 1. Setup Cache Node
     let mut peer_cfg = HashMap::new();
-    let ci_endpoint = Endpoint::builder().bind().await?;
-    let dev_endpoint = Endpoint::builder().bind().await?;
+    let ci_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let dev_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
@@ -233,8 +233,8 @@ async fn workflow_mutual_backup() -> Result<()> {
     let mut alice_peer_cfg = HashMap::new();
     let mut bob_peer_cfg = HashMap::new();
 
-    let alice_endpoint = Endpoint::builder().bind().await?;
-    let bob_endpoint = Endpoint::builder().bind().await?;
+    let alice_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let bob_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     // Alice allows Bob to read/write "backups" (mapped to default store)
     let bob_acl = PeerConfigBlobs {
@@ -292,8 +292,8 @@ async fn workflow_shared_folder() -> Result<()> {
     let storage_addr = storage_endpoint.addr();
 
     // 2. Setup Alice and Bob Clients
-    let alice_endpoint = Endpoint::builder().bind().await?;
-    let bob_endpoint = Endpoint::builder().bind().await?;
+    let alice_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let bob_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     let shared_secret = b"our-shared-secret";
     let keys = derive_sync_keys(shared_secret);
@@ -394,7 +394,7 @@ async fn workflow_tiered_storage() -> Result<()> {
     let media_addr = media_endpoint.addr();
 
     // 2. Setup Client Node (Local)
-    let client_endpoint = Endpoint::builder().bind().await?;
+    let client_endpoint = Endpoint::builder(presets::N0).bind().await?;
     let client_dir = tempdir()?;
     let client_local_store = LocalStore::new(client_dir.path());
     let client_blob_store = client_local_store.to_blob_store();
@@ -483,7 +483,7 @@ async fn workflow_append_only_log() -> Result<()> {
     let (server_endpoint, _dir, router, store) = setup_node(HashMap::new()).await?;
 
     // Setup Client Endpoint
-    let client_endpoint = Endpoint::builder().bind().await?;
+    let client_endpoint = Endpoint::builder(presets::N0).bind().await?;
     let registry_client = RemoteRegistry::connect(client_endpoint, server_endpoint.addr());
 
     // 2. Identity

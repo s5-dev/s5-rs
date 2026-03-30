@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::Endpoint;
+use iroh::{Endpoint, endpoint::presets};
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
 use s5_core::BlobsWrite;
 use s5_fs::dir::FileRef;
@@ -26,9 +26,9 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn fs_sync_large_blob() -> Result<()> {
     // Create endpoints for cloud, laptop, and desktop nodes.
-    let cloud_endpoint = Endpoint::builder().bind().await?;
-    let laptop_endpoint = Endpoint::builder().bind().await?;
-    let desktop_endpoint = Endpoint::builder().bind().await?;
+    let cloud_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let laptop_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let desktop_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     let cloud_addr = cloud_endpoint.addr();
 

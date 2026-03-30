@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use iroh::{Endpoint, protocol::Router};
+use iroh::{Endpoint, endpoint::presets, protocol::Router};
 use s5_blobs::{ALPN, BlobsServer, Client, PeerConfigBlobs};
 use s5_core::{BlobStore, BlobsRead, BlobsWrite};
 use s5_store_memory::MemoryStore;
@@ -30,7 +30,7 @@ async fn client_server_roundtrip_bytes() {
     peer_cfg.insert("*".to_string(), blobs_cfg);
 
     // Bind a fresh endpoint for the server and attach the blobs protocol handler.
-    let server_endpoint = Endpoint::builder()
+    let server_endpoint = Endpoint::builder(presets::N0)
         .bind()
         .await
         .expect("bind server endpoint");
@@ -40,7 +40,7 @@ async fn client_server_roundtrip_bytes() {
         .spawn();
 
     // Bind a separate client endpoint and connect it to the server.
-    let client_endpoint = Endpoint::builder()
+    let client_endpoint = Endpoint::builder(presets::N0)
         .bind()
         .await
         .expect("bind client endpoint");

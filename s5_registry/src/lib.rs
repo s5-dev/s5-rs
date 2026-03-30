@@ -22,7 +22,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use irpc::{Client as IrpcClient, channel::oneshot, rpc_requests};
-use irpc_iroh::{IrohRemoteConnection, read_request};
+use irpc_iroh::{IrohLazyRemoteConnection, read_request};
 
 use s5_core::{RegistryApi, StreamKey, StreamMessage};
 use serde::{Deserialize, Serialize};
@@ -158,7 +158,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(endpoint: Endpoint, addr: impl Into<iroh::EndpointAddr>) -> Self {
-        let conn = IrohRemoteConnection::new(endpoint, addr.into(), ALPN.to_vec());
+        let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), ALPN.to_vec());
         Client {
             inner: IrpcClient::boxed(conn),
         }

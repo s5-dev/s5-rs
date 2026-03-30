@@ -39,10 +39,10 @@ blake3 = { version = "1.8.2", features = [
 ] }
 bytes = { version = "1.10.1" }
 futures = "0.3.31"
-iroh = { version = "0.94.0" }
-iroh-blobs = { version = "0.96.0" }
-irpc = "0.10.0"
-irpc-iroh = "0.10.0"
+iroh = { version = "0.97.0" }
+iroh-blobs = { version = "0.97.0" }
+irpc = "0.13.0"
+irpc-iroh = "0.13.0"
 log = "0.4.28"
 minicbor = { version = "2.1.1", features = ["alloc", "derive", "half"] }
 postcard = "1.1.3"

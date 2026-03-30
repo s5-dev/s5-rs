@@ -61,8 +61,7 @@ impl BlobsServer {
 
 impl ProtocolHandler for BlobsServer {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // Use remote_id if available on this iroh version
-        let node_id = conn.remote_id()?;
+        let node_id = conn.remote_id();
         log::debug!("s5_blobs: accepted connection from {node_id}");
         // Use the EndpointId display string as the canonical key for
         // ACL lookups so that the same string can be used consistently

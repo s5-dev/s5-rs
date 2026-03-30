@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 use iroh::Endpoint;
 use irpc::Client as IrpcClient;
-use irpc_iroh::IrohRemoteConnection;
+use irpc_iroh::IrohLazyRemoteConnection;
 use s5_core::Hash;
 
 use crate::rpc::{DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse, RpcProto, UploadBlob};
@@ -32,7 +32,7 @@ impl Client {
     pub const ALPN: &'static [u8] = crate::rpc::ALPN;
 
     pub fn connect(endpoint: Endpoint, addr: impl Into<iroh::EndpointAddr>) -> Self {
-        let conn = IrohRemoteConnection::new(endpoint, addr.into(), Self::ALPN.to_vec());
+        let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), Self::ALPN.to_vec());
         Client {
             inner: IrpcClient::boxed(conn),
         }

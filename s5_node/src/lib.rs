@@ -15,7 +15,7 @@
 
 use crate::config::{NodeConfigPeer, NodeConfigRegistry, NodeConfigStore, S5NodeConfig};
 use anyhow::anyhow;
-use iroh::{Endpoint, EndpointId, protocol::Router};
+use iroh::{Endpoint, EndpointId, endpoint::presets, protocol::Router};
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer};
 use s5_core::{BlobStore, RegistryApi, store::StoreResult};
 use s5_registry::MemoryRegistry;
@@ -60,7 +60,7 @@ impl S5Node {
     ) -> anyhow::Result<Self> {
         // Create iroh endpoint with optional stable secret key
         // Note: passes None for config_dir, so relative paths won't work here
-        let mut builder = Endpoint::builder();
+        let mut builder = Endpoint::builder(presets::N0);
         if let Some(sec) = identity::load_secret_key(&config.identity, None) {
             builder = builder.secret_key(sec);
         }
@@ -264,7 +264,7 @@ pub async fn run_node(
 ) -> anyhow::Result<()> {
     // Create iroh endpoint first (needed for remote registries)
     let config_dir = config_file_path.parent();
-    let mut builder = Endpoint::builder();
+    let mut builder = Endpoint::builder(presets::N0);
     if let Some(sec) = identity::load_secret_key(&config.identity, config_dir) {
         builder = builder.secret_key(sec);
     }
