@@ -8,8 +8,6 @@ use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
-use crate::config::TaskSpec;
-
 /// RPC protocol definition for an S5 node.
 #[derive(Debug, Serialize, Deserialize)]
 #[rpc_requests(message = S5NodeMessage)]
@@ -56,10 +54,11 @@ pub enum S5NodeProto {
 /// Run a task. Either by name (looked up in config) or with an inline spec.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunTask {
-    /// Task name from `[task.*]` in config. Mutually exclusive with `spec`.
+    /// Task name from `[task.*]` in config. Mutually exclusive with `spec_json`.
     pub name: Option<String>,
-    /// Inline task spec. Mutually exclusive with `name`.
-    pub spec: Option<TaskSpec>,
+    /// Inline task spec as JSON string (postcard can't handle internally-tagged enums).
+    /// Mutually exclusive with `name`.
+    pub spec_json: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,16 +83,16 @@ pub struct Shutdown;
 pub struct RunTaskResponse {
     /// Unique task ID for status/cancel.
     pub task_id: u64,
-    /// The resolved task spec (useful when running by name).
-    pub spec: TaskSpec,
+    /// The resolved task spec as JSON string.
+    pub spec_json: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TaskStatusResponse {
     pub task_id: u64,
     pub state: TaskState,
-    /// Task-type-specific progress counters.
-    pub progress: Option<TaskProgress>,
+    /// Task-type-specific progress counters as JSON string.
+    pub progress_json: Option<String>,
 }
 
 /// Current state of a task.
@@ -146,8 +145,9 @@ pub struct GetConfig;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetConfigResponse {
-    /// The full config as a JSON value (serialized from S5NodeConfig).
-    pub config: serde_json::Value,
+    /// The full config as a JSON string (serialized from S5NodeConfig).
+    /// Postcard cannot serialize serde_json::Value, so we use a String.
+    pub config_json: String,
 }
 
 /// Apply an RFC 6902 JSON Patch to the node's running configuration.
@@ -161,8 +161,9 @@ pub struct GetConfigResponse {
 /// 6. Hot-reload the in-memory config
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PatchConfig {
-    /// RFC 6902 JSON Patch operations.
-    pub patch: serde_json::Value,
+    /// RFC 6902 JSON Patch operations as a JSON string.
+    /// Postcard cannot serialize serde_json::Value, so we use a String.
+    pub patch_json: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,8 +172,8 @@ pub struct PatchConfigResponse {
     pub ok: bool,
     /// Human-readable message (error details on failure).
     pub message: String,
-    /// The config after patching (only present on success).
-    pub config: Option<serde_json::Value>,
+    /// The config after patching as a JSON string (only present on success).
+    pub config_json: Option<String>,
 }
 
 // ── Node status ───────────────────────────────────────────────────

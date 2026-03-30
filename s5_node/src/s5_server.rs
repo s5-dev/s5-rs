@@ -63,9 +63,11 @@ impl S5NodeServer {
     }
 
     async fn handle_run_task(&self, req: RunTask) -> RunTaskResponse {
+        use s5_node_api::config::TaskSpec;
+
         let config = self.config.read().await;
-        // Resolve task spec: either from config (by name) or inline.
-        let spec = match (req.name, req.spec) {
+        // Resolve task spec: either from config (by name) or inline (JSON string).
+        let spec = match (req.name, req.spec_json) {
             (Some(name), None) => {
                 match config.task.get(&name) {
                     Some(tc) => tc.spec.clone(),
@@ -73,27 +75,28 @@ impl S5NodeServer {
                         tracing::warn!(name = %name, "RunTask: task not found in config");
                         return RunTaskResponse {
                             task_id: 0,
-                            spec: s5_node_api::config::TaskSpec::Ingest {
-                                vault: String::new(),
-                                source: String::new(),
-                                blob_store: String::new(),
-                                target_path: None,
-                            },
+                            spec_json: String::from("null"),
                         };
                     }
                 }
             }
-            (None, Some(spec)) => spec,
+            (None, Some(json)) => {
+                match serde_json::from_str::<TaskSpec>(&json) {
+                    Ok(spec) => spec,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RunTask: invalid spec_json");
+                        return RunTaskResponse {
+                            task_id: 0,
+                            spec_json: String::from("null"),
+                        };
+                    }
+                }
+            }
             _ => {
-                tracing::warn!("RunTask: must specify exactly one of `name` or `spec`");
+                tracing::warn!("RunTask: must specify exactly one of `name` or `spec_json`");
                 return RunTaskResponse {
                     task_id: 0,
-                    spec: s5_node_api::config::TaskSpec::Ingest {
-                        vault: String::new(),
-                        source: String::new(),
-                        blob_store: String::new(),
-                        target_path: None,
-                    },
+                    spec_json: String::from("null"),
                 };
             }
         };
@@ -105,12 +108,15 @@ impl S5NodeServer {
                 tracing::info!(task_id, "task spawned");
                 RunTaskResponse {
                     task_id,
-                    spec: resolved_spec,
+                    spec_json: serde_json::to_string(&resolved_spec).unwrap_or_default(),
                 }
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to spawn task");
-                RunTaskResponse { task_id: 0, spec }
+                RunTaskResponse {
+                    task_id: 0,
+                    spec_json: serde_json::to_string(&spec).unwrap_or_default(),
+                }
             }
         }
     }
@@ -123,7 +129,7 @@ impl S5NodeServer {
                 state: TaskState::Failed {
                     error: format!("task {} not found", req.task_id),
                 },
-                progress: None,
+                progress_json: None,
             },
         }
     }
@@ -148,25 +154,25 @@ impl S5NodeServer {
 
     async fn handle_get_config(&self, _req: GetConfig) -> GetConfigResponse {
         let config = self.config.read().await;
-        let value = match serde_json::to_value(&*config) {
-            Ok(v) => v,
+        let json_str = match serde_json::to_string_pretty(&*config) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "failed to serialize config to JSON");
-                serde_json::Value::Null
+                String::from("null")
             }
         };
-        GetConfigResponse { config: value }
+        GetConfigResponse { config_json: json_str }
     }
 
     async fn handle_patch_config(&self, req: PatchConfig) -> PatchConfigResponse {
-        // Parse the patch operations.
-        let patch: json_patch::Patch = match serde_json::from_value(req.patch) {
+        // Parse the patch operations from the JSON string.
+        let patch: json_patch::Patch = match serde_json::from_str(&req.patch_json) {
             Ok(p) => p,
             Err(e) => {
                 return PatchConfigResponse {
                     ok: false,
                     message: format!("invalid JSON Patch: {e}"),
-                    config: None,
+                    config_json: None,
                 };
             }
         };
@@ -180,7 +186,7 @@ impl S5NodeServer {
                 return PatchConfigResponse {
                     ok: false,
                     message: format!("failed to serialize current config: {e}"),
-                    config: None,
+                    config_json: None,
                 };
             }
         };
@@ -190,7 +196,7 @@ impl S5NodeServer {
             return PatchConfigResponse {
                 ok: false,
                 message: format!("patch failed: {e}"),
-                config: None,
+                config_json: None,
             };
         }
 
@@ -201,7 +207,7 @@ impl S5NodeServer {
                 return PatchConfigResponse {
                     ok: false,
                     message: format!("patched config is invalid: {e}"),
-                    config: None,
+                    config_json: None,
                 };
             }
         };
@@ -212,7 +218,7 @@ impl S5NodeServer {
             return PatchConfigResponse {
                 ok: false,
                 message: format!("validation failed: {}", errors.join("; ")),
-                config: None,
+                config_json: None,
             };
         }
 
@@ -223,7 +229,7 @@ impl S5NodeServer {
                 return PatchConfigResponse {
                     ok: false,
                     message: format!("failed to serialize to TOML: {e}"),
-                    config: None,
+                    config_json: None,
                 };
             }
         };
@@ -231,7 +237,7 @@ impl S5NodeServer {
             return PatchConfigResponse {
                 ok: false,
                 message: format!("failed to write config file: {e}"),
-                config: None,
+                config_json: None,
             };
         }
 
@@ -243,7 +249,7 @@ impl S5NodeServer {
         PatchConfigResponse {
             ok: true,
             message: "config updated".into(),
-            config: Some(value),
+            config_json: Some(value.to_string()),
         }
     }
 

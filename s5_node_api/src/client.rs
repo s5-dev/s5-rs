@@ -9,12 +9,14 @@ use crate::rpc::*;
 #[derive(Debug, Clone)]
 pub struct S5NodeClient {
     inner: irpc::Client<S5NodeProto>,
+    /// Kept alive so we can close it gracefully on drop.
+    endpoint: Option<iroh::Endpoint>,
 }
 
 impl S5NodeClient {
-    /// Create a client from a raw irpc client.
-    pub fn new(inner: irpc::Client<S5NodeProto>) -> Self {
-        Self { inner }
+    /// Create a client from a raw irpc client (no endpoint to manage).
+    pub fn new(inner: irpc::Client<S5NodeProto>, endpoint: iroh::Endpoint) -> Self {
+        Self { inner, endpoint: Some(endpoint) }
     }
 
     /// Access the underlying irpc client.
@@ -27,7 +29,7 @@ impl S5NodeClient {
         self.inner
             .rpc(RunTask {
                 name: Some(name.into()),
-                spec: None,
+                spec_json: None,
             })
             .await
             .context("run_task RPC failed")
@@ -35,10 +37,12 @@ impl S5NodeClient {
 
     /// Run a task with an inline spec.
     pub async fn run_task(&self, spec: TaskSpec) -> Result<RunTaskResponse> {
+        let spec_json = serde_json::to_string(&spec)
+            .context("failed to serialize task spec")?;
         self.inner
             .rpc(RunTask {
                 name: None,
-                spec: Some(spec),
+                spec_json: Some(spec_json),
             })
             .await
             .context("run_task RPC failed")
@@ -86,8 +90,10 @@ impl S5NodeClient {
 
     /// Apply an RFC 6902 JSON Patch to the node's configuration.
     pub async fn patch_config(&self, patch: serde_json::Value) -> Result<PatchConfigResponse> {
+        let patch_json = serde_json::to_string(&patch)
+            .context("failed to serialize patch to JSON string")?;
         self.inner
-            .rpc(PatchConfig { patch })
+            .rpc(PatchConfig { patch_json })
             .await
             .context("patch_config RPC failed")
     }
@@ -106,5 +112,29 @@ impl S5NodeClient {
             .rpc(ListSnapshots { vault })
             .await
             .context("list_snapshots RPC failed")
+    }
+
+    /// Gracefully close the underlying iroh endpoint.
+    ///
+    /// Call this before dropping the client to avoid the
+    /// "Endpoint dropped without calling close" warning.
+    pub async fn close(&self) {
+        if let Some(ref endpoint) = self.endpoint {
+            endpoint.close().await;
+        }
+    }
+}
+
+impl Drop for S5NodeClient {
+    fn drop(&mut self) {
+        // Best-effort: if the runtime is still alive, spawn a close task.
+        // For a clean shutdown, call `client.close().await` before dropping.
+        if let Some(endpoint) = self.endpoint.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    endpoint.close().await;
+                });
+            }
+        }
     }
 }

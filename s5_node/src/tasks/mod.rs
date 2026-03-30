@@ -151,7 +151,9 @@ impl TaskExecutor {
         Some(TaskStatusResponse {
             task_id,
             state,
-            progress,
+            progress_json: progress
+                .as_ref()
+                .and_then(|p| serde_json::to_string(p).ok()),
         })
     }
 
@@ -176,7 +178,9 @@ impl TaskExecutor {
             out.push(TaskStatusResponse {
                 task_id: handle.id,
                 state,
-                progress,
+                progress_json: progress
+                    .as_ref()
+                    .and_then(|p| serde_json::to_string(p).ok()),
             });
         }
         out

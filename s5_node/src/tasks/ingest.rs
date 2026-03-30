@@ -139,6 +139,25 @@ pub async fn run_ingest(
         walker.git_ignore(source.respect_ignore_files);
         walker.ignore(source.respect_ignore_files);
 
+        // Skip directories containing a valid CACHEDIR.TAG unless include_caches is set.
+        if !source.include_caches {
+            walker.filter_entry(|entry| {
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    return true;
+                }
+                let tag_path = entry.path().join("CACHEDIR.TAG");
+                if let Ok(mut file) = std::fs::File::open(&tag_path) {
+                    let mut buf = [0u8; 43];
+                    if std::io::Read::read_exact(&mut file, &mut buf).is_ok()
+                        && &buf == b"Signature: 8a477f597d28d172789f06886806bc55"
+                    {
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+
         // Add exclude patterns
         if !source.exclude.is_empty() {
             let mut overrides = ignore::overrides::OverrideBuilder::new(&source_path);
