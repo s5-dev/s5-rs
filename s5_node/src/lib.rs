@@ -28,13 +28,13 @@ use s5_store_local::LocalStore;
 use s5_store_local_links::LocalLinksStore;
 use s5_store_memory::MemoryStore;
 // use s5_store_pixeldrain::PixeldrainStore;  // TODO: add to workspace
+use s5_node_api::ALPN as S5_NODE_ALPN;
+use s5_node_api::connect::{ServiceLock, lock_path, remove_lock, write_lock};
 use s5_store_s3::S3Store;
 use s5_store_sia::SiaStore;
 use std::{collections::BTreeMap, collections::HashMap, path::Path, str::FromStr, sync::Arc};
 use tokio::sync::{RwLock, oneshot};
 use tracing::info;
-use s5_node_api::ALPN as S5_NODE_ALPN;
-use s5_node_api::connect::{lock_path, write_lock, remove_lock, ServiceLock};
 
 pub mod config;
 pub mod fuse;
@@ -196,7 +196,9 @@ impl S5Node {
 /// Create the raw `Arc<dyn Store>` for a config entry.
 ///
 /// `LocalLinks` is not a full `Store` — it is handled separately by the node.
-pub async fn create_raw_store(config: NodeConfigStore) -> StoreResult<Arc<dyn s5_core::store::Store>> {
+pub async fn create_raw_store(
+    config: NodeConfigStore,
+) -> StoreResult<Arc<dyn s5_core::store::Store>> {
     let store: Box<dyn s5_core::store::Store + 'static> = match config {
         NodeConfigStore::SiaRenterd(config) => Box::new(SiaStore::create(config).await?),
         NodeConfigStore::Local(config) => Box::new(LocalStore::create(config)),
@@ -250,9 +252,7 @@ fn create_registry_inner(
         NodeConfigRegistry::StoreLocal { path, prefix } => {
             let registry_root = PathBuf::from(&path);
             std::fs::create_dir_all(&registry_root)?;
-            let store = LocalStore::create(s5_store_local::LocalStoreConfig {
-                base_path: path,
-            });
+            let store = LocalStore::create(s5_store_local::LocalStoreConfig { base_path: path });
             let store_registry = StoreRegistry::new(Arc::new(store), prefix);
             Ok(Arc::new(store_registry))
         }
@@ -302,10 +302,9 @@ fn create_registry_inner(
             Ok(Arc::new(tee))
         }
         NodeConfigRegistry::Store { store, prefix } => {
-            let raw_store = ctx
-                .stores
-                .get(&store)
-                .ok_or_else(|| anyhow!("registry store '{}' not found in [store.*] config", store))?;
+            let raw_store = ctx.stores.get(&store).ok_or_else(|| {
+                anyhow!("registry store '{}' not found in [store.*] config", store)
+            })?;
             let store_registry = StoreRegistry::new(Arc::clone(raw_store), prefix);
             Ok(Arc::new(store_registry))
         }
@@ -388,7 +387,8 @@ pub async fn run_node(
 
     // Create the task executor with pre-built stores.
     // Derive node secret from the endpoint's secret key for vault encryption.
-    let node_secret = blake3::derive_key("s5/node/secret", endpoint.secret_key().to_bytes().as_ref());
+    let node_secret =
+        blake3::derive_key("s5/node/secret", endpoint.secret_key().to_bytes().as_ref());
     // Wrap config in Arc<RwLock> once — shared between the RPC server and the
     // task executor so that `patch_config` updates are visible to tasks.
     let config = Arc::new(RwLock::new(config));

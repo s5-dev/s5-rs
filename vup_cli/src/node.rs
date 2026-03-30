@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use s5_node_api::connect;
+use anyhow::{Context, Result, bail};
 use s5_node_api::S5NodeClient;
+use s5_node_api::connect;
 
 /// Default s5 node config path (`~/.config/s5/config.toml`).
 pub fn default_config_path() -> Result<PathBuf> {

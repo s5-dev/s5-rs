@@ -20,10 +20,7 @@ use {
 };
 
 #[cfg(feature = "server")]
-use {
-    futures::Stream,
-    futures_util::StreamExt,
-};
+use {futures::Stream, futures_util::StreamExt};
 
 #[derive(Clone)]
 // TODO: Support multi-peer connections (pool of remote peers) with per-peer trust/health scores and reuse connections.

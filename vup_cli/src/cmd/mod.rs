@@ -3,7 +3,7 @@ pub mod tasks;
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use s5_node_api::S5NodeClient;
 
 use crate::node::ensure_node_running;
@@ -86,10 +86,7 @@ pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> 
     // Check if the source already exists
     let config_resp = client.get_config().await?;
     let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
-    let source_exists = config
-        .get("source")
-        .and_then(|s| s.get(source))
-        .is_some();
+    let source_exists = config.get("source").and_then(|s| s.get(source)).is_some();
 
     let patch = if source_exists {
         // Append paths to existing source
@@ -120,11 +117,7 @@ pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> 
     let resp = client.patch_config(patch).await?;
     if resp.ok {
         if source_exists {
-            println!(
-                "Added {} path(s) to source '{}'.",
-                abs_paths.len(),
-                source
-            );
+            println!("Added {} path(s) to source '{}'.", abs_paths.len(), source);
         } else {
             println!(
                 "Created source '{}' with {} path(s).",
@@ -294,7 +287,14 @@ fn print_config_summary(config: &serde_json::Value) {
     if let Some(keys) = config.get("key").and_then(|v| v.as_object()) {
         if !keys.is_empty() {
             let names: Vec<&String> = keys.keys().collect();
-            println!("  Keys:    {}", names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+            println!(
+                "  Keys:    {}",
+                names
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         } else {
             println!("  Keys:    (none)");
         }
@@ -342,17 +342,11 @@ fn print_config_summary(config: &serde_json::Value) {
 }
 
 /// Wizard: generate a recovery key phrase and add it to config.
-async fn wizard_recovery_key(
-    client: &S5NodeClient,
-    config: &serde_json::Value,
-) -> Result<()> {
+async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) -> Result<()> {
     use dialoguer::Confirm;
 
     // Check if recovery key already exists
-    let has_recovery = config
-        .get("key")
-        .and_then(|k| k.get("recovery"))
-        .is_some();
+    let has_recovery = config.get("key").and_then(|k| k.get("recovery")).is_some();
 
     if has_recovery {
         println!("\n⚠  A recovery key is already configured.");

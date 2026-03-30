@@ -130,9 +130,7 @@ pub async fn restore(
                 if let Some(parent) = target_path.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
-                        .with_context(|| {
-                            format!("creating parent dir {}", parent.display())
-                        })?;
+                        .with_context(|| format!("creating parent dir {}", parent.display()))?;
                 }
 
                 tokio::fs::write(&target_path, &content)
@@ -142,7 +140,9 @@ pub async fn restore(
                 restore_metadata(&target_path, &entry, config);
 
                 stats.files_restored.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_written.fetch_add(content_len, Ordering::Relaxed);
+                stats
+                    .bytes_written
+                    .fetch_add(content_len, Ordering::Relaxed);
             }
         }
     }
@@ -174,8 +174,8 @@ fn restore_metadata(path: &Path, entry: &NodeEntry, config: &RestoreConfig) {
     // Always restore mtime (both sync and backup mode).
     if let Some(secs) = semantic.timestamp {
         let nanos = semantic.timestamp_subsec_nanos.unwrap_or(0);
-        let mtime = std::time::SystemTime::UNIX_EPOCH
-            + std::time::Duration::new(secs as u64, nanos);
+        let mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos);
         let times = std::fs::FileTimes::new().set_modified(mtime);
 
         if let Ok(file) = std::fs::File::open(path) {
@@ -226,11 +226,7 @@ fn restore_metadata(path: &Path, entry: &NodeEntry, config: &RestoreConfig) {
 /// Uses `lchown` (not `chown`) so it works on symlinks too.
 /// Requires CAP_CHOWN (typically root). Failures are logged, not propagated.
 fn restore_ownership(path: &Path, entry: &NodeEntry) {
-    let unix = match entry
-        .semantic
-        .as_ref()
-        .and_then(|s| s.unix.as_ref())
-    {
+    let unix = match entry.semantic.as_ref().and_then(|s| s.unix.as_ref()) {
         Some(u) => u,
         None => return,
     };

@@ -255,12 +255,10 @@ impl DirActor {
         // Root directories need to walk children even if not dirty, to catch
         // changes in subdirectories. Both LocalFile (native) and RegistryKey (WASM)
         // are root-level storage backends.
-        let is_root = matches!(
-            self.context.link,
-            DirContextParentLink::RegistryKey { .. }
-        );
+        let is_root = matches!(self.context.link, DirContextParentLink::RegistryKey { .. });
         #[cfg(not(target_arch = "wasm32"))]
-        let is_root = is_root || matches!(self.context.link, DirContextParentLink::LocalFile { .. });
+        let is_root =
+            is_root || matches!(self.context.link, DirContextParentLink::LocalFile { .. });
 
         if self.dirty || is_root {
             self.shard_if_needed().await?;

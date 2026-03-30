@@ -68,30 +68,26 @@ impl S5NodeServer {
         let config = self.config.read().await;
         // Resolve task spec: either from config (by name) or inline (JSON string).
         let spec = match (req.name, req.spec_json) {
-            (Some(name), None) => {
-                match config.task.get(&name) {
-                    Some(tc) => tc.spec.clone(),
-                    None => {
-                        tracing::warn!(name = %name, "RunTask: task not found in config");
-                        return RunTaskResponse {
-                            task_id: 0,
-                            spec_json: String::from("null"),
-                        };
-                    }
+            (Some(name), None) => match config.task.get(&name) {
+                Some(tc) => tc.spec.clone(),
+                None => {
+                    tracing::warn!(name = %name, "RunTask: task not found in config");
+                    return RunTaskResponse {
+                        task_id: 0,
+                        spec_json: String::from("null"),
+                    };
                 }
-            }
-            (None, Some(json)) => {
-                match serde_json::from_str::<TaskSpec>(&json) {
-                    Ok(spec) => spec,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "RunTask: invalid spec_json");
-                        return RunTaskResponse {
-                            task_id: 0,
-                            spec_json: String::from("null"),
-                        };
-                    }
+            },
+            (None, Some(json)) => match serde_json::from_str::<TaskSpec>(&json) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(error = %e, "RunTask: invalid spec_json");
+                    return RunTaskResponse {
+                        task_id: 0,
+                        spec_json: String::from("null"),
+                    };
                 }
-            }
+            },
             _ => {
                 tracing::warn!("RunTask: must specify exactly one of `name` or `spec_json`");
                 return RunTaskResponse {
@@ -161,7 +157,9 @@ impl S5NodeServer {
                 String::from("null")
             }
         };
-        GetConfigResponse { config_json: json_str }
+        GetConfigResponse {
+            config_json: json_str,
+        }
     }
 
     async fn handle_patch_config(&self, req: PatchConfig) -> PatchConfigResponse {
@@ -305,13 +303,10 @@ impl S5NodeServer {
             }
 
             // Fallback: read local vault root (current snapshot only).
-            let root_path =
-                crate::tasks::vault_persist::vault_root_path(&vault.root_path);
-            if let Ok(Some(node)) = crate::tasks::vault_persist::load_node(
-                &root_path,
-                &ctx.node_secret,
-                vault_name,
-            ) {
+            let root_path = crate::tasks::vault_persist::vault_root_path(&vault.root_path);
+            if let Ok(Some(node)) =
+                crate::tasks::vault_persist::load_node(&root_path, &ctx.node_secret, vault_name)
+            {
                 if let Some(entry) = node.transparent_entry() {
                     if let Some(ref content) = entry.content {
                         snapshots.push(SnapshotInfo {
@@ -342,8 +337,7 @@ impl S5NodeServer {
         use s5_core::StreamKey;
 
         // Derive the signing key → verifying key → stream key for this vault
-        let signing_key =
-            crate::tasks::publish::vault_signing_key(&ctx.node_secret, vault_name);
+        let signing_key = crate::tasks::publish::vault_signing_key(&ctx.node_secret, vault_name);
         let verifying_key: VerifyingKey = (&signing_key).into();
         let stream_key = StreamKey::PublicKeyEd25519(verifying_key.to_bytes());
 
@@ -356,7 +350,9 @@ impl S5NodeServer {
         }
 
         if identity_files.is_empty() {
-            return Err(anyhow::anyhow!("no identity files for vault '{vault_name}'"));
+            return Err(anyhow::anyhow!(
+                "no identity files for vault '{vault_name}'"
+            ));
         }
 
         // Resolve a blob store to download from
@@ -367,15 +363,14 @@ impl S5NodeServer {
         let blob_store = crate::tasks::resolve_store(&ctx.stores, blob_store_name)?;
 
         // Fetch the published TN
-        let (node, _hash, _revision) =
-            crate::tasks::publish::fetch_previous_published_node(
-                registry,
-                blob_store,
-                &stream_key,
-                &identity_files,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no published entry for vault '{vault_name}'"))?;
+        let (node, _hash, _revision) = crate::tasks::publish::fetch_previous_published_node(
+            registry,
+            blob_store,
+            &stream_key,
+            &identity_files,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no published entry for vault '{vault_name}'"))?;
 
         // Extract snapshots from the Node entries
         let mut result = Vec::new();

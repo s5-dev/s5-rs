@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use s5_core::blob::store::BlobStore;
 use s5_core::blob::location::BlobLocation;
+use s5_core::blob::store::BlobStore;
 use s5_core::store::{StoreFeatures, StoreResult};
 use std::path::PathBuf;
 use tokio::fs::File;
@@ -207,11 +207,7 @@ impl s5_core::store::Store for LocalStore {
         Ok(Box::new(stream))
     }
 
-    async fn reflink_file_to(
-        &self,
-        source: &std::path::Path,
-        dest_path: &str,
-    ) -> StoreResult<()> {
+    async fn reflink_file_to(&self, source: &std::path::Path, dest_path: &str) -> StoreResult<()> {
         let full_dest = self.resolve_path(dest_path)?;
         if let Some(parent) = full_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -246,9 +242,8 @@ fn try_reflink(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         let err = std::io::Error::last_os_error();
         // Clean up the empty destination file on failure
         let _ = std::fs::remove_file(dst);
-        return Err(err).with_context(|| {
-            format!("FICLONE ioctl failed for {:?} -> {:?}", src, dst)
-        });
+        return Err(err)
+            .with_context(|| format!("FICLONE ioctl failed for {:?} -> {:?}", src, dst));
     }
 
     Ok(())

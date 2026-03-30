@@ -79,11 +79,8 @@ pub async fn connect_with_lock(lock: &ServiceLock) -> Result<S5NodeClient> {
     // Local-only: no relay servers, direct connection only
     let endpoint = iroh::Endpoint::empty_builder().bind().await?;
     let endpoint_handle = endpoint.clone();
-    let client = irpc_iroh::client::<crate::S5NodeProto>(
-        endpoint,
-        lock.endpoint_addr.clone(),
-        crate::ALPN,
-    );
+    let client =
+        irpc_iroh::client::<crate::S5NodeProto>(endpoint, lock.endpoint_addr.clone(), crate::ALPN);
 
     Ok(S5NodeClient::new(client, endpoint_handle))
 }

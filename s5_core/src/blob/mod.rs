@@ -1,10 +1,10 @@
+pub mod fallback;
 pub mod identifier;
 pub mod import;
 pub mod location;
 pub mod paths;
 pub mod read;
 pub mod store;
-pub mod fallback;
 pub mod tee;
 
 pub use identifier::BlobId;

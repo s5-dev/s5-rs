@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::Path;
 
 use age::secrecy::ExposeSecret;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Run the interactive init flow.
 ///
@@ -154,8 +154,13 @@ struct S3Config {
 
 /// The user's store choice from the init wizard.
 enum StoreChoice {
-    Local { path: std::path::PathBuf },
-    S3 { local_cache: std::path::PathBuf, s3: S3Config },
+    Local {
+        path: std::path::PathBuf,
+    },
+    S3 {
+        local_cache: std::path::PathBuf,
+        s3: S3Config,
+    },
 }
 
 impl StoreChoice {
@@ -189,22 +194,16 @@ async fn ask_store_type(default_local_path: &std::path::Path) -> Result<StoreCho
     }
 
     // -- S3 prompts ----------------------------------------------------------
-    let endpoint: String = Input::new()
-        .with_prompt("Endpoint URL")
-        .interact_text()?;
+    let endpoint: String = Input::new().with_prompt("Endpoint URL").interact_text()?;
 
-    let bucket_name: String = Input::new()
-        .with_prompt("Bucket name")
-        .interact_text()?;
+    let bucket_name: String = Input::new().with_prompt("Bucket name").interact_text()?;
 
     let region: String = Input::new()
         .with_prompt("Region")
         .default("us-east-1".into())
         .interact_text()?;
 
-    let access_key: String = Input::new()
-        .with_prompt("Access Key ID")
-        .interact_text()?;
+    let access_key: String = Input::new().with_prompt("Access Key ID").interact_text()?;
 
     let secret_key: String = Input::new()
         .with_prompt("Secret Access Key")
@@ -225,9 +224,10 @@ async fn ask_store_type(default_local_path: &std::path::Path) -> Result<StoreCho
     use tokio_stream::StreamExt;
 
     // Try to list — this validates endpoint, credentials, and bucket access.
-    let mut stream = store.list().await.context(
-        "S3 connection failed. Check endpoint, bucket, and credentials.",
-    )?;
+    let mut stream = store
+        .list()
+        .await
+        .context("S3 connection failed. Check endpoint, bucket, and credentials.")?;
     // Consume the first item (or empty is fine) to confirm the stream works.
     let _first = stream.next().await;
     println!("✓ S3 connection successful");

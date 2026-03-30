@@ -140,7 +140,12 @@ impl Snapshot {
         master_secret: [u8; 32],
         root_plaintext_hash: Option<[u8; 32]>,
     ) -> Self {
-        Self::new(root, store, encrypted_context(master_secret), root_plaintext_hash)
+        Self::new(
+            root,
+            store,
+            encrypted_context(master_secret),
+            root_plaintext_hash,
+        )
     }
 
     // =====================================================================

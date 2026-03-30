@@ -44,7 +44,7 @@ use s5_core::{BlobId, BlobsRead, BlobsWrite, Hash};
 
 use crate::context::{self, KDF_META};
 use crate::layer::ReadableLayer;
-use crate::node::{ContentRef, Node, NodeEntry, NodeHeader, NodeKind, Structural, NODE_MAGIC};
+use crate::node::{ContentRef, NODE_MAGIC, Node, NodeEntry, NodeHeader, NodeKind, Structural};
 use crate::snapshot::Snapshot;
 
 /// Default expected entries per leaf node.
@@ -299,16 +299,12 @@ impl Snapshot {
         let mut children: Vec<(String, NodeEntry)> = Vec::with_capacity(nodes.len());
 
         for node in &nodes {
-            let (blob_id, plaintext_hash) =
-                self.write_node_dedup(node, store, read_store, stats).await?;
+            let (blob_id, plaintext_hash) = self
+                .write_node_dedup(node, store, read_store, stats)
+                .await?;
 
             // The first key in this node is the routing key for the parent.
-            let first_key = node
-                .entries
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_default();
+            let first_key = node.entries.keys().next().cloned().unwrap_or_default();
 
             // Total plaintext size of all entries in this node.
             let total_size: u64 = node

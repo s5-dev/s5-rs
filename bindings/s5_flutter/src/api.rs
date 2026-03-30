@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
+use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
 use s5_blobs::RemoteBlobStore;
 use s5_client::DerivedKeys;
 use s5_core::{blob::location::BlobLocation, blob::BlobStore, Hash, StreamKey};
@@ -220,7 +220,8 @@ impl S5Client {
         // Create blob client and stores
         let blobs_client = s5_blobs::Client::connect(endpoint.clone(), remote_addr.clone());
         let remote_blob_store = RemoteBlobStore::new(blobs_client.clone());
-        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> = Arc::new(BlobStore::new(remote_blob_store));
+        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> =
+            Arc::new(BlobStore::new(remote_blob_store));
 
         // Create remote registry
         let remote_registry = RemoteRegistry::connect(endpoint.clone(), remote_addr);

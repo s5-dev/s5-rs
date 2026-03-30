@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use s5_node_api::config::TaskSpec;
 use s5_node_api::{S5NodeClient, TaskProgress, TaskState};
@@ -76,20 +76,18 @@ pub async fn run_backup(
     // Resolve blob store
     let blob_store = match blob_store_override {
         Some(b) => b.to_string(),
-        None => {
-            vault_cfg
-                .get("blob_stores")
-                .and_then(|s| s.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "vault '{}' has no blob_stores configured — use --blob-store",
-                        vault_name
-                    )
-                })?
-        }
+        None => vault_cfg
+            .get("blob_stores")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "vault '{}' has no blob_stores configured — use --blob-store",
+                    vault_name
+                )
+            })?,
     };
 
     // Resolve keys
@@ -102,11 +100,7 @@ pub async fn run_backup(
             keys.push(k.to_string());
         }
         // Include "recovery" if configured
-        if config
-            .get("key")
-            .and_then(|k| k.get("recovery"))
-            .is_some()
-        {
+        if config.get("key").and_then(|k| k.get("recovery")).is_some() {
             keys.push("recovery".to_string());
         }
         if keys.is_empty() {

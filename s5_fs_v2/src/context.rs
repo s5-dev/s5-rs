@@ -99,8 +99,8 @@ fn stored_blocks(len: usize, block_size: u32) -> u64 {
 ///
 /// Uses nonce = 0 because each blob has a unique derived key.
 fn apply_chacha20(key: &[u8; 32], data: &mut [u8]) {
-    use chacha20::cipher::{KeyIvInit, StreamCipher};
     use chacha20::ChaCha20;
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
 
     let nonce = [0u8; 12];
     let mut cipher = ChaCha20::new(key.into(), &nonce.into());

@@ -28,7 +28,7 @@ use bytes::Bytes;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
 use s5_blobs::RemoteBlobStore;
 use s5_client::DerivedKeys;
-use s5_core::{blob::BlobStore, Hash, StreamKey, blob::location::BlobLocation};
+use s5_core::{Hash, StreamKey, blob::BlobStore, blob::location::BlobLocation};
 use s5_fs::{CursorKind, DirActorContext, FS5, FileRef, SigningKey};
 use s5_registry::RemoteRegistry;
 use wasm_bindgen::prelude::*;
@@ -230,7 +230,8 @@ impl S5Client {
 
         // Create remote blob store (for content blobs)
         let remote_blob_store = RemoteBlobStore::new(blobs_client.clone());
-        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> = Arc::new(BlobStore::new(remote_blob_store.clone()));
+        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> =
+            Arc::new(BlobStore::new(remote_blob_store.clone()));
 
         // Create remote registry
         let remote_registry = RemoteRegistry::connect(endpoint.clone(), remote_addr);

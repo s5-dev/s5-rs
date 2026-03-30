@@ -243,11 +243,7 @@ fn build_semantic(
 }
 
 /// Build full Unix metadata for backup mode.
-fn build_unix_full(
-    path: &Path,
-    meta: &std::fs::Metadata,
-    file_type: FileType,
-) -> UnixMetadata {
+fn build_unix_full(path: &Path, meta: &std::fs::Metadata, file_type: FileType) -> UnixMetadata {
     let uid = meta.uid();
     let gid = meta.gid();
 
@@ -520,7 +516,9 @@ async fn process_entry(
 
         overlay.put(key, node_entry);
         stats.files_changed.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_uploaded.fetch_add(content_len, Ordering::Relaxed);
+        stats
+            .bytes_uploaded
+            .fetch_add(content_len, Ordering::Relaxed);
     } else {
         // Block device, char device, fifo, socket — skip.
         tracing::debug!(path = %path.display(), "skipping special file");

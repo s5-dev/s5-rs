@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use s5_core::Hash;
 use s5_fs_v2::node::{ContentRef, Node, NodeEntry, Structural, TraversalContext};
 use s5_fs_v2::snapshot::Snapshot;
@@ -253,8 +253,8 @@ pub fn remove_inprogress(vault_root: &str) -> anyhow::Result<()> {
 mod tests {
     use std::sync::Arc;
 
-    use s5_core::blob::BlobStore;
     use s5_core::Hash;
+    use s5_core::blob::BlobStore;
     use s5_fs_v2::snapshot::Snapshot;
     use s5_store_memory::MemoryStore;
 

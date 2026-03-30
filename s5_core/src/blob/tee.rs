@@ -45,7 +45,9 @@ impl BlobsWrite for TeeBlobsWrite<'_> {
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
         F: Fn(u64) -> std::io::Result<()> + Send + Sync + 'static,
     {
-        Err(anyhow::anyhow!("TeeBlobsWrite does not support blob_upload_reader"))
+        Err(anyhow::anyhow!(
+            "TeeBlobsWrite does not support blob_upload_reader"
+        ))
     }
 
     async fn blob_upload_stream<S>(&self, _stream: S) -> BlobResult<BlobId>
@@ -53,12 +55,16 @@ impl BlobsWrite for TeeBlobsWrite<'_> {
         Self: Sized,
         S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
     {
-        Err(anyhow::anyhow!("TeeBlobsWrite does not support blob_upload_stream"))
+        Err(anyhow::anyhow!(
+            "TeeBlobsWrite does not support blob_upload_stream"
+        ))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     async fn blob_upload_file(&self, _path: std::path::PathBuf) -> BlobResult<BlobId> {
-        Err(anyhow::anyhow!("TeeBlobsWrite does not support blob_upload_file"))
+        Err(anyhow::anyhow!(
+            "TeeBlobsWrite does not support blob_upload_file"
+        ))
     }
 
     async fn blob_sync(&self) -> BlobResult<()> {

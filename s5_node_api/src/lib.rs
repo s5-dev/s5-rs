@@ -8,12 +8,12 @@
 /// ALPN identifier for the S5 node RPC protocol.
 pub const ALPN: &[u8] = b"s5/node/0";
 
+mod client;
 pub mod config;
 mod rpc;
-mod client;
 
-pub use rpc::*;
 pub use client::S5NodeClient;
+pub use rpc::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod connect;

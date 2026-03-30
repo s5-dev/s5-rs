@@ -38,8 +38,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use iroh::{Endpoint, endpoint::presets};
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
-use s5_core::blob::BlobsRead;
 use s5_core::RegistryApi;
+use s5_core::blob::BlobsRead;
 use s5_fs::dir::FileRef;
 use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,

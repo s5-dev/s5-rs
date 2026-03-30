@@ -67,8 +67,8 @@ pub use stream::{RegistryApi, StreamKey, StreamMessage};
 // Note: BlobStore is hidden to encourage using dyn BlobsRead/BlobsReadWrite traits
 // Use s5_core::blob::store::BlobStore internally if needed
 // pub use blob::store::BlobStore;
-pub use blob::{BlobsRead, BlobsReadWrite, BlobsWrite};
 pub use blob::fallback::FallbackBlobsRead;
+pub use blob::{BlobsRead, BlobsReadWrite, BlobsWrite};
 
 // Storage traits (available on all platforms)
 pub use store::{Store, StoreFeatures, StoreResult};

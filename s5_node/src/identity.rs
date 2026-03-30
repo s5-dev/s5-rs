@@ -42,10 +42,7 @@ pub fn load_secret_key(
                 match age_decrypt_with_key(&raw_bytes, key_name, keys, config_dir) {
                     Ok(decrypted) => decrypted,
                     Err(e) => {
-                        tracing::warn!(
-                            key = key_name,
-                            "failed to age-decrypt node identity: {e}"
-                        );
+                        tracing::warn!(key = key_name, "failed to age-decrypt node identity: {e}");
                         return None;
                     }
                 }
@@ -103,8 +100,8 @@ fn age_decrypt_with_key(
         .into_identities()
         .map_err(|e| anyhow::anyhow!("loading identities: {e}"))?;
 
-    let decryptor = age::Decryptor::new(ciphertext)
-        .map_err(|e| anyhow::anyhow!("age decryptor: {e}"))?;
+    let decryptor =
+        age::Decryptor::new(ciphertext).map_err(|e| anyhow::anyhow!("age decryptor: {e}"))?;
 
     let id_refs: Vec<&dyn age::Identity> = identities.iter().map(|i| i.as_ref()).collect();
 

@@ -11,15 +11,13 @@ pub mod vault_persist;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::anyhow;
 use s5_core::RegistryApi;
 use s5_core::blob::BlobStore;
-use s5_node_api::config::{
-    NodeConfigKey, NodeConfigSource, NodeConfigVault, TaskSpec,
-};
+use s5_node_api::config::{NodeConfigKey, NodeConfigSource, NodeConfigVault, TaskSpec};
 use s5_node_api::{TaskProgress, TaskState, TaskStatusResponse};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -255,9 +253,7 @@ async fn run_task(
 
             Ok(())
         }
-        TaskSpec::Publish { vault, keys } => {
-            publish::run_publish(&ctx, vault, keys).await
-        }
+        TaskSpec::Publish { vault, keys } => publish::run_publish(&ctx, vault, keys).await,
         TaskSpec::RemoteRestore {
             vault,
             age_secret_key,
@@ -309,9 +305,12 @@ pub(crate) fn resolve_store<'a>(
     stores: &'a HashMap<String, BlobStore>,
     name: &str,
 ) -> anyhow::Result<&'a BlobStore> {
-    stores
-        .get(name)
-        .ok_or_else(|| anyhow!("store '{}' not found (not configured or is a local_links store)", name))
+    stores.get(name).ok_or_else(|| {
+        anyhow!(
+            "store '{}' not found (not configured or is a local_links store)",
+            name
+        )
+    })
 }
 
 /// Resolve a key name to its config.

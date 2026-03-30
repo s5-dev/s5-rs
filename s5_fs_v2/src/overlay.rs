@@ -19,9 +19,9 @@
 //!   → swap base snapshot, clear overlay
 //! ```
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::RwLock;
-use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -79,23 +79,21 @@ impl WritableOverlay {
 
     /// Returns true if the overlay has no pending entries.
     pub fn pending_is_empty(&self) -> bool {
-        self.entries.read().expect("overlay lock poisoned").is_empty()
+        self.entries
+            .read()
+            .expect("overlay lock poisoned")
+            .is_empty()
     }
 
     /// Clears all pending entries from the overlay.
     pub fn clear(&self) {
-        self.entries
-            .write()
-            .expect("overlay lock poisoned")
-            .clear();
+        self.entries.write().expect("overlay lock poisoned").clear();
     }
 
     /// Takes a snapshot of the pending entries, consuming the overlay contents.
     /// The base layer is unaffected.
     pub fn take(&self) -> BTreeMap<String, NodeEntry> {
-        std::mem::take(
-            &mut *self.entries.write().expect("overlay lock poisoned"),
-        )
+        std::mem::take(&mut *self.entries.write().expect("overlay lock poisoned"))
     }
 
     /// Returns a reference to the base layer.

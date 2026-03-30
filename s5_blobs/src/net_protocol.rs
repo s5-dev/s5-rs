@@ -505,11 +505,7 @@ async fn handle_download(
                     break;
                 }
                 if tx.send(bytes.clone()).await.is_err() {
-                    tracing::info!(
-                        hash = hash_short,
-                        sent,
-                        "download: peer disconnected"
-                    );
+                    tracing::info!(hash = hash_short, sent, "download: peer disconnected");
                     break;
                 }
                 sent += bytes.len() as u64;

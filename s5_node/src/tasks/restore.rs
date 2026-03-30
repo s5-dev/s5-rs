@@ -51,9 +51,15 @@ pub async fn run_restore(
 
     // -- Load vault root from Transparent Node --
     let current_path = vault_root_path(&vault.root_path);
-    let (root, root_plaintext_hash, context) = load_vault_root(&current_path, &ctx.node_secret, vault_name)
-        .context("reading vault root")?
-        .ok_or_else(|| anyhow!("vault '{}' has no snapshot to restore (root file not found)", vault_name))?;
+    let (root, root_plaintext_hash, context) =
+        load_vault_root(&current_path, &ctx.node_secret, vault_name)
+            .context("reading vault root")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "vault '{}' has no snapshot to restore (root file not found)",
+                    vault_name
+                )
+            })?;
 
     tracing::info!(
         vault = vault_name,
@@ -102,10 +108,8 @@ pub async fn run_restore(
     };
 
     // Combined reader: meta store (for tree nodes) + blob stores (for file content)
-    let read_store: Arc<dyn BlobsRead> = Arc::new(FallbackBlobsRead::new(
-        meta_store.clone(),
-        blob_read,
-    ));
+    let read_store: Arc<dyn BlobsRead> =
+        Arc::new(FallbackBlobsRead::new(meta_store.clone(), blob_read));
 
     // -- Build snapshot with full context and restore --
     let snapshot = Snapshot::new(root, read_store, context, root_plaintext_hash);
@@ -126,10 +130,18 @@ pub async fn run_restore(
         .with_context(|| format!("restoring vault '{}' to {}", vault_name, target_path))?;
 
     // Final progress update
-    let files_restored = stats.files_restored.load(std::sync::atomic::Ordering::Relaxed)
-        + stats.dirs_created.load(std::sync::atomic::Ordering::Relaxed)
-        + stats.symlinks_created.load(std::sync::atomic::Ordering::Relaxed);
-    let bytes_written = stats.bytes_written.load(std::sync::atomic::Ordering::Relaxed);
+    let files_restored = stats
+        .files_restored
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + stats
+            .dirs_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+        + stats
+            .symlinks_created
+            .load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_written = stats
+        .bytes_written
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     {
         let mut p = progress.write().await;
@@ -257,8 +269,7 @@ pub async fn run_remote_restore(
     // -- Step 6: Parse Node → snapshot parts --
     // The published TN may have history entries (timestamps → previous hashes).
     // We only care about the current entry at "".
-    let node = Node::from_bytes(&cbor)
-        .map_err(|e| anyhow!("CBOR decode Transparent Node: {e}"))?;
+    let node = Node::from_bytes(&cbor).map_err(|e| anyhow!("CBOR decode Transparent Node: {e}"))?;
 
     let (root, root_plaintext_hash, context) = node_to_snapshot_parts(&node)
         .context("extracting snapshot from published Transparent Node")?;

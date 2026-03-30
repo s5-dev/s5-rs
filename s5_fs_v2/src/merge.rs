@@ -135,7 +135,11 @@ impl<'a> KMergeState<'a> {
                 match best_idx {
                     None => best_idx = Some(i),
                     Some(bi) => {
-                        let best_key = &self.heads[bi].1.as_ref().expect("best_idx points to populated buffer").0;
+                        let best_key = &self.heads[bi]
+                            .1
+                            .as_ref()
+                            .expect("best_idx points to populated buffer")
+                            .0;
                         match key.cmp(best_key) {
                             Ordering::Less => best_idx = Some(i),
                             Ordering::Equal | Ordering::Greater => {}
@@ -151,7 +155,10 @@ impl<'a> KMergeState<'a> {
         };
 
         // Take the winner.
-        let winner = self.heads[best_idx].1.take().expect("best_idx points to populated buffer");
+        let winner = self.heads[best_idx]
+            .1
+            .take()
+            .expect("best_idx points to populated buffer");
 
         // Skip duplicate keys from lower-priority streams.
         for (i, (_, buf)) in self.heads.iter_mut().enumerate() {

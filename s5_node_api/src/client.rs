@@ -16,7 +16,10 @@ pub struct S5NodeClient {
 impl S5NodeClient {
     /// Create a client from a raw irpc client (no endpoint to manage).
     pub fn new(inner: irpc::Client<S5NodeProto>, endpoint: iroh::Endpoint) -> Self {
-        Self { inner, endpoint: Some(endpoint) }
+        Self {
+            inner,
+            endpoint: Some(endpoint),
+        }
     }
 
     /// Access the underlying irpc client.
@@ -37,8 +40,7 @@ impl S5NodeClient {
 
     /// Run a task with an inline spec.
     pub async fn run_task(&self, spec: TaskSpec) -> Result<RunTaskResponse> {
-        let spec_json = serde_json::to_string(&spec)
-            .context("failed to serialize task spec")?;
+        let spec_json = serde_json::to_string(&spec).context("failed to serialize task spec")?;
         self.inner
             .rpc(RunTask {
                 name: None,
@@ -90,8 +92,8 @@ impl S5NodeClient {
 
     /// Apply an RFC 6902 JSON Patch to the node's configuration.
     pub async fn patch_config(&self, patch: serde_json::Value) -> Result<PatchConfigResponse> {
-        let patch_json = serde_json::to_string(&patch)
-            .context("failed to serialize patch to JSON string")?;
+        let patch_json =
+            serde_json::to_string(&patch).context("failed to serialize patch to JSON string")?;
         self.inner
             .rpc(PatchConfig { patch_json })
             .await

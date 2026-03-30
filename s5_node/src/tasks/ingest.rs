@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use super::vault_persist::{
     inprogress_root_path, load_vault_root, remove_inprogress, save_vault_root, vault_root_path,
 };
-use super::{TaskExecutorContext, resolve_source, resolve_store, resolve_vault, vault_meta_store_path};
+use super::{
+    TaskExecutorContext, resolve_source, resolve_store, resolve_vault, vault_meta_store_path,
+};
 
 /// Run an ingest task.
 ///
@@ -60,11 +62,9 @@ pub async fn run_ingest(
     let meta_path = vault_meta_store_path(&vault);
     std::fs::create_dir_all(&meta_path)
         .with_context(|| format!("creating meta store at {}", meta_path.display()))?;
-    let meta_store = BlobStore::new(LocalStore::create(
-        s5_store_local::LocalStoreConfig {
-            base_path: meta_path.to_string_lossy().into_owned(),
-        },
-    ));
+    let meta_store = BlobStore::new(LocalStore::create(s5_store_local::LocalStoreConfig {
+        base_path: meta_path.to_string_lossy().into_owned(),
+    }));
 
     // -- Build a combined read store (meta + blob) --
     let read_store: Arc<dyn BlobsRead> = Arc::new(FallbackBlobsRead::new(
@@ -98,7 +98,10 @@ pub async fn run_ingest(
                 Snapshot::new(root, read_store.clone(), context, root_plaintext_hash)
             }
             None => {
-                tracing::info!(vault = vault_name, "no previous snapshot — generating encryption keys");
+                tracing::info!(
+                    vault = vault_name,
+                    "no previous snapshot — generating encryption keys"
+                );
                 let mut leaf_key = [0u8; 32];
                 let mut node_key = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut leaf_key);
@@ -196,14 +199,18 @@ pub async fn run_ingest(
             walker,
         )
         .await
-        .with_context(|| {
-            format!("backup failed for source path {}", source_path.display())
-        })?;
+        .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
 
         if let Some((new_snapshot, stats)) = result {
-            let changed = stats.files_changed.load(std::sync::atomic::Ordering::Relaxed);
-            let skipped = stats.files_skipped.load(std::sync::atomic::Ordering::Relaxed);
-            let uploaded = stats.bytes_uploaded.load(std::sync::atomic::Ordering::Relaxed);
+            let changed = stats
+                .files_changed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let skipped = stats
+                .files_skipped
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let uploaded = stats
+                .bytes_uploaded
+                .load(std::sync::atomic::Ordering::Relaxed);
 
             tracing::info!(
                 source = source_path_str,
@@ -230,7 +237,9 @@ pub async fn run_ingest(
             if !current_snapshot.is_empty() && source.paths.len() > 1 {
                 let ip_path = inprogress_root_path(&vault.root_path);
                 std::fs::create_dir_all(&vault.root_path).ok();
-                if let Err(e) = save_vault_root(&ip_path, &current_snapshot, &ctx.node_secret, vault_name) {
+                if let Err(e) =
+                    save_vault_root(&ip_path, &current_snapshot, &ctx.node_secret, vault_name)
+                {
                     tracing::warn!(error = %e, "failed to save inprogress checkpoint");
                 }
             }
@@ -246,8 +255,13 @@ pub async fn run_ingest(
         std::fs::create_dir_all(&vault.root_path)
             .with_context(|| format!("creating vault root at {}", vault.root_path))?;
 
-        save_vault_root(&current_path, &current_snapshot, &ctx.node_secret, vault_name)
-            .context("saving vault root")?;
+        save_vault_root(
+            &current_path,
+            &current_snapshot,
+            &ctx.node_secret,
+            vault_name,
+        )
+        .context("saving vault root")?;
 
         // Clean up any in-progress file
         remove_inprogress(&vault.root_path).ok();

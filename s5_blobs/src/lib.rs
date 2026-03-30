@@ -43,7 +43,10 @@ pub use net_protocol::BlobsServer;
 /// This type wrapped a `Client` to implement the low-level `Store` trait,
 /// but `Client` now implements `BlobsRead` (and `BlobsReadWrite` with `server` feature)
 /// directly, making this wrapper unnecessary.
-#[deprecated(since = "1.0.0-beta.2", note = "Use Client directly as BlobsRead/BlobsReadWrite")]
+#[deprecated(
+    since = "1.0.0-beta.2",
+    note = "Use Client directly as BlobsRead/BlobsReadWrite"
+)]
 mod store_remote;
 #[allow(deprecated)]
 pub use store_remote::RemoteBlobStore;

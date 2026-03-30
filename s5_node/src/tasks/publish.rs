@@ -76,10 +76,7 @@ async fn ensure_recovery_entry(
     // Check if entry already exists
     match registry.get(&recovery_stream_key).await {
         Ok(Some(_)) => {
-            tracing::debug!(
-                vault = vault_name,
-                "recovery registry entry already exists"
-            );
+            tracing::debug!(vault = vault_name, "recovery registry entry already exists");
             return Ok(());
         }
         Ok(None) => {} // Need to create it
@@ -198,8 +195,7 @@ pub(crate) fn age_decrypt_with_secret_key(
         .parse()
         .map_err(|e| anyhow!("parsing age secret key: {e}"))?;
 
-    let decryptor =
-        age::Decryptor::new(ciphertext).map_err(|e| anyhow!("age decryptor: {e}"))?;
+    let decryptor = age::Decryptor::new(ciphertext).map_err(|e| anyhow!("age decryptor: {e}"))?;
 
     let mut plaintext = vec![];
     let mut reader = decryptor
@@ -290,8 +286,7 @@ pub(crate) async fn fetch_previous_published_node(
     let cbor = age_decrypt_with_identity_files(&encrypted_bytes, identity_files)
         .context("decrypting previous published Transparent Node")?;
 
-    let node =
-        Node::from_bytes(&cbor).map_err(|e| anyhow!("CBOR decode previous TN: {e}"))?;
+    let node = Node::from_bytes(&cbor).map_err(|e| anyhow!("CBOR decode previous TN: {e}"))?;
 
     Ok(Some((node, entry.hash, entry.revision)))
 }
@@ -431,50 +426,45 @@ pub async fn run_publish(
     let stream_key = StreamKey::PublicKeyEd25519(verifying_key.to_bytes());
 
     // -- Fetch previous published TN for history accumulation --
-    let (prev_node, prev_encrypted_hash, prev_revision) =
-        if !identity_files.is_empty() {
-            match fetch_previous_published_node(
-                registry.as_ref(),
-                blob_store,
-                &stream_key,
-                &identity_files,
-            )
-            .await
-            {
-                Ok(Some((node, hash, rev))) => (Some(node), Some(hash), rev),
-                Ok(None) => (None, None, 0),
-                Err(e) => {
-                    tracing::warn!(
-                        vault = vault_name,
-                        error = %e,
-                        "could not fetch previous published TN for history — publishing without history"
-                    );
-                    // Fall back: check registry for revision only
-                    let rev = match registry.get(&stream_key).await {
-                        Ok(Some(entry)) => entry.revision,
-                        _ => 0,
-                    };
-                    (None, None, rev)
-                }
+    let (prev_node, prev_encrypted_hash, prev_revision) = if !identity_files.is_empty() {
+        match fetch_previous_published_node(
+            registry.as_ref(),
+            blob_store,
+            &stream_key,
+            &identity_files,
+        )
+        .await
+        {
+            Ok(Some((node, hash, rev))) => (Some(node), Some(hash), rev),
+            Ok(None) => (None, None, 0),
+            Err(e) => {
+                tracing::warn!(
+                    vault = vault_name,
+                    error = %e,
+                    "could not fetch previous published TN for history — publishing without history"
+                );
+                // Fall back: check registry for revision only
+                let rev = match registry.get(&stream_key).await {
+                    Ok(Some(entry)) => entry.revision,
+                    _ => 0,
+                };
+                (None, None, rev)
             }
-        } else {
-            tracing::info!(
-                vault = vault_name,
-                "no identity files configured — publishing without history"
-            );
-            let rev = match registry.get(&stream_key).await {
-                Ok(Some(entry)) => entry.revision,
-                _ => 0,
-            };
-            (None, None, rev)
+        }
+    } else {
+        tracing::info!(
+            vault = vault_name,
+            "no identity files configured — publishing without history"
+        );
+        let rev = match registry.get(&stream_key).await {
+            Ok(Some(entry)) => entry.revision,
+            _ => 0,
         };
+        (None, None, rev)
+    };
 
     // -- Build enriched Node with history --
-    let published_node = build_published_node(
-        &cbor,
-        prev_node.as_ref(),
-        prev_encrypted_hash,
-    )?;
+    let published_node = build_published_node(&cbor, prev_node.as_ref(), prev_encrypted_hash)?;
 
     let history_count = published_node.entries.len() - 1; // exclude ""
 
@@ -589,8 +579,7 @@ mod tests {
         let recipient_str = recipient.to_string();
 
         let plaintext = b"test transparent node cbor data";
-        let encrypted =
-            age_encrypt_for_recipients(plaintext, &[recipient_str]).unwrap();
+        let encrypted = age_encrypt_for_recipients(plaintext, &[recipient_str]).unwrap();
 
         // Decrypt with the identity
         let decryptor = age::Decryptor::new(&encrypted[..]).unwrap();
@@ -704,7 +693,9 @@ mod tests {
         assert!(node.entries.contains_key("2025-01-01T00:00:00Z"));
 
         // The new timestamp entry should be there (exact key depends on current time)
-        let new_history: Vec<_> = node.entries.keys()
+        let new_history: Vec<_> = node
+            .entries
+            .keys()
             .filter(|k| !k.is_empty() && k.as_str() != "2025-01-01T00:00:00Z")
             .collect();
         assert_eq!(new_history.len(), 1);

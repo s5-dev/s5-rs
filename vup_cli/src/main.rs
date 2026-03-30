@@ -181,51 +181,61 @@ async fn main() -> Result<()> {
 
         Commands::Status => cmd::run_status(&client).await,
 
-        Commands::Add { paths, source } => {
-            cmd::run_add(&client, &source, &paths).await
-        }
+        Commands::Add { paths, source } => cmd::run_add(&client, &source, &paths).await,
 
-        Commands::Snapshots { vault } => {
-            cmd::run_snapshots(&client, vault).await
-        }
+        Commands::Snapshots { vault } => cmd::run_snapshots(&client, vault).await,
 
-        Commands::Config { json, patch, patch_file } => {
-            cmd::run_config(&client, json, patch, patch_file).await
-        }
+        Commands::Config {
+            json,
+            patch,
+            patch_file,
+        } => cmd::run_config(&client, json, patch, patch_file).await,
 
         // Task commands
-        Commands::RunTask { name } => {
-            cmd::tasks::run_task_by_name(&client, &name).await
-        }
-        Commands::Ingest { vault, source, blob_store } => {
-            cmd::tasks::run_ingest(&client, &vault, &source, &blob_store).await
-        }
-        Commands::Backup { vault, source, blob_store, key } => {
+        Commands::RunTask { name } => cmd::tasks::run_task_by_name(&client, &name).await,
+        Commands::Ingest {
+            vault,
+            source,
+            blob_store,
+        } => cmd::tasks::run_ingest(&client, &vault, &source, &blob_store).await,
+        Commands::Backup {
+            vault,
+            source,
+            blob_store,
+            key,
+        } => {
             cmd::tasks::run_backup(
                 &client,
                 vault.as_deref(),
                 source.as_deref(),
                 blob_store.as_deref(),
                 &key,
-            ).await
+            )
+            .await
         }
-        Commands::Restore { vault, target, blob_store } => {
-            cmd::tasks::run_restore_task(&client, &vault, &target, blob_store.as_deref()).await
-        }
-        Commands::RemoteRestore { vault, age_secret_key, blob_store, target } => {
+        Commands::Restore {
+            vault,
+            target,
+            blob_store,
+        } => cmd::tasks::run_restore_task(&client, &vault, &target, blob_store.as_deref()).await,
+        Commands::RemoteRestore {
+            vault,
+            age_secret_key,
+            blob_store,
+            target,
+        } => {
             cmd::tasks::run_remote_restore_task(
-                &client, &age_secret_key, &vault, &blob_store, &target,
-            ).await
+                &client,
+                &age_secret_key,
+                &vault,
+                &blob_store,
+                &target,
+            )
+            .await
         }
-        Commands::TaskStatus { task_id } => {
-            cmd::tasks::task_status(&client, task_id).await
-        }
-        Commands::Tasks => {
-            cmd::tasks::list_tasks(&client).await
-        }
-        Commands::Cancel { task_id } => {
-            cmd::tasks::cancel_task(&client, task_id).await
-        }
+        Commands::TaskStatus { task_id } => cmd::tasks::task_status(&client, task_id).await,
+        Commands::Tasks => cmd::tasks::list_tasks(&client).await,
+        Commands::Cancel { task_id } => cmd::tasks::cancel_task(&client, task_id).await,
     };
 
     // Gracefully close the iroh endpoint before the runtime shuts down.
