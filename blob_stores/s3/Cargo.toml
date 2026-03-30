@@ -11,7 +11,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
-rust-s3 = { version = "0.37.0" }
+rust-s3 = { version = "0.37.0", default-features = false, features = ["tokio-rustls-tls", "tags", "fail-on-err"] }
 s5_core.workspace = true
 serde.workspace = true
 # S3 store uses async io
