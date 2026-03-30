@@ -166,44 +166,41 @@ async fn main() -> Result<()> {
 
     let config_path = resolve_config(cli.config)?;
 
-    match cli.cmd {
-        Commands::Init => cmd::init::run_init(&config_path).await,
+    // Commands that don't need a shared node connection.
+    match &cli.cmd {
+        Commands::Init => return cmd::init::run_init(&config_path).await,
+        Commands::Daemon => return node::run_daemon(&config_path).await,
+        Commands::Shutdown => return cmd::run_shutdown(&config_path).await,
+        _ => {}
+    }
 
-        Commands::Daemon => node::run_daemon(&config_path).await,
+    // Commands that need a node connection — connect once, close cleanly.
+    let client = node::ensure_node_running(&config_path).await?;
+    let result = match cli.cmd {
+        Commands::Init | Commands::Daemon | Commands::Shutdown => unreachable!(),
 
-        Commands::Shutdown => cmd::run_shutdown(&config_path).await,
-
-        Commands::Status => {
-            let client = node::ensure_node_running(&config_path).await?;
-            cmd::run_status(&client).await
-        }
+        Commands::Status => cmd::run_status(&client).await,
 
         Commands::Add { paths, source } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::run_add(&client, &source, &paths).await
         }
 
         Commands::Snapshots { vault } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::run_snapshots(&client, vault).await
         }
 
         Commands::Config { json, patch, patch_file } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::run_config(&client, json, patch, patch_file).await
         }
 
         // Task commands
         Commands::RunTask { name } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::run_task_by_name(&client, &name).await
         }
         Commands::Ingest { vault, source, blob_store } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::run_ingest(&client, &vault, &source, &blob_store).await
         }
         Commands::Backup { vault, source, blob_store, key } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::run_backup(
                 &client,
                 vault.as_deref(),
@@ -213,26 +210,26 @@ async fn main() -> Result<()> {
             ).await
         }
         Commands::Restore { vault, target, blob_store } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::run_restore_task(&client, &vault, &target, blob_store.as_deref()).await
         }
         Commands::RemoteRestore { vault, age_secret_key, blob_store, target } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::run_remote_restore_task(
                 &client, &age_secret_key, &vault, &blob_store, &target,
             ).await
         }
         Commands::TaskStatus { task_id } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::task_status(&client, task_id).await
         }
         Commands::Tasks => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::list_tasks(&client).await
         }
         Commands::Cancel { task_id } => {
-            let client = node::ensure_node_running(&config_path).await?;
             cmd::tasks::cancel_task(&client, task_id).await
         }
-    }
+    };
+
+    // Gracefully close the iroh endpoint before the runtime shuts down.
+    client.close().await;
+
+    result
 }

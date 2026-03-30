@@ -53,12 +53,12 @@ pub async fn run_backup(
     key_overrides: &[String],
 ) -> Result<()> {
     let config_resp = client.get_config().await?;
-    let config = &config_resp.config;
+    let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
 
     // Resolve vault
     let vault_name = match vault_override {
         Some(v) => v.to_string(),
-        None => resolve_single_or_default(config, "vault", "default")?,
+        None => resolve_single_or_default(&config, "vault", "default")?,
     };
 
     // Get vault config for downstream defaults
@@ -70,7 +70,7 @@ pub async fn run_backup(
     // Resolve source
     let source_name = match source_override {
         Some(s) => s.to_string(),
-        None => resolve_single_or_default(config, "source", "default")?,
+        None => resolve_single_or_default(&config, "source", "default")?,
     };
 
     // Resolve blob store
@@ -198,7 +198,8 @@ pub async fn run_remote_restore_task(
 /// `vup task-status <id>` — show task status.
 pub async fn task_status(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let resp = client.get_task_status(task_id).await?;
-    print_status(resp.task_id, &resp.state, resp.progress.as_ref());
+    let progress = parse_progress(resp.progress_json.as_deref());
+    print_status(resp.task_id, &resp.state, progress.as_ref());
     Ok(())
 }
 
@@ -210,7 +211,8 @@ pub async fn list_tasks(client: &S5NodeClient) -> Result<()> {
         return Ok(());
     }
     for t in &resp.tasks {
-        print_status(t.task_id, &t.state, t.progress.as_ref());
+        let progress = parse_progress(t.progress_json.as_deref());
+        print_status(t.task_id, &t.state, progress.as_ref());
         println!();
     }
     Ok(())
@@ -231,6 +233,11 @@ pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Deserialize a `TaskProgress` from an optional JSON string.
+fn parse_progress(json: Option<&str>) -> Option<TaskProgress> {
+    json.and_then(|s| serde_json::from_str(s).ok())
+}
+
 /// Poll a task until it finishes, printing progress updates.
 async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let pb = ProgressBar::new_spinner();
@@ -245,15 +252,16 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let resp = client.get_task_status(task_id).await?;
+        let progress = parse_progress(resp.progress_json.as_deref());
 
         match &resp.state {
             TaskState::Pending | TaskState::Running => {
-                if let Some(ref p) = resp.progress {
+                if let Some(ref p) = progress {
                     pb.set_message(format_progress(p));
                 }
             }
             TaskState::Completed => {
-                if let Some(ref p) = resp.progress {
+                if let Some(ref p) = progress {
                     pb.set_message(format_progress(p));
                 }
                 pb.finish_with_message(format!("✓ task {} completed", task_id));

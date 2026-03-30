@@ -29,7 +29,8 @@ pub async fn run_status(client: &S5NodeClient) -> Result<()> {
 
     // Also show configured sources from config
     let config_resp = client.get_config().await?;
-    if let Some(sources) = config_resp.config.get("source") {
+    let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
+    if let Some(sources) = config.get("source") {
         if let Some(obj) = sources.as_object() {
             if !obj.is_empty() {
                 println!("\nSources:");
@@ -44,7 +45,7 @@ pub async fn run_status(client: &S5NodeClient) -> Result<()> {
         }
     }
 
-    if let Some(vaults) = config_resp.config.get("vault") {
+    if let Some(vaults) = config.get("vault") {
         if let Some(obj) = vaults.as_object() {
             if !obj.is_empty() {
                 println!("\nVaults:");
@@ -84,8 +85,8 @@ pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> 
 
     // Check if the source already exists
     let config_resp = client.get_config().await?;
-    let source_exists = config_resp
-        .config
+    let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
+    let source_exists = config
         .get("source")
         .and_then(|s| s.get(source))
         .is_some();
@@ -196,7 +197,8 @@ pub async fn run_config(
         if resp.ok {
             println!("Config updated.");
             if json {
-                if let Some(config) = resp.config {
+                if let Some(ref config_json) = resp.config_json {
+                    let config: serde_json::Value = serde_json::from_str(config_json)?;
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 }
             }
@@ -215,7 +217,8 @@ pub async fn run_config(
         if resp.ok {
             println!("Config updated from {}.", path.display());
             if json {
-                if let Some(config) = resp.config {
+                if let Some(ref config_json) = resp.config_json {
+                    let config: serde_json::Value = serde_json::from_str(config_json)?;
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 }
             }
@@ -228,7 +231,8 @@ pub async fn run_config(
     // --json: dump config and exit
     if json {
         let resp = client.get_config().await?;
-        println!("{}", serde_json::to_string_pretty(&resp.config)?);
+        let config: serde_json::Value = serde_json::from_str(&resp.config_json)?;
+        println!("{}", serde_json::to_string_pretty(&config)?);
         return Ok(());
     }
 
@@ -242,10 +246,10 @@ async fn run_config_wizard(client: &S5NodeClient) -> Result<()> {
 
     loop {
         let config_resp = client.get_config().await?;
-        let config = &config_resp.config;
+        let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
 
         // Show current state summary
-        print_config_summary(config);
+        print_config_summary(&config);
         println!();
 
         let choices = &[
@@ -260,9 +264,9 @@ async fn run_config_wizard(client: &S5NodeClient) -> Result<()> {
             .interact()?;
 
         match selection {
-            0 => wizard_recovery_key(client, config).await?,
+            0 => wizard_recovery_key(client, &config).await?,
             1 => {
-                println!("{}", serde_json::to_string_pretty(config)?);
+                println!("{}", serde_json::to_string_pretty(&config)?);
                 println!();
             }
             2 => break,
@@ -426,7 +430,8 @@ async fn wizard_recovery_key(
         println!("Recovery key added to config.");
 
         // Check if it was added to any tasks
-        if let Some(new_config) = &resp.config {
+        if let Some(ref new_config_json) = resp.config_json {
+            let new_config: serde_json::Value = serde_json::from_str(new_config_json)?;
             if let Some(tasks) = new_config.get("task").and_then(|v| v.as_object()) {
                 for (name, task) in tasks {
                     if let Some(keys) = task.get("keys").and_then(|k| k.as_array()) {
