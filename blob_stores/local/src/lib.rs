@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use s5_core::blob::store::BlobStore;
 use s5_core::blob::location::BlobLocation;
 use s5_core::store::{StoreFeatures, StoreResult};
 use std::path::PathBuf;
@@ -27,8 +28,8 @@ impl LocalStore {
         }
     }
 
-    pub fn to_blob_store(self) -> s5_core::BlobStore {
-        s5_core::BlobStore::new(self)
+    pub fn to_blob_store(self) -> BlobStore {
+        BlobStore::new(self)
     }
 
     pub fn create(config: LocalStoreConfig) -> Self {
@@ -37,6 +38,7 @@ impl LocalStore {
             // TODO copy_files: config.copy_files,
         }
     }
+
     fn resolve_path(&self, path: &str) -> StoreResult<PathBuf> {
         if path.contains("..") || path.starts_with('/') {
             return Err(anyhow!(
@@ -72,6 +74,7 @@ impl s5_core::store::Store for LocalStore {
             case_sensitive: false,
             recommended_max_dir_size: 1024,
             supports_rename: true,
+            supports_reflink: true,
         }
     }
 
@@ -203,6 +206,57 @@ impl s5_core::store::Store for LocalStore {
 
         Ok(Box::new(stream))
     }
+
+    async fn reflink_file_to(
+        &self,
+        source: &std::path::Path,
+        dest_path: &str,
+    ) -> StoreResult<()> {
+        let full_dest = self.resolve_path(dest_path)?;
+        if let Some(parent) = full_dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let source = source.to_path_buf();
+        tokio::task::spawn_blocking(move || try_reflink(&source, &full_dest)).await?
+    }
+}
+
+/// Attempt a reflink (FICLONE) copy from `src` to `dst`.
+///
+/// FICLONE is a Linux ioctl that creates a copy-on-write clone of a file.
+/// On XFS with `reflink=1`, this is instant and uses zero extra disk space
+/// until either file is modified. If FICLONE is not supported (wrong FS,
+/// cross-device, etc.) this returns an error and the caller should fall back
+/// to a regular copy.
+#[cfg(target_os = "linux")]
+fn try_reflink(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // FICLONE ioctl number: _IOW(0x94, 9, int) = 0x40049409
+    const FICLONE: libc::c_ulong = 0x40049409;
+
+    let src_file = std::fs::File::open(src)
+        .with_context(|| format!("reflink: failed to open source {:?}", src))?;
+    let dst_file = std::fs::File::create(dst)
+        .with_context(|| format!("reflink: failed to create dest {:?}", dst))?;
+
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // Clean up the empty destination file on failure
+        let _ = std::fs::remove_file(dst);
+        return Err(err).with_context(|| {
+            format!("FICLONE ioctl failed for {:?} -> {:?}", src, dst)
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_reflink(_src: &std::path::Path, _dst: &std::path::Path) -> Result<()> {
+    anyhow::bail!("reflink not supported on this platform")
 }
 
 #[cfg(test)]

@@ -4,13 +4,10 @@
 //! for exchanging content-addressed blobs over iroh:
 //!
 //! - [`Client`]: a high-level RPC client that implements
-//!   [`s5_core::BlobsRead`] and [`s5_core::BlobsWrite`] (with `server` feature).
+//!   [`s5_core::BlobsRead`] and [`s5_core::BlobsWrite`] (read is always available,
+//!   write requires `server` feature).
 //! - [`BlobsServer`]: a server-side handler that exposes named
 //!   blob stores over an iroh [`iroh::Endpoint`]. (requires `server` feature)
-//! - [`RemoteBlobStore`]: a remote implementation of
-//!   [`s5_core::Store`] backed by a [`Client`], suitable for
-//!   use with [`s5_core::BlobStore`] as a generic remote
-//!   storage backend.
 //! - [`MultiFetcher`]: fetches blobs from multiple sources with fallback.
 //!
 //! These building blocks can be composed to run a blob-serving
@@ -19,11 +16,12 @@
 //! ## Features
 //!
 //! - `server` (default): Enables server-side functionality including `BlobsServer`
-//!   and the `BlobsRead`/`BlobsWrite` trait implementations on `Client`.
+//!   and the `BlobsWrite` trait implementation on `Client`.
 //!   Requires tokio. Not WASM-compatible.
 //!
-//! For WASM/browser usage, disable default features to get `Client`, `RemoteBlobStore`,
-//! `MultiFetcher`, and RPC types.
+//! For WASM/browser usage, disable default features to get `Client`,
+//! `MultiFetcher`, and RPC types (note: `Client` still implements `BlobsRead`
+//! even without the server feature).
 
 pub mod rpc;
 pub use crate::rpc::ALPN;
@@ -41,7 +39,13 @@ mod net_protocol;
 #[cfg(feature = "server")]
 pub use net_protocol::BlobsServer;
 
+/// Deprecated: Use `Arc<dyn BlobsReadWrite>` with `s5_blobs::Client` directly.
+/// This type wrapped a `Client` to implement the low-level `Store` trait,
+/// but `Client` now implements `BlobsRead` (and `BlobsReadWrite` with `server` feature)
+/// directly, making this wrapper unnecessary.
+#[deprecated(since = "1.0.0-beta.2", note = "Use Client directly as BlobsRead/BlobsReadWrite")]
 mod store_remote;
+#[allow(deprecated)]
 pub use store_remote::RemoteBlobStore;
 
 mod multi_fetcher;

@@ -8,17 +8,21 @@ use s5_core::Hash;
 
 use crate::rpc::{DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse, RpcProto, UploadBlob};
 
-#[cfg(feature = "server")]
 use {
     anyhow::anyhow,
     async_trait::async_trait,
-    futures::Stream,
-    futures_util::StreamExt,
     s5_core::BlobId,
     s5_core::blob::{BlobResult, BlobsRead, BlobsWrite},
     std::io::Cursor,
     std::path::PathBuf,
-    tokio::io::{AsyncRead, AsyncReadExt},
+    tokio::io::AsyncRead,
+    tokio::io::AsyncReadExt,
+};
+
+#[cfg(feature = "server")]
+use {
+    futures::Stream,
+    futures_util::StreamExt,
 };
 
 #[derive(Clone)]
@@ -194,7 +198,6 @@ impl Client {
     }
 }
 
-#[cfg(feature = "server")]
 #[async_trait]
 impl BlobsRead for Client {
     async fn blob_contains(&self, hash: Hash) -> BlobResult<bool> {

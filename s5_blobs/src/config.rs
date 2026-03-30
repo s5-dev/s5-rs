@@ -7,4 +7,7 @@ pub struct PeerConfigBlobs {
     pub readable_stores: Vec<String>,
     #[serde(default)]
     pub store_uploads_in: Option<String>,
+    /// Skip per-blob pin checks for this peer (default: false).
+    #[serde(default)]
+    pub skip_pin_check: bool,
 }

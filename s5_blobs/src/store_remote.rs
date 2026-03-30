@@ -145,6 +145,7 @@ impl Store for RemoteBlobStore {
             supports_rename: false,
             case_sensitive: true,
             recommended_max_dir_size: u64::MAX,
+            ..Default::default()
         }
     }
 

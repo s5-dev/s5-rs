@@ -54,6 +54,15 @@ impl BlobStore {
         }
     }
 
+    /// Create a `BlobStore` from an already-Arc'd `Store`, using it for
+    /// both blob data and outboard data.
+    pub fn from_arc(store: Arc<dyn Store>) -> Self {
+        Self {
+            store: store.clone(),
+            outboard_store: Some(store),
+        }
+    }
+
     /// Create a `BlobStore` that never stores Bao outboard data.
     /// Only the main blob content is persisted.
     pub fn without_outboard<S>(store: S) -> Self
@@ -164,6 +173,20 @@ impl BlobStore {
         import::import_bytes(&self.store, &self.outboard_store, bytes).await
     }
 
+    /// Insert an in-memory blob without checking if it already exists.
+    ///
+    /// This is faster than `import_bytes` because it skips the existence check
+    /// and writes directly. Use this during bulk import/backfill when you know
+    /// records are new.
+    ///
+    /// # Warning
+    ///
+    /// If the blob already exists, this will overwrite it (which is usually fine
+    /// for content-addressed storage since the content is identical).
+    pub async fn import_bytes_unchecked(&self, bytes: bytes::Bytes) -> StoreResult<BlobId> {
+        import::import_bytes_unchecked(&self.store, &self.outboard_store, bytes).await
+    }
+
     /// Import a blob from a stream of bytes.
     pub async fn import_stream(
         &self,
@@ -196,6 +219,18 @@ impl BlobStore {
         }
 
         Ok(hashes)
+    }
+
+    /// Ensures all pending writes are durably persisted to storage.
+    ///
+    /// Call this before creating snapshots or on shutdown to guarantee
+    /// that all imported blobs are safely stored.
+    pub async fn sync(&self) -> StoreResult<()> {
+        self.store.sync().await?;
+        if let Some(ref outboard) = self.outboard_store {
+            outboard.sync().await?;
+        }
+        Ok(())
     }
 }
 
@@ -266,6 +301,10 @@ impl BlobsWrite for BlobStore {
     #[cfg(not(target_arch = "wasm32"))]
     async fn blob_upload_file(&self, path: PathBuf) -> StoreResult<BlobId> {
         self.import_file(path, |_| Ok(())).await
+    }
+
+    async fn blob_sync(&self) -> StoreResult<()> {
+        self.sync().await
     }
 }
 
@@ -372,6 +411,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: true,
             recommended_max_dir_size: 100,
+            ..Default::default()
         };
         let (store, entries) = TestStore::new(features);
         let blob_store = BlobStore::without_outboard(store);
@@ -404,6 +444,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: false,
             recommended_max_dir_size: 100,
+            ..Default::default()
         };
         let (store, entries) = TestStore::new(features);
         let blob_store = BlobStore::without_outboard(store);
@@ -436,6 +477,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: true,
             recommended_max_dir_size: u64::MAX,
+            ..Default::default()
         };
         let (store, entries) = TestStore::new(features);
         let blob_store = BlobStore::without_outboard(store);
@@ -458,6 +500,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: true,
             recommended_max_dir_size: 100,
+            ..Default::default()
         };
         let result = BlobStore::hash_from_blob_path("other/prefix", &features).unwrap();
         assert!(result.is_none());
@@ -469,6 +512,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: true,
             recommended_max_dir_size: 100,
+            ..Default::default()
         };
         let result = BlobStore::hash_from_blob_path("blob3/!!!", &features);
         assert!(result.is_err());
@@ -480,6 +524,7 @@ mod tests {
             supports_rename: true,
             case_sensitive: false,
             recommended_max_dir_size: 100,
+            ..Default::default()
         };
         let result = BlobStore::hash_from_blob_path("blob3/!!!!", &features).unwrap();
         assert!(result.is_none());
