@@ -1,0 +1,24 @@
+[package]
+name = "s5_fs_local"
+version = "1.0.0-beta.1"
+edition = "2024"
+description = "Local filesystem backup and restore for S5 FS V2"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+futures.workspace = true
+ignore = "0.4"
+libc = "0.2"
+s5_core.workspace = true
+s5_fs_v2.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tracing.workspace = true
+xattr = "1"
+
+[dev-dependencies]
+s5_store_memory.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
