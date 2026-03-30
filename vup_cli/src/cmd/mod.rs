@@ -1,212 +1,445 @@
-use std::path::{Path, PathBuf};
+pub mod init;
+pub mod tasks;
 
-use anyhow::{Context, bail, Result};
+use std::path::PathBuf;
 
-use crate::config::{Source, VaultConfig};
-use crate::vault;
+use anyhow::{bail, Result};
+use s5_node_api::S5NodeClient;
 
-// ── vup config ──────────────────────────────────────────────────────
+use crate::node::ensure_node_running;
 
-/// Interactive configuration. Detects current state and walks the user
-/// through whatever is missing (seed phrase, etc.).
-pub async fn run_config(config_path: &Path) -> Result<()> {
-    let mut cfg = VaultConfig::load(config_path)?;
-    let is_new = cfg.vault.seed_phrase.is_none();
-
-    if is_new {
-        println!("No vault found — setting up a new one.");
-        println!();
-
-        let seed_phrase = s5_client::keys::generate_seed_phrase()
-            .map_err(|e| anyhow::anyhow!("failed to generate seed phrase: {e}"))?;
-
-        // Validate round-trip before showing to user
-        let _keys = s5_client::DerivedKeys::from_seed_phrase(&seed_phrase)
-            .map_err(|e| anyhow::anyhow!("generated phrase failed validation: {e}"))?;
-
-        println!("Your recovery phrase (write this down and store it safely):");
-        println!();
-        println!("  {seed_phrase}");
-        println!();
-        println!("WARNING: This phrase is the ONLY way to recover your encrypted backups.");
-        println!("         If you lose it, your data cannot be recovered.");
-        println!();
-
-        let confirmed = dialoguer::Confirm::new()
-            .with_prompt("I have saved my recovery phrase")
-            .default(false)
-            .interact()?;
-
-        if !confirmed {
-            bail!("Aborted. Run `vup config` again when ready.");
-        }
-
-        cfg.vault.seed_phrase = Some(seed_phrase);
-    } else {
-        println!("Vault configured at {}", config_path.display());
-        println!();
-    }
-
-    // Show current targets
-    if !cfg.targets.is_empty() {
-        println!("Current targets:");
-        for (name, store) in &cfg.targets {
-            println!("  {name}: {store:?}");
-        }
-        println!();
-    }
-
-    cfg.save(config_path)?;
-
-    if is_new {
-        println!();
-        println!("Vault initialized at {}", config_path.display());
-        println!("Next: run `vup add <directory>` to start tracking files.");
-    }
-
+/// Shut down the running node.
+pub async fn run_shutdown(config_path: &std::path::Path) -> Result<()> {
+    let client = ensure_node_running(config_path).await?;
+    client.shutdown().await?;
+    println!("Service stopped.");
     Ok(())
 }
 
-// ── vup add ─────────────────────────────────────────────────────────
+/// `vup status` — show node status summary.
+pub async fn run_status(client: &S5NodeClient) -> Result<()> {
+    let resp = client.get_status().await?;
 
-/// Register source directories and run initial index.
-pub async fn run_add(paths: Vec<PathBuf>, config_path: &Path) -> Result<()> {
-    let mut cfg = VaultConfig::load(config_path)?;
-    if cfg.vault.seed_phrase.is_none() {
-        bail!("Vault not configured. Run `vup config` first.");
-    }
+    println!("S5 Node Status");
+    println!("  Endpoint:     {}", resp.endpoint_id);
+    println!("  Stores:       {}", resp.store_count);
+    println!("  Vaults:       {}", resp.vault_count);
+    println!("  Sources:      {}", resp.source_count);
+    println!("  Active tasks: {}", resp.running_tasks);
 
-    let mut added = Vec::new();
-    for p in &paths {
-        let abs = p
-            .canonicalize()
-            .with_context(|| format!("path does not exist: {}", p.display()))?;
-
-        if !abs.is_dir() {
-            bail!("{} is not a directory", abs.display());
-        }
-
-        if cfg.sources.iter().any(|s| s.path == abs) {
-            println!("  already tracked: {}", abs.display());
-            continue;
-        }
-
-        cfg.sources.push(Source { path: abs.clone() });
-        println!("  added: {}", abs.display());
-        added.push(abs);
-    }
-
-    cfg.save(config_path)?;
-
-    // Re-index all sources (including newly added ones)
-    let source_paths: Vec<PathBuf> = cfg.sources.iter().map(|s| s.path.clone()).collect();
-    let fs = vault::open_index()?;
-    let (files, bytes) = vault::reindex(&fs, &source_paths).await?;
-    fs.shutdown().await?;
-
-    println!();
-    println!(
-        "Indexed {} files ({})",
-        files,
-        vault::format_bytes(bytes),
-    );
-
-    Ok(())
-}
-
-// ── vup status ──────────────────────────────────────────────────────
-
-/// Re-index then show vault status.
-pub async fn run_status(config_path: &Path) -> Result<()> {
-    if !config_path.exists() {
-        println!("Vault not configured. Run `vup config` to get started.");
-        return Ok(());
-    }
-
-    let cfg = VaultConfig::load(config_path)?;
-
-    if cfg.vault.seed_phrase.is_none() {
-        println!("Vault not configured. Run `vup config` to get started.");
-        return Ok(());
-    }
-
-    // Re-index all sources
-    let source_paths: Vec<PathBuf> = cfg.sources.iter().map(|s| s.path.clone()).collect();
-    if !source_paths.is_empty() {
-        let fs = vault::open_index()?;
-        vault::reindex(&fs, &source_paths).await?;
-        fs.shutdown().await?;
-    }
-
-    println!("Vault: {}", config_path.display());
-    println!();
-
-    // Sources
-    println!("Sources ({}):", cfg.sources.len());
-    if cfg.sources.is_empty() {
-        println!("  (none) — run `vup add <path>` to track directories");
-    } else {
-        for s in &cfg.sources {
-            // TODO: show file count + size per source, and backup status
-            println!("  {}", s.path.display());
-        }
-    }
-    println!();
-
-    // Targets
-    println!("Targets ({}):", cfg.targets.len());
-    if cfg.targets.is_empty() {
-        println!("  (none) — run `vup config` to add a backup target");
-    } else {
-        for (name, store) in &cfg.targets {
-            println!("  {name}: {store:?}");
-        }
-    }
-
-    Ok(())
-}
-
-// ── vup backup ──────────────────────────────────────────────────────
-
-/// Re-index, diff against backup root, upload changed blobs.
-pub async fn run_backup(config_path: &Path, target_name: Option<&str>) -> Result<()> {
-    let cfg = VaultConfig::load(config_path)?;
-    if cfg.vault.seed_phrase.is_none() {
-        bail!("Vault not configured. Run `vup config` first.");
-    }
-    if cfg.sources.is_empty() {
-        bail!("No sources tracked. Run `vup add <path>` first.");
-    }
-
-    // Resolve target
-    let _target = match target_name {
-        Some(name) => cfg
-            .targets
-            .get(name)
-            .with_context(|| format!("target not found: {name}"))?,
-        None => {
-            if cfg.targets.len() == 1 {
-                cfg.targets.values().next().unwrap()
-            } else if cfg.targets.is_empty() {
-                bail!("No targets configured. Run `vup config` to add one.");
-            } else {
-                bail!("Multiple targets configured. Specify one with --target <name>.");
+    // Also show configured sources from config
+    let config_resp = client.get_config().await?;
+    if let Some(sources) = config_resp.config.get("source") {
+        if let Some(obj) = sources.as_object() {
+            if !obj.is_empty() {
+                println!("\nSources:");
+                for (name, source) in obj {
+                    if let Some(paths) = source.get("paths").and_then(|p| p.as_array()) {
+                        let path_strs: Vec<&str> =
+                            paths.iter().filter_map(|p| p.as_str()).collect();
+                        println!("  {}: {}", name, path_strs.join(", "));
+                    }
+                }
             }
         }
-    };
+    }
 
-    // Re-index all sources
-    let source_paths: Vec<PathBuf> = cfg.sources.iter().map(|s| s.path.clone()).collect();
-    let index_fs = vault::open_index()?;
-    let (files, bytes) = vault::reindex(&index_fs, &source_paths).await?;
+    if let Some(vaults) = config_resp.config.get("vault") {
+        if let Some(obj) = vaults.as_object() {
+            if !obj.is_empty() {
+                println!("\nVaults:");
+                for (name, vault) in obj {
+                    let stores = vault
+                        .get("blob_stores")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    println!("  {}: stores=[{}]", name, stores);
+                }
+            }
+        }
+    }
 
-    println!("Indexed {} files ({})", files, vault::format_bytes(bytes));
-
-    // TODO: diff index vs backup root, upload changed blobs
-    println!();
-    println!("Backup upload not yet implemented. Index is up to date.");
-
-    index_fs.shutdown().await?;
     Ok(())
 }
 
+/// `vup add <paths> --source <name>` — add paths to a source via JSON Patch.
+pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        bail!("no paths specified");
+    }
+
+    // Canonicalize paths
+    let mut abs_paths = Vec::new();
+    for p in paths {
+        let abs = std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("cannot resolve path '{}': {}", p.display(), e))?;
+        abs_paths.push(abs.to_string_lossy().to_string());
+    }
+
+    // Check if the source already exists
+    let config_resp = client.get_config().await?;
+    let source_exists = config_resp
+        .config
+        .get("source")
+        .and_then(|s| s.get(source))
+        .is_some();
+
+    let patch = if source_exists {
+        // Append paths to existing source
+        let mut ops: Vec<serde_json::Value> = Vec::new();
+        for path in &abs_paths {
+            ops.push(serde_json::json!({
+                "op": "add",
+                "path": format!("/source/{}/paths/-", source),
+                "value": path,
+            }));
+        }
+        serde_json::Value::Array(ops)
+    } else {
+        // Create new source with these paths
+        serde_json::json!([
+            {
+                "op": "add",
+                "path": format!("/source/{}", source),
+                "value": {
+                    "paths": abs_paths,
+                    "exclude": [],
+                    "ignore": false,
+                }
+            }
+        ])
+    };
+
+    let resp = client.patch_config(patch).await?;
+    if resp.ok {
+        if source_exists {
+            println!(
+                "Added {} path(s) to source '{}'.",
+                abs_paths.len(),
+                source
+            );
+        } else {
+            println!(
+                "Created source '{}' with {} path(s).",
+                source,
+                abs_paths.len()
+            );
+        }
+        for p in &abs_paths {
+            println!("  + {}", p);
+        }
+    } else {
+        bail!("failed to update config: {}", resp.message);
+    }
+
+    Ok(())
+}
+
+/// `vup snapshots [vault]` — list vault snapshots.
+pub async fn run_snapshots(client: &S5NodeClient, vault: Option<String>) -> Result<()> {
+    let resp = client.list_snapshots(vault.clone()).await?;
+
+    if resp.snapshots.is_empty() {
+        match vault {
+            Some(v) => println!("No snapshots found for vault '{}'.", v),
+            None => println!("No snapshots found."),
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<16} {:<10} {:<12} {}",
+        "VAULT", "HASH", "FILES", "SIZE", "DATE"
+    );
+    for snap in &resp.snapshots {
+        let hash_short = if snap.hash.len() > 12 {
+            &snap.hash[..12]
+        } else {
+            &snap.hash
+        };
+        let files = snap
+            .file_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let size = snap
+            .total_bytes
+            .map(|b| humansize::format_size(b, humansize::BINARY))
+            .unwrap_or_else(|| "-".into());
+        let date = &snap.timestamp;
+        println!(
+            "{:<12} {:<16} {:<10} {:<12} {}",
+            snap.vault, hash_short, files, size, date
+        );
+    }
+
+    Ok(())
+}
+
+/// `vup config` — interactive configuration wizard or JSON patch.
+pub async fn run_config(
+    client: &S5NodeClient,
+    json: bool,
+    patch: Option<String>,
+    patch_file: Option<PathBuf>,
+) -> Result<()> {
+    // --patch: apply and exit
+    if let Some(patch_str) = patch {
+        let patch_val: serde_json::Value = serde_json::from_str(&patch_str)
+            .map_err(|e| anyhow::anyhow!("invalid JSON patch: {}", e))?;
+        let resp = client.patch_config(patch_val).await?;
+        if resp.ok {
+            println!("Config updated.");
+            if json {
+                if let Some(config) = resp.config {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                }
+            }
+        } else {
+            bail!("patch failed: {}", resp.message);
+        }
+        return Ok(());
+    }
+
+    // --patch-file: apply and exit
+    if let Some(path) = patch_file {
+        let content = tokio::fs::read_to_string(&path).await?;
+        let patch_val: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("invalid JSON in {}: {}", path.display(), e))?;
+        let resp = client.patch_config(patch_val).await?;
+        if resp.ok {
+            println!("Config updated from {}.", path.display());
+            if json {
+                if let Some(config) = resp.config {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                }
+            }
+        } else {
+            bail!("patch failed: {}", resp.message);
+        }
+        return Ok(());
+    }
+
+    // --json: dump config and exit
+    if json {
+        let resp = client.get_config().await?;
+        println!("{}", serde_json::to_string_pretty(&resp.config)?);
+        return Ok(());
+    }
+
+    // Default: interactive wizard
+    run_config_wizard(client).await
+}
+
+/// Interactive configuration wizard.
+async fn run_config_wizard(client: &S5NodeClient) -> Result<()> {
+    use dialoguer::{Confirm, Select};
+
+    loop {
+        let config_resp = client.get_config().await?;
+        let config = &config_resp.config;
+
+        // Show current state summary
+        print_config_summary(config);
+        println!();
+
+        let choices = &[
+            "Generate recovery key",
+            "Show current config as JSON",
+            "Done",
+        ];
+        let selection = Select::new()
+            .with_prompt("What would you like to configure?")
+            .items(choices)
+            .default(0)
+            .interact()?;
+
+        match selection {
+            0 => wizard_recovery_key(client, config).await?,
+            1 => {
+                println!("{}", serde_json::to_string_pretty(config)?);
+                println!();
+            }
+            2 => break,
+            _ => unreachable!(),
+        }
+
+        if !Confirm::new()
+            .with_prompt("Configure something else?")
+            .default(false)
+            .interact()?
+        {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a compact config summary for the wizard header.
+fn print_config_summary(config: &serde_json::Value) {
+    println!("Current Configuration");
+    println!("─────────────────────");
+
+    // Keys
+    if let Some(keys) = config.get("key").and_then(|v| v.as_object()) {
+        if !keys.is_empty() {
+            let names: Vec<&String> = keys.keys().collect();
+            println!("  Keys:    {}", names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        } else {
+            println!("  Keys:    (none)");
+        }
+    } else {
+        println!("  Keys:    (none)");
+    }
+
+    // Stores
+    if let Some(stores) = config.get("store").and_then(|v| v.as_object()) {
+        if !stores.is_empty() {
+            for (name, store) in stores {
+                let stype = store.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  Store:   {} ({})", name, stype);
+            }
+        } else {
+            println!("  Stores:  (none)");
+        }
+    } else {
+        println!("  Stores:  (none)");
+    }
+
+    // Sources
+    if let Some(sources) = config.get("source").and_then(|v| v.as_object()) {
+        if !sources.is_empty() {
+            for (name, source) in sources {
+                let count = source
+                    .get("paths")
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                println!("  Source:  {} ({} paths)", name, count);
+            }
+        }
+    }
+
+    // Vaults
+    if let Some(vaults) = config.get("vault").and_then(|v| v.as_object()) {
+        if !vaults.is_empty() {
+            for (name, vault) in vaults {
+                let key = vault.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  Vault:   {} (key={})", name, key);
+            }
+        }
+    }
+}
+
+/// Wizard: generate a recovery key phrase and add it to config.
+async fn wizard_recovery_key(
+    client: &S5NodeClient,
+    config: &serde_json::Value,
+) -> Result<()> {
+    use dialoguer::Confirm;
+
+    // Check if recovery key already exists
+    let has_recovery = config
+        .get("key")
+        .and_then(|k| k.get("recovery"))
+        .is_some();
+
+    if has_recovery {
+        println!("\n⚠  A recovery key is already configured.");
+        if !Confirm::new()
+            .with_prompt("Generate a NEW recovery key? (the old one will be replaced)")
+            .default(false)
+            .interact()?
+        {
+            return Ok(());
+        }
+    }
+
+    println!();
+    println!("Generating a new age recovery key...");
+    println!("This key can restore access to your encrypted vaults.");
+    println!();
+
+    let (pubkey, secret_key) = crate::recovery::generate_recovery_key();
+
+    println!("┌─────────────────────────────────────────────────────────────────────────┐");
+    println!("│  WRITE DOWN THIS KEY — it is your only way to recover your data         │");
+    println!("│  if you lose this device.                                               │");
+    println!("│                                                                         │");
+    println!("│  {}  │", format!("{:<69}", &secret_key));
+    println!("│                                                                         │");
+    println!("│  Store this key OFFLINE in a safe place.                                │");
+    println!("│  Anyone with this key can decrypt your backups.                         │");
+    println!("│                                                                         │");
+    println!("│  Tip: Bech32 encoding avoids ambiguous characters (0/O, l/1)            │");
+    println!("│  and includes a checksum to catch typos.                                │");
+    println!("└─────────────────────────────────────────────────────────────────────────┘");
+    println!();
+    println!("Derived age public key: {}", pubkey);
+    println!();
+
+    if !Confirm::new()
+        .with_prompt("I have written down the recovery key")
+        .default(false)
+        .interact()?
+    {
+        println!("Aborted — no changes made.");
+        return Ok(());
+    }
+
+    // Build the patch to add/replace the recovery key
+    let mut ops = vec![serde_json::json!({
+        "op": if has_recovery { "replace" } else { "add" },
+        "path": "/key/recovery",
+        "value": {
+            "public_key": pubkey,
+        }
+    })];
+
+    // Also add "recovery" to each vault's backup tasks' keys list if not already present
+    if let Some(tasks) = config.get("task").and_then(|v| v.as_object()) {
+        for (name, task) in tasks {
+            let task_type = task.get("type").and_then(|v| v.as_str());
+            if matches!(task_type, Some("backup") | Some("publish")) {
+                if let Some(keys) = task.get("keys").and_then(|k| k.as_array()) {
+                    let already_has = keys.iter().any(|k| k.as_str() == Some("recovery"));
+                    if !already_has {
+                        ops.push(serde_json::json!({
+                            "op": "add",
+                            "path": format!("/task/{}/keys/-", name),
+                            "value": "recovery"
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let resp = client.patch_config(serde_json::Value::Array(ops)).await?;
+    if resp.ok {
+        println!("Recovery key added to config.");
+
+        // Check if it was added to any tasks
+        if let Some(new_config) = &resp.config {
+            if let Some(tasks) = new_config.get("task").and_then(|v| v.as_object()) {
+                for (name, task) in tasks {
+                    if let Some(keys) = task.get("keys").and_then(|k| k.as_array()) {
+                        if keys.iter().any(|k| k.as_str() == Some("recovery")) {
+                            println!("  + added to task '{}'", name);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        bail!("failed to save recovery key: {}", resp.message);
+    }
+
+    Ok(())
+}
