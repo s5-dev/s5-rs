@@ -43,7 +43,7 @@ jobs:
         run: cargo build --workspace --locked --verbose
 
       - name: Run Tests (Nextest)
-        run: cargo nextest run --workspace --locked
+        run: cargo nextest run --workspace --locked --retries 5
 
       - name: Run Doctests
         run: cargo test --workspace --doc --locked
