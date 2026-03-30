@@ -108,7 +108,6 @@ pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> 
                 "value": {
                     "paths": abs_paths,
                     "exclude": [],
-                    "ignore": false,
                 }
             }
         ])
