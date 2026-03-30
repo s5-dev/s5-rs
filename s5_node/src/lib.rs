@@ -389,8 +389,11 @@ pub async fn run_node(
     // Create the task executor with pre-built stores.
     // Derive node secret from the endpoint's secret key for vault encryption.
     let node_secret = blake3::derive_key("s5/node/secret", endpoint.secret_key().to_bytes().as_ref());
+    // Wrap config in Arc<RwLock> once — shared between the RPC server and the
+    // task executor so that `patch_config` updates are visible to tasks.
+    let config = Arc::new(RwLock::new(config));
     let executor_ctx = Arc::new(tasks::TaskExecutorContext {
-        config: Arc::new(config.clone()),
+        config: config.clone(),
         stores: stores.clone(),
         node_secret,
         registry: registry.clone(),
@@ -400,7 +403,6 @@ pub async fn run_node(
     // Create shutdown channel and S5NodeServer RPC.
     let endpoint_id = endpoint.id().to_string();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let config = Arc::new(RwLock::new(config));
     let server = s5_server::S5NodeServer::new(
         config.clone(),
         config_file_path.clone(),
