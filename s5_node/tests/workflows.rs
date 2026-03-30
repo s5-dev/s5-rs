@@ -6,7 +6,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, RemoteBlobStore};
 use s5_core::blob::{BlobsRead, BlobsWrite};
-use s5_core::{BlobStore, MessageType, RegistryApi, StreamMessage};
+use s5_core::{MessageType, RegistryApi, StreamMessage, blob::BlobStore};
 use s5_fs::{DirActorContext, FS5, FileRef};
 use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
@@ -73,6 +73,7 @@ async fn workflow_dead_drop() -> Result<()> {
     let wildcard_acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert("*".to_string(), wildcard_acl);
 
@@ -114,6 +115,7 @@ async fn workflow_time_travel() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert(client_endpoint.id().to_string(), acl);
 
@@ -198,6 +200,7 @@ async fn workflow_build_cache() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert(ci_endpoint.id().to_string(), acl.clone());
     peer_cfg.insert(dev_endpoint.id().to_string(), acl.clone());
@@ -242,6 +245,7 @@ async fn workflow_mutual_backup() -> Result<()> {
     let bob_acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     alice_peer_cfg.insert(bob_endpoint.id().to_string(), bob_acl);
 
@@ -249,6 +253,7 @@ async fn workflow_mutual_backup() -> Result<()> {
     let alice_acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     bob_peer_cfg.insert(alice_endpoint.id().to_string(), alice_acl);
 
@@ -286,6 +291,7 @@ async fn workflow_shared_folder() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     // Allow wildcard for simplicity in this test, or we'd need to know client IDs
     peer_cfg.insert("*".to_string(), acl);
@@ -389,6 +395,7 @@ async fn workflow_tiered_storage() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert("*".to_string(), acl); // Allow all for simplicity
 
@@ -608,6 +615,7 @@ async fn workflow_local_links_serve() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["default".to_string(), "links".to_string()],
         store_uploads_in: Some("default".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert("*".to_string(), acl);
 

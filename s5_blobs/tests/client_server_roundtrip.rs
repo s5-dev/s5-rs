@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
 use s5_blobs::{ALPN, BlobsServer, Client, PeerConfigBlobs};
-use s5_core::{BlobStore, BlobsRead, BlobsWrite};
+use s5_core::{BlobsRead, BlobsWrite, blob::BlobStore};
 use s5_store_memory::MemoryStore;
 
 /// Minimal in-process client/server round-trip over iroh.

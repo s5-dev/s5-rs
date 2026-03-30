@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use fs4::fs_std::FileExt;
 #[cfg(not(target_arch = "wasm32"))]
 use s5_core::RegistryPinner;
-use s5_core::{BlobStore, Pins, RegistryApi, StreamKey};
+use s5_core::{Pins, RegistryApi, StreamKey, blob::BlobStore};
 #[cfg(not(target_arch = "wasm32"))]
 use s5_registry_redb::RedbRegistry;
 #[cfg(not(target_arch = "wasm32"))]

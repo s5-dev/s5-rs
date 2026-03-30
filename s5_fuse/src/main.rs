@@ -1,5 +1,5 @@
 use clap::{Arg, ArgAction, Command};
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::{DirContext, FS5};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::path::PathBuf;

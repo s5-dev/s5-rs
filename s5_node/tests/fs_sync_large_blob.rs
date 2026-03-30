@@ -43,6 +43,7 @@ async fn fs_sync_large_blob() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["meta".to_string()],
         store_uploads_in: Some("meta".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert(laptop_endpoint.id().to_string(), acl.clone());
     peer_cfg.insert(desktop_endpoint.id().to_string(), acl);

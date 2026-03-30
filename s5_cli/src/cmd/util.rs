@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_node::config::S5NodeConfig;
 
 /// Opens a blob store by name from the node config using the same
@@ -21,6 +21,6 @@ pub async fn open_store(config: &S5NodeConfig, name: &str) -> Result<BlobStore> 
 
 /// Computes the registry path exactly as the node would, so CLI tools
 /// see the same pins as the running node.
-pub fn registry_path(node_config_file: &Path, config: &S5NodeConfig) -> PathBuf {
-    s5_node::config::registry_path(node_config_file, config)
+pub fn registry_path(_node_config_file: &Path, config: &S5NodeConfig) -> PathBuf {
+    s5_node::config::default_registry_path(config)
 }

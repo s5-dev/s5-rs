@@ -14,7 +14,8 @@
 use age::secrecy::ExposeSecret;
 
 // Re-export the recovery signing key derivation from s5_node.
-pub use s5_node::tasks::publish::recovery_signing_key;
+#[cfg(test)]
+use s5_node::tasks::publish::recovery_signing_key;
 
 /// Generate a new age X25519 keypair for recovery.
 ///

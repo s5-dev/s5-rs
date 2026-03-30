@@ -152,7 +152,7 @@ mod tests {
 
         let bytes = postcard::to_allocvec(&response).expect("serialize empty");
         let decoded: QueryResponse = postcard::from_bytes(&bytes).expect("deserialize empty");
-        assert_eq!(decoded.exists, false);
+        assert!(!decoded.exists);
         assert_eq!(decoded.size, None);
         assert_eq!(decoded.locations.len(), 0);
         assert_eq!(decoded.actual_hash, None);
@@ -167,7 +167,7 @@ mod tests {
 
         let bytes2 = postcard::to_allocvec(&response2).expect("serialize with data");
         let decoded2: QueryResponse = postcard::from_bytes(&bytes2).expect("deserialize with data");
-        assert_eq!(decoded2.exists, true);
+        assert!(decoded2.exists);
         assert_eq!(decoded2.size, Some(1024));
         assert_eq!(decoded2.locations.len(), 1);
         assert_eq!(decoded2.actual_hash, Some([0x42; 32]));
@@ -185,6 +185,6 @@ mod tests {
         let bytes = postcard::to_allocvec(&query).expect("serialize query");
         let decoded: Query = postcard::from_bytes(&bytes).expect("deserialize query");
         assert_eq!(decoded.hash, [0x42; 32]);
-        assert_eq!(decoded.blinded, false);
+        assert!(!decoded.blinded);
     }
 }

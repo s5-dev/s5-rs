@@ -5,7 +5,7 @@ use fuser::{FileAttr, FileType, MountOption};
 use fuser_async::FilesystemFUSE;
 use fuser_async::{DirEntry, Error, Filesystem};
 use lasso::{Key, Spur, ThreadedRodeo};
-use s5_core::{BlobStore, Hash};
+use s5_core::{Hash, blob::BlobStore};
 use s5_fs::FS5;
 use s5_fs::dir::{DirRef, FileRef};
 use std::collections::{BTreeMap, BTreeSet};

@@ -206,6 +206,7 @@ pub fn load_node(
 ///
 /// Convenience wrapper: loads + extracts (root, plaintext_hash, context).
 /// Returns `None` if the file does not exist.
+#[allow(clippy::type_complexity)]
 pub fn load_vault_root(
     path: &Path,
     node_secret: &[u8; 32],

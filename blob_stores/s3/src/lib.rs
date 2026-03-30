@@ -18,6 +18,24 @@ pub struct S3StoreConfig {
     secret_key: String,
 }
 
+impl S3StoreConfig {
+    pub fn new(
+        endpoint: String,
+        bucket_name: String,
+        access_key: String,
+        secret_key: String,
+        region: String,
+    ) -> Self {
+        Self {
+            endpoint,
+            bucket_name,
+            access_key,
+            secret_key,
+            region,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Store {
     bucket: Box<Bucket>,

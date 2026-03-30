@@ -2,8 +2,8 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use ed25519_dalek::SigningKey as DalekSigningKey;
-use s5_blobs::Client as BlobsClient;
-use s5_core::{RegistryApi, StreamKey};
+use s5_blobs::{Client as BlobsClient, RemoteBlobStore};
+use s5_core::{RegistryApi, StreamKey, blob::BlobStore};
 use s5_fs::{DirActorContext, FS5, SigningKey as FsSigningKey};
 
 use crate::{RemoteRegistry, S5Node};
@@ -59,8 +59,8 @@ pub fn open_encrypted_fs(
     blob_client: BlobsClient,
     registry: RemoteRegistry,
 ) -> FS5 {
-    // Client implements BlobsReadWrite directly via the server feature
-    let blob_store: Arc<dyn s5_core::BlobsReadWrite> = Arc::new(blob_client);
+    // Client implements Store via RemoteBlobStore; wrap in BlobStore for FS5
+    let blob_store = BlobStore::new(RemoteBlobStore::new(blob_client));
     let registry_arc: Arc<dyn RegistryApi + Send + Sync> = Arc::new(registry);
 
     let context = DirActorContext::new_encrypted_registry(
@@ -84,7 +84,7 @@ pub fn open_encrypted_fs(
 pub async fn push_snapshot(plaintext: &FS5, encrypted: &FS5) -> Result<()> {
     let snapshot = plaintext.export_snapshot().await?;
     encrypted.merge_from_snapshot(snapshot).await?;
-    encrypted.sync().await?;
+    encrypted.save().await?;
     Ok(())
 }
 
@@ -96,7 +96,7 @@ pub async fn push_snapshot(plaintext: &FS5, encrypted: &FS5) -> Result<()> {
 pub async fn pull_snapshot(encrypted: &FS5, plaintext: &FS5) -> Result<()> {
     let snapshot = encrypted.export_snapshot().await?;
     plaintext.merge_from_snapshot(snapshot).await?;
-    plaintext.sync().await?;
+    plaintext.save().await?;
     Ok(())
 }
 

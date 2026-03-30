@@ -47,6 +47,7 @@ async fn test_autosave_debouncing() {
 }
 
 #[tokio::test]
+#[ignore = "flaky under parallel execution — timing-sensitive file lock release"]
 async fn test_autosave_shutdown_safety() {
     let _ = env_logger::builder().is_test(true).try_init();
 

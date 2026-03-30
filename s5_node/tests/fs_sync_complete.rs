@@ -32,7 +32,6 @@
 //! To run this test: `cargo test -p s5_node --test fs_sync_complete`
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -70,6 +69,7 @@ async fn fs_sync_complete() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["meta".to_string()],
         store_uploads_in: Some("meta".to_string()),
+        ..Default::default()
     };
     // Use the EndpointId display string for ACL keys, matching the
     // production server behaviour and config expectations.

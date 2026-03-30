@@ -19,35 +19,23 @@ pub async fn run_snapshots(
 ) -> Result<()> {
     let config_dir = node_config_file.parent();
     match cmd {
-        SnapshotsCmd::Head { sync } => {
-            let sync_cfg = config
-                .sync
-                .get(&sync)
-                .with_context(|| format!("sync.{sync} not found in node config"))?;
-            let first = sync_cfg
-                .via_untrusted
-                .first()
-                .with_context(|| format!("sync.{sync} has empty via_untrusted list"))?;
-            let _peer_cfg = config
-                .peer
-                .get(first)
-                .with_context(|| format!("via_untrusted peer '{first}' not found"))?;
-            let endpoint = build_endpoint(&config.identity, config_dir).await?;
-            let peer_addr = peer_endpoint_addr(config, first)?;
-            let keys = derive_sync_keys(&sync_cfg.shared_secret);
+        SnapshotsCmd::Head {
+            peer,
+            shared_secret,
+        } => {
+            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
+            let peer_addr = peer_endpoint_addr(config, &peer)?;
+            let keys = derive_sync_keys(shared_secret.as_bytes());
             let stream_key = keys.stream_key();
             let registry = RemoteRegistry::connect(endpoint, peer_addr);
             if let Some(msg) = registry.get(&stream_key).await? {
-                println!(
-                    "sync.{sync} head: hash={} revision={}",
-                    msg.hash, msg.revision
-                );
+                println!("head: hash={} revision={}", msg.hash, msg.revision);
             } else {
-                println!("sync.{sync} has no remote snapshot yet");
+                println!("no remote snapshot yet");
             }
         }
         SnapshotsCmd::Download { peer, hash, out } => {
-            let endpoint = build_endpoint(&config.identity, config_dir).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;
@@ -65,7 +53,7 @@ pub async fn run_snapshots(
             );
         }
         SnapshotsCmd::Restore { root, peer, hash } => {
-            let endpoint = build_endpoint(&config.identity, config_dir).await?;
+            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
             let peer_addr = peer_endpoint_addr(config, &peer)?;
             let client = BlobsClient::connect(endpoint, peer_addr);
             let hash = parse_hash_hex(&hash)?;

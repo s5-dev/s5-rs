@@ -244,6 +244,7 @@ async fn ask_store_type(default_local_path: &std::path::Path) -> Result<StoreCho
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_config(
     store_path: &Path,
     registry_path: &Path,

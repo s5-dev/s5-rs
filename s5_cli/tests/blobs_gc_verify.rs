@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use s5_core::RegistryPinner;
-use s5_core::{BlobStore, PinContext, Pins};
+use s5_core::{PinContext, Pins, blob::BlobStore};
 use s5_registry_redb::RedbRegistry;
 use s5_store_local::{LocalStore, LocalStoreConfig};
 use std::fs;
@@ -31,19 +31,27 @@ async fn blobs_gc_and_verify_local_comprehensive() -> anyhow::Result<()> {
     let store_path = data_root.join("stores").join("default_store");
     fs::create_dir_all(&store_path)?;
 
+    let registry_path = data_root.join("registry");
+    fs::create_dir_all(&registry_path)?;
+
     let config_contents = format!(
         r#"[identity]
 secret_key_file = ""
 
 [store.default]
 type = "local"
-base_path = "{}"
+base_path = "{store}"
+
+[registry.default]
+type = "redb"
+path = "{registry}"
 
 [peer]
 
 [sync]
 "#,
-        store_path.to_string_lossy(),
+        store = store_path.to_string_lossy(),
+        registry = registry_path.to_string_lossy(),
     );
     fs::write(&node_config, config_contents)?;
 

@@ -30,39 +30,38 @@ pub async fn run_status(client: &S5NodeClient) -> Result<()> {
     // Also show configured sources from config
     let config_resp = client.get_config().await?;
     let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
-    if let Some(sources) = config.get("source") {
-        if let Some(obj) = sources.as_object() {
-            if !obj.is_empty() {
-                println!("\nSources:");
-                for (name, source) in obj {
-                    if let Some(paths) = source.get("paths").and_then(|p| p.as_array()) {
-                        let path_strs: Vec<&str> =
-                            paths.iter().filter_map(|p| p.as_str()).collect();
-                        println!("  {}: {}", name, path_strs.join(", "));
-                    }
-                }
+    if let Some(obj) = config
+        .get("source")
+        .and_then(|s| s.as_object())
+        .filter(|o| !o.is_empty())
+    {
+        println!("\nSources:");
+        for (name, source) in obj {
+            if let Some(paths) = source.get("paths").and_then(|p| p.as_array()) {
+                let path_strs: Vec<&str> = paths.iter().filter_map(|p| p.as_str()).collect();
+                println!("  {}: {}", name, path_strs.join(", "));
             }
         }
     }
 
-    if let Some(vaults) = config.get("vault") {
-        if let Some(obj) = vaults.as_object() {
-            if !obj.is_empty() {
-                println!("\nVaults:");
-                for (name, vault) in obj {
-                    let stores = vault
-                        .get("blob_stores")
-                        .and_then(|s| s.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_default();
-                    println!("  {}: stores=[{}]", name, stores);
-                }
-            }
+    if let Some(obj) = config
+        .get("vault")
+        .and_then(|v| v.as_object())
+        .filter(|o| !o.is_empty())
+    {
+        println!("\nVaults:");
+        for (name, vault) in obj {
+            let stores = vault
+                .get("blob_stores")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!("  {}: stores=[{}]", name, stores);
         }
     }
 
@@ -147,8 +146,8 @@ pub async fn run_snapshots(client: &S5NodeClient, vault: Option<String>) -> Resu
     }
 
     println!(
-        "{:<12} {:<16} {:<10} {:<12} {}",
-        "VAULT", "HASH", "FILES", "SIZE", "DATE"
+        "{:<12} {:<16} {:<10} {:<12} DATE",
+        "VAULT", "HASH", "FILES", "SIZE"
     );
     for snap in &resp.snapshots {
         let hash_short = if snap.hash.len() > 12 {
@@ -188,11 +187,9 @@ pub async fn run_config(
         let resp = client.patch_config(patch_val).await?;
         if resp.ok {
             println!("Config updated.");
-            if json {
-                if let Some(ref config_json) = resp.config_json {
-                    let config: serde_json::Value = serde_json::from_str(config_json)?;
-                    println!("{}", serde_json::to_string_pretty(&config)?);
-                }
+            if let (true, Some(config_json)) = (json, &resp.config_json) {
+                let config: serde_json::Value = serde_json::from_str(config_json)?;
+                println!("{}", serde_json::to_string_pretty(&config)?);
             }
         } else {
             bail!("patch failed: {}", resp.message);
@@ -208,11 +205,9 @@ pub async fn run_config(
         let resp = client.patch_config(patch_val).await?;
         if resp.ok {
             println!("Config updated from {}.", path.display());
-            if json {
-                if let Some(ref config_json) = resp.config_json {
-                    let config: serde_json::Value = serde_json::from_str(config_json)?;
-                    println!("{}", serde_json::to_string_pretty(&config)?);
-                }
+            if let (true, Some(config_json)) = (json, &resp.config_json) {
+                let config: serde_json::Value = serde_json::from_str(config_json)?;
+                println!("{}", serde_json::to_string_pretty(&config)?);
             }
         } else {
             bail!("patch failed: {}", resp.message);
@@ -316,26 +311,30 @@ fn print_config_summary(config: &serde_json::Value) {
     }
 
     // Sources
-    if let Some(sources) = config.get("source").and_then(|v| v.as_object()) {
-        if !sources.is_empty() {
-            for (name, source) in sources {
-                let count = source
-                    .get("paths")
-                    .and_then(|p| p.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                println!("  Source:  {} ({} paths)", name, count);
-            }
+    if let Some(sources) = config
+        .get("source")
+        .and_then(|v| v.as_object())
+        .filter(|o| !o.is_empty())
+    {
+        for (name, source) in sources {
+            let count = source
+                .get("paths")
+                .and_then(|p| p.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            println!("  Source:  {} ({} paths)", name, count);
         }
     }
 
     // Vaults
-    if let Some(vaults) = config.get("vault").and_then(|v| v.as_object()) {
-        if !vaults.is_empty() {
-            for (name, vault) in vaults {
-                let key = vault.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("  Vault:   {} (key={})", name, key);
-            }
+    if let Some(vaults) = config
+        .get("vault")
+        .and_then(|v| v.as_object())
+        .filter(|o| !o.is_empty())
+    {
+        for (name, vault) in vaults {
+            let key = vault.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("  Vault:   {} (key={})", name, key);
         }
     }
 }
@@ -369,7 +368,7 @@ async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) 
     println!("│  WRITE DOWN THIS KEY — it is your only way to recover your data         │");
     println!("│  if you lose this device.                                               │");
     println!("│                                                                         │");
-    println!("│  {}  │", format!("{:<69}", &secret_key));
+    println!("│  {:<69}  │", &secret_key);
     println!("│                                                                         │");
     println!("│  Store this key OFFLINE in a safe place.                                │");
     println!("│  Anyone with this key can decrypt your backups.                         │");
@@ -403,16 +402,16 @@ async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) 
     if let Some(tasks) = config.get("task").and_then(|v| v.as_object()) {
         for (name, task) in tasks {
             let task_type = task.get("type").and_then(|v| v.as_str());
-            if matches!(task_type, Some("backup") | Some("publish")) {
-                if let Some(keys) = task.get("keys").and_then(|k| k.as_array()) {
-                    let already_has = keys.iter().any(|k| k.as_str() == Some("recovery"));
-                    if !already_has {
-                        ops.push(serde_json::json!({
-                            "op": "add",
-                            "path": format!("/task/{}/keys/-", name),
-                            "value": "recovery"
-                        }));
-                    }
+            if matches!(task_type, Some("backup") | Some("publish"))
+                && let Some(keys) = task.get("keys").and_then(|k| k.as_array())
+            {
+                let already_has = keys.iter().any(|k| k.as_str() == Some("recovery"));
+                if !already_has {
+                    ops.push(serde_json::json!({
+                        "op": "add",
+                        "path": format!("/task/{}/keys/-", name),
+                        "value": "recovery"
+                    }));
                 }
             }
         }
@@ -427,10 +426,10 @@ async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) 
             let new_config: serde_json::Value = serde_json::from_str(new_config_json)?;
             if let Some(tasks) = new_config.get("task").and_then(|v| v.as_object()) {
                 for (name, task) in tasks {
-                    if let Some(keys) = task.get("keys").and_then(|k| k.as_array()) {
-                        if keys.iter().any(|k| k.as_str() == Some("recovery")) {
-                            println!("  + added to task '{}'", name);
-                        }
+                    if let Some(keys) = task.get("keys").and_then(|k| k.as_array())
+                        && keys.iter().any(|k| k.as_str() == Some("recovery"))
+                    {
+                        println!("  + added to task '{}'", name);
                     }
                 }
             }

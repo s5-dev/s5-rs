@@ -421,21 +421,22 @@ async fn handle_download(
     // Pin check: only required for blobs from regular stores.
     // Read sources are explicitly published data — any peer configured
     // to read them should be able to download without pinning.
-    if !from_read_source && !cfg.skip_pin_check {
-        if let Some(pinner) = &server.pinner {
-            let is_pinned = pinner
-                .is_pinned(hash, PinContext::NodeId(node_id_bytes))
-                .await
-                .unwrap_or(false);
+    if !from_read_source
+        && !cfg.skip_pin_check
+        && let Some(pinner) = &server.pinner
+    {
+        let is_pinned = pinner
+            .is_pinned(hash, PinContext::NodeId(node_id_bytes))
+            .await
+            .unwrap_or(false);
 
-            if !is_pinned {
-                tracing::info!(
-                    peer = node_key,
-                    hash = hash_short,
-                    "download denied: not pinned"
-                );
-                return; // Not pinned by this user, deny download
-            }
+        if !is_pinned {
+            tracing::info!(
+                peer = node_key,
+                hash = hash_short,
+                "download denied: not pinned"
+            );
+            return; // Not pinned by this user, deny download
         }
     }
 

@@ -21,7 +21,7 @@
 //! ```
 
 use bytes::Bytes;
-use s5_core::{BlobStore, Hash};
+use s5_core::{Hash, blob::BlobStore};
 use std::sync::Arc;
 
 use crate::Client;

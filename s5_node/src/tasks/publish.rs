@@ -522,21 +522,20 @@ pub async fn run_publish(
     );
 
     // -- Ensure one-time recovery entry exists --
-    if !identity_files.is_empty() {
-        if let Err(e) = ensure_recovery_entry(
+    if !identity_files.is_empty()
+        && let Err(e) = ensure_recovery_entry(
             registry.as_ref(),
             &identity_files,
             vault_name,
             &verifying_key,
         )
         .await
-        {
-            tracing::warn!(
-                vault = vault_name,
-                error = %e,
-                "could not ensure recovery registry entry — publish still succeeded"
-            );
-        }
+    {
+        tracing::warn!(
+            vault = vault_name,
+            error = %e,
+            "could not ensure recovery registry entry — publish still succeeded"
+        );
     }
 
     Ok(())

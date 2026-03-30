@@ -292,32 +292,29 @@ impl S5NodeServer {
             };
 
             // Try to read the published TN from registry (has full history).
-            if let Some(registry) = ctx.registry.as_ref() {
-                if let Ok(published) = self
+            if let Some(registry) = ctx.registry.as_ref()
+                && let Ok(published) = self
                     .list_published_snapshots(ctx, &config, vault_name, vault, registry.as_ref())
                     .await
-                {
-                    snapshots.extend(published);
-                    continue;
-                }
+            {
+                snapshots.extend(published);
+                continue;
             }
 
             // Fallback: read local vault root (current snapshot only).
             let root_path = crate::tasks::vault_persist::vault_root_path(&vault.root_path);
             if let Ok(Some(node)) =
                 crate::tasks::vault_persist::load_node(&root_path, &ctx.node_secret, vault_name)
+                && let Some(entry) = node.transparent_entry()
+                && let Some(ref content) = entry.content
             {
-                if let Some(entry) = node.transparent_entry() {
-                    if let Some(ref content) = entry.content {
-                        snapshots.push(SnapshotInfo {
-                            vault: vault_name.clone(),
-                            hash: hex::encode(content.hash),
-                            timestamp: String::from("current"),
-                            file_count: None,
-                            total_bytes: None,
-                        });
-                    }
-                }
+                snapshots.push(SnapshotInfo {
+                    vault: vault_name.clone(),
+                    hash: hex::encode(content.hash),
+                    timestamp: String::from("current"),
+                    file_count: None,
+                    total_bytes: None,
+                });
             }
         }
 
@@ -343,10 +340,10 @@ impl S5NodeServer {
 
         // Resolve identity files from vault's key config
         let mut identity_files = Vec::new();
-        if let Some(key_config) = config.key.get(&vault.key) {
-            if let Some(ref id_file) = key_config.identity_file {
-                identity_files.push(id_file.clone());
-            }
+        if let Some(key_config) = config.key.get(&vault.key)
+            && let Some(ref id_file) = key_config.identity_file
+        {
+            identity_files.push(id_file.clone());
         }
 
         if identity_files.is_empty() {

@@ -100,12 +100,12 @@ impl S5NodeConfig {
         let mut errors = Vec::new();
 
         // Check identity encrypted_with
-        if let Some(key_name) = &self.identity.encrypted_with {
-            if !self.key.contains_key(key_name) {
-                errors.push(format!(
-                    "identity.encrypted_with: key \"{key_name}\" not found in [key.*]"
-                ));
-            }
+        if let Some(key_name) = &self.identity.encrypted_with
+            && !self.key.contains_key(key_name)
+        {
+            errors.push(format!(
+                "identity.encrypted_with: key \"{key_name}\" not found in [key.*]"
+            ));
         }
 
         // Check vault references
@@ -219,12 +219,12 @@ impl S5NodeConfig {
                             "task.{task_name}: vault \"{vault}\" not found in [vault.*]"
                         ));
                     }
-                    if let Some(store_name) = blob_store {
-                        if !self.store.contains_key(store_name) {
-                            errors.push(format!(
-                                "task.{task_name}: blob_store \"{store_name}\" not found in [store.*]"
-                            ));
-                        }
+                    if let Some(store_name) = blob_store
+                        && !self.store.contains_key(store_name)
+                    {
+                        errors.push(format!(
+                            "task.{task_name}: blob_store \"{store_name}\" not found in [store.*]"
+                        ));
                     }
                 }
                 TaskSpec::RemoteRestore { blob_store, .. } => {

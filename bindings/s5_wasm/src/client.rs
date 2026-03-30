@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
 use s5_blobs::RemoteBlobStore;
 use s5_client::DerivedKeys;
 use s5_core::{Hash, StreamKey, blob::BlobStore, blob::location::BlobLocation};
@@ -230,8 +230,7 @@ impl S5Client {
 
         // Create remote blob store (for content blobs)
         let remote_blob_store = RemoteBlobStore::new(blobs_client.clone());
-        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> =
-            Arc::new(BlobStore::new(remote_blob_store.clone()));
+        let content_blob_store = BlobStore::new(remote_blob_store.clone());
 
         // Create remote registry
         let remote_registry = RemoteRegistry::connect(endpoint.clone(), remote_addr);

@@ -1,4 +1,4 @@
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::{DirContext, FS5, FileRef};
 use s5_store_memory::MemoryStore;
 use tempfile::tempdir;

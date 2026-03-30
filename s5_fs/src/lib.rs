@@ -24,6 +24,9 @@ pub use api::{CursorKind, FS5};
 pub use context::{DirContext, DirContextParentLink, SigningKey};
 pub use dir::FileRef;
 
+/// Backwards-compatible alias after the `DirContext` rename.
+pub type DirActorContext = DirContext;
+
 /// Number of entries sharing a path prefix
 /// required before FS5 auto-promotes that prefix
 /// into a dedicated subdirectory.

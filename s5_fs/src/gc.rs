@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::FSResult;
 use crate::dir::{DirRef, DirV1, FileRef, decrypt_dir_bytes};
-use s5_core::{BlobStore, Hash, Pins};
+use s5_core::{Hash, Pins, blob::BlobStore};
 use s5_store_local::{LocalStore, LocalStoreConfig};
 
 /// Traverse a `DirV1` tree and collect all content hashes referenced by

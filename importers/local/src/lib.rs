@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use ignore::{DirEntry, WalkBuilder};
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::{FS5, FileRef};
 use std::io::Read;
 use std::sync::Arc;
