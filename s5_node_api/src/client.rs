@@ -131,12 +131,12 @@ impl Drop for S5NodeClient {
     fn drop(&mut self) {
         // Best-effort: if the runtime is still alive, spawn a close task.
         // For a clean shutdown, call `client.close().await` before dropping.
-        if let Some(endpoint) = self.endpoint.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    endpoint.close().await;
-                });
-            }
+        if let Some(endpoint) = self.endpoint.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                endpoint.close().await;
+            });
         }
     }
 }

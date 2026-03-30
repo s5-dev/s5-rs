@@ -108,7 +108,7 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StoreFeatures {
     pub supports_rename: bool,
     pub case_sensitive: bool,
@@ -117,15 +117,4 @@ pub struct StoreFeatures {
     /// When true, `BlobStore::import_file` will try `Store::reflink_file_to`
     /// before falling back to the TeeStream path.
     pub supports_reflink: bool,
-}
-
-impl Default for StoreFeatures {
-    fn default() -> Self {
-        Self {
-            supports_rename: false,
-            case_sensitive: false,
-            recommended_max_dir_size: 0,
-            supports_reflink: false,
-        }
-    }
 }

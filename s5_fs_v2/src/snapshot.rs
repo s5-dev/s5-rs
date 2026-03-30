@@ -439,25 +439,25 @@ impl Snapshot {
 
             match node.header.kind {
                 NodeKind::Transparent => {
-                    if let Some(entry) = node.transparent_entry() {
-                        if entry.is_link() {
-                            let content = entry.content.as_ref().expect("is_link implies content");
-                            let child = self.child(entry);
-                            let mut s = std::pin::pin!(child.walk_inner(
-                                content.hash(),
-                                content.plaintext_hash,
-                                prefix,
-                            ));
-                            while let Some(item) = s.next().await {
-                                yield item?;
-                            }
+                    if let Some(entry) = node.transparent_entry()
+                        && entry.is_link()
+                    {
+                        let content = entry.content.as_ref().expect("is_link implies content");
+                        let child = self.child(entry);
+                        let mut s = std::pin::pin!(child.walk_inner(
+                            content.hash(),
+                            content.plaintext_hash,
+                            prefix,
+                        ));
+                        while let Some(item) = s.next().await {
+                            yield item?;
                         }
                     }
                 }
                 NodeKind::Namespace => {
                     if node.header.level > 0 {
                         // Internal prolly tree node — descend to children.
-                        for (_key, entry) in &node.entries {
+                        for entry in node.entries.values() {
                             if entry.is_link() {
                                 let content = entry.content.as_ref().expect("is_link implies content");
                                 let mut s = std::pin::pin!(self.walk_inner(
@@ -560,10 +560,10 @@ impl Snapshot {
 
         for (i, child_key) in child_keys.iter().enumerate() {
             let next_key = child_keys.get(i + 1).map(|k| k.as_str());
-            if let Some(next) = next_key {
-                if !range_start_before(start, next) {
-                    continue;
-                }
+            if let Some(next) = next_key
+                && !range_start_before(start, next)
+            {
+                continue;
             }
             if !range_end_after(end, child_key) {
                 break;

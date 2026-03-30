@@ -216,17 +216,14 @@ impl Snapshot {
     /// Returns the chunk boundary mask from the root node's BuildContext,
     /// or the default if no BuildContext is set.
     async fn chunk_mask(&self) -> u32 {
-        if !self.is_empty() {
-            if let Ok(root) = self.load_root().await {
-                if let Some(build) = &root.header.build {
-                    if let Some(crate::node::MetaChunkingStrategy::ProllyBlake3 {
-                        expected_entries_per_node,
-                    }) = &build.meta_chunking
-                    {
-                        return expected_entries_per_node.wrapping_sub(1);
-                    }
-                }
-            }
+        if !self.is_empty()
+            && let Ok(root) = self.load_root().await
+            && let Some(build) = &root.header.build
+            && let Some(crate::node::MetaChunkingStrategy::ProllyBlake3 {
+                expected_entries_per_node,
+            }) = &build.meta_chunking
+        {
+            return expected_entries_per_node.wrapping_sub(1);
         }
         DEFAULT_ENTRIES_PER_NODE - 1
     }

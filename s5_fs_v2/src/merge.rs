@@ -100,6 +100,7 @@ fn k_way_merge<'a>(
 /// Internal state for k-way merge.
 struct KMergeState<'a> {
     /// (stream, buffered next item) per layer. Index = priority.
+    #[allow(clippy::type_complexity)]
     heads: Vec<(
         BoxStream<'a, anyhow::Result<(String, NodeEntry)>>,
         Option<(String, NodeEntry)>,
@@ -120,10 +121,10 @@ impl<'a> KMergeState<'a> {
     async fn next(&mut self) -> anyhow::Result<Option<(String, NodeEntry)>> {
         // Fill all empty buffers.
         for (stream, buf) in self.heads.iter_mut() {
-            if !self.initialized || buf.is_none() {
-                if let Some(result) = stream.next().await {
-                    *buf = Some(result?);
-                }
+            if (!self.initialized || buf.is_none())
+                && let Some(result) = stream.next().await
+            {
+                *buf = Some(result?);
             }
         }
         self.initialized = true;
@@ -162,12 +163,11 @@ impl<'a> KMergeState<'a> {
 
         // Skip duplicate keys from lower-priority streams.
         for (i, (_, buf)) in self.heads.iter_mut().enumerate() {
-            if i != best_idx {
-                if let Some((key, _)) = buf {
-                    if *key == winner.0 {
-                        *buf = None; // Discard lower-priority duplicate.
-                    }
-                }
+            if i != best_idx
+                && let Some((key, _)) = buf
+                && *key == winner.0
+            {
+                *buf = None; // Discard lower-priority duplicate.
             }
         }
 

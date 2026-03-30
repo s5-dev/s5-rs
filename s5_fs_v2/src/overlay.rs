@@ -179,20 +179,20 @@ fn merge_two<'a>(
         },
         |mut state| async move {
             // Fill buffers.
-            if state.buf_p.is_none() {
-                if let Some(result) = state.primary.next().await {
-                    match result {
-                        Ok(item) => state.buf_p = Some(item),
-                        Err(e) => return Some((Err(e), state)),
-                    }
+            if state.buf_p.is_none()
+                && let Some(result) = state.primary.next().await
+            {
+                match result {
+                    Ok(item) => state.buf_p = Some(item),
+                    Err(e) => return Some((Err(e), state)),
                 }
             }
-            if state.buf_s.is_none() {
-                if let Some(result) = state.secondary.next().await {
-                    match result {
-                        Ok(item) => state.buf_s = Some(item),
-                        Err(e) => return Some((Err(e), state)),
-                    }
+            if state.buf_s.is_none()
+                && let Some(result) = state.secondary.next().await
+            {
+                match result {
+                    Ok(item) => state.buf_s = Some(item),
+                    Err(e) => return Some((Err(e), state)),
                 }
             }
 

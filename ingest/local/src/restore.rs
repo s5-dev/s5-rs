@@ -20,6 +20,7 @@ use s5_fs_v2::node::{FileType, NodeEntry};
 use s5_fs_v2::snapshot::Snapshot;
 
 /// Configuration for a restore operation.
+#[derive(Default)]
 pub struct RestoreConfig {
     /// Backup mode: restore full metadata (permissions, ownership, xattrs).
     ///
@@ -27,12 +28,6 @@ pub struct RestoreConfig {
     /// When true, also restores permissions, uid/gid (requires CAP_CHOWN),
     /// and extended attributes.
     pub backup: bool,
-}
-
-impl Default for RestoreConfig {
-    fn default() -> Self {
-        Self { backup: false }
-    }
 }
 
 /// Statistics from a restore operation.
@@ -178,10 +173,10 @@ fn restore_metadata(path: &Path, entry: &NodeEntry, config: &RestoreConfig) {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos);
         let times = std::fs::FileTimes::new().set_modified(mtime);
 
-        if let Ok(file) = std::fs::File::open(path) {
-            if let Err(e) = file.set_times(times) {
-                tracing::debug!(path = %path.display(), "failed to set mtime: {e}");
-            }
+        if let Ok(file) = std::fs::File::open(path)
+            && let Err(e) = file.set_times(times)
+        {
+            tracing::debug!(path = %path.display(), "failed to set mtime: {e}");
         }
     }
 
@@ -208,14 +203,14 @@ fn restore_metadata(path: &Path, entry: &NodeEntry, config: &RestoreConfig) {
     // Extended attributes.
     if let Some(attrs) = &unix.extended_attributes {
         for attr in attrs {
-            if let Some(value) = &attr.value {
-                if let Err(e) = xattr::set(path, &attr.name, value) {
-                    tracing::debug!(
-                        path = %path.display(),
-                        xattr = %attr.name,
-                        "failed to set xattr: {e}"
-                    );
-                }
+            if let Some(value) = &attr.value
+                && let Err(e) = xattr::set(path, &attr.name, value)
+            {
+                tracing::debug!(
+                    path = %path.display(),
+                    xattr = %attr.name,
+                    "failed to set xattr: {e}"
+                );
             }
         }
     }

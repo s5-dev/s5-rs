@@ -175,12 +175,11 @@ pub async fn import_file(
     // Try reflink-based import first if the store supports it.
     // This creates a COW snapshot of the source file, guaranteeing
     // hash-content consistency even if the source is being written to.
-    if store.features().supports_reflink {
-        if let Some(blob_id) =
+    if store.features().supports_reflink
+        && let Some(blob_id) =
             try_import_file_reflink(store, outboard_store, &path, &on_progress).await?
-        {
-            return Ok(blob_id);
-        }
+    {
+        return Ok(blob_id);
         // Reflink failed (e.g. cross-device) — fall through to TeeStream
     }
 

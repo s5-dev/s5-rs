@@ -283,6 +283,7 @@ impl Store for SiaStore {
             case_sensitive: false,
             recommended_max_dir_size: u64::MAX,
             supports_rename: true,
+            supports_reflink: false,
         }
     }
     async fn exists(&self, path: &str) -> StoreResult<bool> {

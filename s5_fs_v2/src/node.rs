@@ -152,7 +152,7 @@ impl Node {
     }
 
     /// Returns an iterator over entries in the given key range.
-    pub fn range<'a, K, R>(&'a self, range: R) -> impl Iterator<Item = (&'a String, &'a NodeEntry)>
+    pub fn range<K, R>(&self, range: R) -> impl Iterator<Item = (&String, &NodeEntry)>
     where
         K: Ord + ?Sized,
         R: std::ops::RangeBounds<K>,
@@ -706,7 +706,7 @@ pub struct WebArchiveMetadata {
 /// use different compression strategies.
 ///
 /// See `decisions/fs5-context-passing-pipeline`.
-#[derive(Encode, Decode, CborLen, Clone, Debug)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, Default)]
 #[cbor(map)]
 pub struct TraversalContext {
     /// Encryption key map: key ID -> key bytes.
@@ -720,16 +720,6 @@ pub struct TraversalContext {
     /// Pipeline for node blobs (serialized `Node` metadata).
     #[n(2)]
     pub node: Option<BlobPipeline>,
-}
-
-impl Default for TraversalContext {
-    fn default() -> Self {
-        Self {
-            keys: None,
-            leaf: None,
-            node: None,
-        }
-    }
 }
 
 /// Processing pipeline for a single blob type.

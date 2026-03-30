@@ -128,12 +128,11 @@ pub async fn backup(
             if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 return true;
             }
-            if let Some(root_dev) = root_dev {
-                if let Ok(m) = entry.metadata() {
-                    if m.dev() != root_dev {
-                        return false;
-                    }
-                }
+            if let Some(root_dev) = root_dev
+                && let Ok(m) = entry.metadata()
+                && m.dev() != root_dev
+            {
+                return false;
             }
             true
         });
@@ -411,10 +410,10 @@ async fn is_changed(
     // Extended checks when previous snapshot has backup-mode metadata.
     if let Some(unix) = &prev_semantic.unix {
         // Inode check: detect file replacement via rename-into-place.
-        if let Some(prev_inode) = unix.inode {
-            if meta.ino() != prev_inode {
-                return Ok(true);
-            }
+        if let Some(prev_inode) = unix.inode
+            && meta.ino() != prev_inode
+        {
+            return Ok(true);
         }
 
         // Ctime check: detect metadata-only changes (permissions, ownership).

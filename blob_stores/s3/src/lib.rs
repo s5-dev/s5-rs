@@ -69,6 +69,7 @@ impl s5_core::store::Store for S3Store {
             supports_rename: false,
             case_sensitive: true,
             recommended_max_dir_size: u64::MAX,
+            supports_reflink: false,
         }
     }
 

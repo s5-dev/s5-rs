@@ -88,7 +88,7 @@ fn stored_blocks(len: usize, block_size: u32) -> u64 {
     if bs <= 1 {
         return len;
     }
-    (len + bs - 1) / bs
+    len.div_ceil(bs)
 }
 
 // ---------------------------------------------------------------------------
