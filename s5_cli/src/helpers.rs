@@ -1,16 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use s5_core::Hash;
-use s5_node::config::{NodeConfigIdentity, S5NodeConfig};
+use s5_node::config::{NodeConfigIdentity, NodeConfigKey, S5NodeConfig};
 use s5_node::identity;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 pub async fn build_endpoint(
     identity: &NodeConfigIdentity,
     config_dir: Option<&std::path::Path>,
+    keys: &BTreeMap<String, NodeConfigKey>,
 ) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::N0);
-    if let Some(sec) = identity::load_secret_key(identity, config_dir) {
+    if let Some(sec) = identity::load_secret_key(identity, config_dir, keys) {
         builder = builder.secret_key(sec);
     }
     let endpoint = builder.bind().await?;

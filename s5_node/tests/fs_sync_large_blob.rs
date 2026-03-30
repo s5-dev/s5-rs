@@ -19,8 +19,8 @@ use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
 };
-use s5_store_local::LocalStore;
 use s5_registry_redb::RedbRegistry;
+use s5_store_local::LocalStore;
 use tempfile::tempdir;
 
 #[tokio::test]

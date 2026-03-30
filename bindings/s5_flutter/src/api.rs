@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
 use s5_blobs::RemoteBlobStore;
 use s5_client::DerivedKeys;
-use s5_core::{blob::location::BlobLocation, BlobStore, Hash, StreamKey};
-use s5_fs::{CursorKind, DirContext, FileRef, SigningKey, FS5};
+use s5_core::{blob::location::BlobLocation, blob::BlobStore, Hash, StreamKey};
+use s5_fs::{CursorKind, DirActorContext, FileRef, SigningKey, FS5};
 use s5_registry::RemoteRegistry;
 use tokio::sync::RwLock;
 
@@ -201,10 +201,9 @@ impl S5Client {
         let node_id = secret_key.public().to_string();
 
         // Build endpoint
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![s5_blobs::ALPN.to_vec(), s5_registry::ALPN.to_vec()])
-            .relay_mode(RelayMode::Default)
             .bind()
             .await
             .map_err(|e| S5Error::ConnectionError(format!("Failed to bind endpoint: {}", e)))?;
@@ -221,7 +220,7 @@ impl S5Client {
         // Create blob client and stores
         let blobs_client = s5_blobs::Client::connect(endpoint.clone(), remote_addr.clone());
         let remote_blob_store = RemoteBlobStore::new(blobs_client.clone());
-        let content_blob_store = BlobStore::new(remote_blob_store);
+        let content_blob_store: Arc<dyn s5_core::BlobsReadWrite> = Arc::new(BlobStore::new(remote_blob_store));
 
         // Create remote registry
         let remote_registry = RemoteRegistry::connect(endpoint.clone(), remote_addr);
@@ -231,7 +230,7 @@ impl S5Client {
         let stream_key = StreamKey::PublicKeyEd25519(keys.sync_keys.public_key);
         let signing_key = SigningKey::new(keys.sync_keys.signing_key_bytes);
 
-        let ctx = DirContext::new_encrypted_registry(
+        let ctx = DirActorContext::new_encrypted_registry(
             stream_key,
             signing_key,
             keys.sync_keys.encryption_key,
@@ -379,7 +378,7 @@ impl S5Client {
 
         inner
             .fs
-            .save()
+            .flush()
             .await
             .map_err(|e| S5Error::StorageError(format!("Failed to save: {}", e)))?;
 
@@ -437,7 +436,7 @@ impl S5Client {
 
         inner
             .fs
-            .save()
+            .flush()
             .await
             .map_err(|e| S5Error::StorageError(format!("Failed to save: {}", e)))?;
 
@@ -659,7 +658,7 @@ impl S5Client {
 
         inner
             .fs
-            .save()
+            .flush()
             .await
             .map_err(|e| S5Error::StorageError(format!("Failed to save: {}", e)))?;
 
@@ -671,7 +670,7 @@ impl S5Client {
         let mut guard = self.inner.write().await;
         if let Some(inner) = guard.take() {
             // Save pending changes
-            let _ = inner.fs.save().await;
+            let _ = inner.fs.flush().await;
             // Close endpoint
             inner.endpoint.close().await;
         }

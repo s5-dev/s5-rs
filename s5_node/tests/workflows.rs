@@ -7,14 +7,16 @@ use rand::rngs::OsRng;
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, RemoteBlobStore};
 use s5_core::blob::{BlobsRead, BlobsWrite};
 use s5_core::{BlobStore, MessageType, RegistryApi, StreamMessage};
-use s5_fs::{DirContext, FS5, FileRef};
+use s5_fs::{DirActorContext, FS5, FileRef};
 use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, push_snapshot},
 };
-use s5_store_local::LocalStore;
 use s5_registry_redb::RedbRegistry;
+use s5_store_local::LocalStore;
+use s5_store_local_links::LocalLinksStore;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 // --- Helper: Setup a Node with custom ACLs and optional endpoint ---
@@ -146,7 +148,7 @@ async fn workflow_time_travel() -> Result<()> {
             FileRef::new_inline_blob(Bytes::from_static(b"fn main() {}")),
         )
         .await?;
-    client_plain.save().await?;
+    client_plain.flush().await?;
 
     push_snapshot(&client_plain, &client_encrypted).await?;
 
@@ -164,7 +166,7 @@ async fn workflow_time_travel() -> Result<()> {
             FileRef::new_inline_blob(Bytes::from_static(b"fn main() { println!(); }")),
         )
         .await?;
-    client_plain.save().await?;
+    client_plain.flush().await?;
     push_snapshot(&client_plain, &client_encrypted).await?;
 
     // 5. Restore Snapshot 1 to a new directory
@@ -328,13 +330,13 @@ async fn workflow_shared_folder() -> Result<()> {
     let file_ref = FileRef::new_inline_blob(Bytes::from_static(content));
 
     // We need a plaintext wrapper to write easily, or just use internal API if exposed.
-    // open_encrypted_fs returns a DirContext. We need to wrap it in FS5.
+    // open_encrypted_fs returns a DirActorContext. We need to wrap it in FS5.
     // But open_encrypted_fs returns FS5? No, let's check imports.
     // use s5_node::sync::{open_encrypted_fs, ...}
     // It returns FS5.
 
     alice_fs.file_put_sync("shared.txt", file_ref).await?;
-    alice_fs.save().await?;
+    alice_fs.flush().await?;
 
     // Alice pushes snapshot (updates registry on storage node)
     // Note: open_encrypted_fs uses a RegistryKey link, so save() automatically updates the registry!
@@ -449,14 +451,14 @@ async fn workflow_static_site() -> Result<()> {
 
     // 2. Create Site Content
     let site_dir = tempdir()?;
-    let ctx = DirContext::open_local_root(site_dir.path())?;
+    let ctx = DirActorContext::open_local_root(site_dir.path())?;
     let fs = FS5::open(ctx);
 
     let index_html = b"<html>Hello World</html>";
     let index_ref = FileRef::new_inline_blob(Bytes::from_static(index_html));
 
     fs.file_put_sync("index.html", index_ref).await?;
-    fs.save().await?;
+    fs.flush().await?;
 
     // 3. Export Snapshot (Pinning)
     let snapshot = fs.export_snapshot().await?;
@@ -561,6 +563,78 @@ async fn workflow_append_only_log() -> Result<()> {
     let new_head = registry_client.get(&stream_key).await?.expect("new head");
     assert_eq!(new_head.hash, event_id.hash);
     assert_eq!(new_head.revision, 1);
+
+    router.shutdown().await?;
+    Ok(())
+}
+
+// --- Workflow: Serve linked files to remote peers ---
+#[tokio::test]
+async fn workflow_local_links_serve() -> Result<()> {
+    // 1. Create a temp file to link
+    let files_dir = tempdir()?;
+    let file_path = files_dir.path().join("video.mp4");
+    let file_content = b"fake video content for testing";
+    std::fs::write(&file_path, file_content)?;
+
+    // 2. Setup server with both BlobStore and LocalLinksStore
+    let server_endpoint = Endpoint::builder(presets::N0).bind().await?;
+
+    // Create local blob store (for regular blobs)
+    let store_dir = tempdir()?;
+    let local_store = LocalStore::new(store_dir.path());
+    let blob_store = local_store.to_blob_store();
+    let mut stores = HashMap::new();
+    stores.insert("default".to_string(), blob_store.clone());
+
+    // Create local links store
+    let links_dir = tempdir()?;
+    let links_store = Arc::new(LocalLinksStore::open(links_dir.path())?);
+
+    // Link the file (hash it and register)
+    let blob_id = links_store
+        .import_file(file_path.clone(), |_| Ok(()))
+        .await?;
+
+    // Create read sources with the links store
+    let mut read_sources: HashMap<String, Arc<dyn BlobsRead>> = HashMap::new();
+    read_sources.insert(
+        "links".to_string(),
+        links_store.clone() as Arc<dyn BlobsRead>,
+    );
+
+    // Configure ACL to allow reading from both stores
+    let mut peer_cfg = HashMap::new();
+    let acl = PeerConfigBlobs {
+        readable_stores: vec!["default".to_string(), "links".to_string()],
+        store_uploads_in: Some("default".to_string()),
+    };
+    peer_cfg.insert("*".to_string(), acl);
+
+    let blobs_server = BlobsServer::with_read_sources(stores, read_sources, peer_cfg, None);
+
+    let router = iroh::protocol::Router::builder(server_endpoint.clone())
+        .accept(BLOBS_ALPN, blobs_server)
+        .spawn();
+
+    // 3. Setup client and connect to server
+    let client_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let client = s5_blobs::Client::connect(client_endpoint.clone(), server_endpoint.addr());
+
+    // 4. Client queries for the linked file
+    let query_result = client
+        .query(blob_id.hash, std::collections::BTreeSet::new())
+        .await?;
+    assert!(query_result.exists, "linked file should exist on server");
+    assert_eq!(query_result.size, Some(file_content.len() as u64));
+
+    // 5. Client downloads the linked file
+    let downloaded = client.blob_download(blob_id.hash).await?;
+    assert_eq!(downloaded.as_ref(), file_content);
+
+    // 6. Client downloads a slice
+    let slice = client.blob_download_slice(blob_id.hash, 5, Some(5)).await?;
+    assert_eq!(slice.as_ref(), &file_content[5..10]);
 
     router.shutdown().await?;
     Ok(())
