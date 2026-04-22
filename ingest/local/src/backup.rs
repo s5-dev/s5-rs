@@ -423,12 +423,16 @@ async fn is_changed(
     prev_snapshot: &Snapshot,
 ) -> anyhow::Result<bool> {
     let Some(prev_entry) = prev_snapshot.get(key).await? else {
+        tracing::debug!(key = key, "is_changed: new entry");
         return Ok(true); // New entry.
     };
 
     let prev_semantic = match &prev_entry.semantic {
         Some(s) => s,
-        None => return Ok(true), // No metadata to compare.
+        None => {
+            tracing::debug!(key = key, "is_changed: no semantic metadata, treating as new");
+            return Ok(true); // No metadata to compare.
+        }
     };
 
     // Size check (only meaningful for regular files).

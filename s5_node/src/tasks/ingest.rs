@@ -78,10 +78,16 @@ pub async fn run_ingest(
         let inprogress_path = inprogress_root_path(&vault.root_path);
         let current_path = vault_root_path(&vault.root_path);
 
+        // Check if inprogress exists
+        let has_ip = inprogress_path.exists();
+        let has_cur = current_path.exists();
+        tracing::debug!(inprogress_exists = has_ip, current_exists = has_cur, "resume check");
+
         let vault_root = load_vault_root(&inprogress_path, &ctx.node_secret, vault_name)
             .ok()
             .flatten()
             .or_else(|| {
+                tracing::debug!("no inprogress snapshot, trying current path");
                 load_vault_root(&current_path, &ctx.node_secret, vault_name)
                     .ok()
                     .flatten()

@@ -160,9 +160,32 @@ fn resolve_config(cli_override: Option<PathBuf>) -> Result<PathBuf> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_max_level(cli.verbosity)
-        .init();
+    // For the daemon, write logs to ~/.cache/s5/logs/node.log
+    let is_daemon = matches!(&cli.cmd, Commands::Daemon);
+
+    if is_daemon {
+        let log_dir = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("s5")
+            .join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+
+        let file_appender = tracing_appender::rolling::never(&log_dir, "node.log");
+        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+        tracing_subscriber::fmt()
+            .with_max_level(cli.verbosity)
+            .with_writer(file_writer)
+            .with_ansi(false)
+            .init();
+
+        // Leak the guard to keep it alive for the entire program
+        Box::leak(Box::new(_guard));
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(cli.verbosity)
+            .init();
+    }
 
     let config_path = resolve_config(cli.config)?;
 
