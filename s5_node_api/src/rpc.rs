@@ -4,7 +4,7 @@
 //! `S5NodeMessage` (the enum with attached channels) and implements
 //! `irpc::Service` on `S5NodeProto`.
 
-use irpc::channel::oneshot;
+use irpc::channel::{mpsc, oneshot};
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,10 @@ pub enum S5NodeProto {
     /// Get status of a running or completed task.
     #[rpc(tx = oneshot::Sender<TaskStatusResponse>)]
     GetTaskStatus(GetTaskStatus),
+
+    /// Stream status updates for a task until it reaches a terminal state.
+    #[rpc(tx = mpsc::Sender<TaskStatusResponse>)]
+    WatchTaskStatus(WatchTaskStatus),
 
     /// Cancel a running task.
     #[rpc(tx = oneshot::Sender<CancelTaskResponse>)]
@@ -67,6 +71,11 @@ pub struct GetTaskStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct WatchTaskStatus {
+    pub task_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CancelTask {
     pub task_id: u64,
 }
@@ -87,7 +96,7 @@ pub struct RunTaskResponse {
     pub spec_json: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStatusResponse {
     pub task_id: u64,
     pub state: TaskState,

@@ -58,6 +58,20 @@ impl S5NodeClient {
             .context("get_task_status RPC failed")
     }
 
+    /// Stream status updates for a task until it reaches a terminal state.
+    ///
+    /// Returns a receiver that yields `TaskStatusResponse` messages as the task
+    /// progresses. The stream ends when the task completes, fails, or is cancelled.
+    pub async fn watch_task_status(
+        &self,
+        task_id: u64,
+    ) -> Result<irpc::channel::mpsc::Receiver<TaskStatusResponse>> {
+        self.inner
+            .server_streaming(WatchTaskStatus { task_id }, 4)
+            .await
+            .context("watch_task_status RPC failed")
+    }
+
     /// Cancel a running task.
     pub async fn cancel_task(&self, task_id: u64) -> Result<CancelTaskResponse> {
         self.inner

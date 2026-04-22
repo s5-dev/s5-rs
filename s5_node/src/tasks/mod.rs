@@ -19,7 +19,7 @@ use s5_core::RegistryApi;
 use s5_core::blob::BlobStore;
 use s5_node_api::config::{NodeConfigKey, NodeConfigSource, NodeConfigVault, TaskSpec};
 use s5_node_api::{TaskProgressMap, TaskState, TaskStatusResponse};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::S5NodeConfig;
@@ -47,6 +47,59 @@ pub struct TaskExecutorContext {
 }
 
 // ---------------------------------------------------------------------------
+// Task reporter
+// ---------------------------------------------------------------------------
+
+/// A clonable handle that tasks use to report progress and state changes.
+///
+/// Wraps a `watch::Sender<TaskStatusResponse>` so that every mutation
+/// immediately notifies all watchers (both the executor's `TaskHandle`
+/// and any streaming RPC subscribers).
+#[derive(Clone)]
+pub struct TaskReporter {
+    tx: watch::Sender<TaskStatusResponse>,
+}
+
+impl TaskReporter {
+    /// Create a new reporter for a task. The initial status is `Running`
+    /// with no progress.
+    fn new(task_id: u64) -> (Self, watch::Receiver<TaskStatusResponse>) {
+        let initial = TaskStatusResponse {
+            task_id,
+            state: TaskState::Running,
+            progress: None,
+        };
+        let (tx, rx) = watch::channel(initial);
+        (Self { tx }, rx)
+    }
+
+    /// Replace the progress map wholesale (used for initial setup).
+    pub fn init_progress(&self, progress: TaskProgressMap) {
+        self.tx.send_modify(|s| {
+            s.progress = Some(progress);
+        });
+    }
+
+    /// Mutate the progress map in-place. The closure receives
+    /// `&mut TaskProgressMap`; if progress hasn't been initialised yet
+    /// the call is a no-op.
+    pub fn update_progress(&self, f: impl FnOnce(&mut TaskProgressMap)) {
+        self.tx.send_modify(|s| {
+            if let Some(ref mut p) = s.progress {
+                f(p);
+            }
+        });
+    }
+
+    /// Set the task state (e.g. Completed, Failed, Cancelled).
+    fn set_state(&self, state: TaskState) {
+        self.tx.send_modify(|s| {
+            s.state = state;
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task handle
 // ---------------------------------------------------------------------------
 
@@ -57,10 +110,9 @@ struct TaskHandle {
     id: u64,
     /// The resolved spec this task is executing.
     spec: TaskSpec,
-    /// Current task state.
-    state: Arc<RwLock<TaskState>>,
-    /// Optional progress counters (task-type-specific).
-    progress: Arc<RwLock<Option<TaskProgressMap>>>,
+    /// Watch receiver for the task's current status.
+    /// Read the latest value with `borrow().clone()`.
+    status: watch::Receiver<TaskStatusResponse>,
     /// Cancellation token — dropping or cancelling stops the task.
     cancel: CancellationToken,
     /// JoinHandle for the spawned tokio task.
@@ -99,30 +151,23 @@ impl TaskExecutor {
     pub async fn spawn(&self, spec: TaskSpec) -> anyhow::Result<(u64, TaskSpec)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
-        let state = Arc::new(RwLock::new(TaskState::Running));
-        let progress: Arc<RwLock<Option<TaskProgressMap>>> = Arc::new(RwLock::new(None));
+        let (reporter, status_rx) = TaskReporter::new(id);
 
         // Clone what the spawned future needs.
         let ctx = self.ctx.clone();
         let spec_clone = spec.clone();
-        let state_clone = state.clone();
-        let progress_clone = progress.clone();
         let cancel_clone = cancel.clone();
+        let reporter_clone = reporter.clone();
 
         let join = tokio::spawn(async move {
-            let result = run_task(ctx, &spec_clone, progress_clone.clone(), cancel_clone).await;
-            let mut s = state_clone.write().await;
+            let result = run_task(ctx, &spec_clone, reporter_clone.clone(), cancel_clone).await;
             match result {
-                Ok(()) => *s = TaskState::Completed,
+                Ok(true) => reporter_clone.set_state(TaskState::Cancelled),
+                Ok(false) => reporter_clone.set_state(TaskState::Completed),
                 Err(e) => {
-                    // Check if it was a cancellation
                     let msg = format!("{e:#}");
-                    if msg.contains("cancelled") {
-                        *s = TaskState::Cancelled;
-                    } else {
-                        tracing::error!(task_id = id, error = %e, "task failed");
-                        *s = TaskState::Failed { error: msg };
-                    }
+                    tracing::error!(task_id = id, error = %e, "task failed");
+                    reporter_clone.set_state(TaskState::Failed { error: msg });
                 }
             }
         });
@@ -130,8 +175,7 @@ impl TaskExecutor {
         let handle = TaskHandle {
             id,
             spec: spec.clone(),
-            state,
-            progress,
+            status: status_rx,
             cancel,
             join,
         };
@@ -144,13 +188,15 @@ impl TaskExecutor {
     pub async fn get_status(&self, task_id: u64) -> Option<TaskStatusResponse> {
         let tasks = self.tasks.read().await;
         let handle = tasks.get(&task_id)?;
-        let state = handle.state.read().await.clone();
-        let progress = handle.progress.read().await.clone();
-        Some(TaskStatusResponse {
-            task_id,
-            state,
-            progress,
-        })
+        Some((*handle.status.borrow()).clone())
+    }
+
+    /// Get a cloned watch receiver for a task's status stream.
+    /// Returns `None` if the task doesn't exist.
+    pub async fn watch_status(&self, task_id: u64) -> Option<watch::Receiver<TaskStatusResponse>> {
+        let tasks = self.tasks.read().await;
+        let handle = tasks.get(&task_id)?;
+        Some(handle.status.clone())
     }
 
     /// Cancel a running task. Returns true if the task was found.
@@ -169,13 +215,7 @@ impl TaskExecutor {
         let tasks = self.tasks.read().await;
         let mut out = Vec::with_capacity(tasks.len());
         for handle in tasks.values() {
-            let state = handle.state.read().await.clone();
-            let progress = handle.progress.read().await.clone();
-            out.push(TaskStatusResponse {
-                task_id: handle.id,
-                state,
-                progress,
-            });
+            out.push((*handle.status.borrow()).clone());
         }
         out
     }
@@ -189,9 +229,9 @@ impl TaskExecutor {
 async fn run_task(
     ctx: Arc<TaskExecutorContext>,
     spec: &TaskSpec,
-    progress: Arc<RwLock<Option<TaskProgressMap>>>,
+    reporter: TaskReporter,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     match spec {
         TaskSpec::Ingest {
             vault,
@@ -199,17 +239,17 @@ async fn run_task(
             blob_store,
             target_path,
         } => {
-            let _was_cancelled = ingest::run_ingest(
+            let was_cancelled = ingest::run_ingest(
                 &ctx,
                 vault,
                 source,
                 blob_store,
                 target_path.as_deref(),
-                progress,
+                reporter,
                 cancel,
             )
             .await?;
-            Ok(())
+            Ok(was_cancelled)
         }
         TaskSpec::Restore {
             vault,
@@ -221,10 +261,11 @@ async fn run_task(
                 vault,
                 target_path,
                 blob_store.as_deref(),
-                progress,
+                reporter,
                 cancel,
             )
-            .await
+            .await?;
+            Ok(false)
         }
         TaskSpec::Backup {
             vault,
@@ -240,7 +281,7 @@ async fn run_task(
                 source,
                 blob_store,
                 target_path.as_deref(),
-                progress.clone(),
+                reporter.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -248,15 +289,18 @@ async fn run_task(
             // Skip publishing if cancelled — we saved partial state to inprogress for resume
             if was_cancelled {
                 tracing::info!("backup was cancelled, skipping publish");
-                return Ok(());
+                return Ok(true);
             }
 
             // Publish the snapshot to registry (if registry is available)
             publish::run_publish(&ctx, vault, keys).await?;
 
-            Ok(())
+            Ok(false)
         }
-        TaskSpec::Publish { vault, keys } => publish::run_publish(&ctx, vault, keys).await,
+        TaskSpec::Publish { vault, keys } => {
+            publish::run_publish(&ctx, vault, keys).await?;
+            Ok(false)
+        }
         TaskSpec::RemoteRestore {
             vault,
             age_secret_key,
@@ -269,10 +313,11 @@ async fn run_task(
                 vault,
                 blob_store,
                 target_path,
-                progress,
+                reporter,
                 cancel,
             )
-            .await
+            .await?;
+            Ok(false)
         }
     }
 }

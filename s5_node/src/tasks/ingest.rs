@@ -16,8 +16,9 @@ use s5_fs_local::{BackupConfig, BackupResult, BackupStats, WalkBuilder, backup};
 use s5_fs_v2::snapshot::Snapshot;
 use s5_node_api::TaskProgressMap;
 use s5_store_local::LocalStore;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+use super::TaskReporter;
 
 use super::vault_persist::{
     inprogress_root_path, load_vault_root, remove_inprogress, save_vault_root, vault_root_path,
@@ -43,7 +44,7 @@ pub async fn run_ingest(
     source_name: &str,
     blob_store_name: &str,
     _target_path: Option<&str>,
-    progress: Arc<RwLock<Option<TaskProgressMap>>>,
+    reporter: TaskReporter,
     cancel: CancellationToken,
 ) -> anyhow::Result<bool> {
     // -- Resolve config references --
@@ -122,13 +123,12 @@ pub async fn run_ingest(
 
     // -- Initialize progress (shared across all sources) --
     {
-        let mut p = progress.write().await;
         let mut states = TaskProgressMap::new();
         states.bytes("bytes", 0, None);
         states.count("files_added", 0, None);
         states.count("files_skipped", 0, None);
         states.count("files_errored", 0, None);
-        *p = Some(states);
+        reporter.init_progress(states);
     }
 
     // Shared stats accumulator across all sources
@@ -205,7 +205,7 @@ pub async fn run_ingest(
 
         // Spawn a background task that reports live progress 5 times per second.
         let stats_for_reporter = stats.clone();
-        let progress_for_reporter = progress.clone();
+        let reporter_for_bg = reporter.clone();
         let reporter_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -221,9 +221,7 @@ pub async fn run_ingest(
                 let uploaded = stats_for_reporter
                     .bytes_uploaded
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let mut p = progress_for_reporter.write().await;
-                if let Some(states) = p.as_mut() {
-                    // Update existing states (accumulate across sources)
+                reporter_for_bg.update_progress(|states| {
                     if let Some(s) = states.get_mut("bytes") {
                         s.progress = uploaded;
                     }
@@ -236,7 +234,7 @@ pub async fn run_ingest(
                     if let Some(s) = states.get_mut("files_errored") {
                         s.progress = errored;
                     }
-                }
+                });
             }
         });
 
@@ -285,23 +283,20 @@ pub async fn run_ingest(
         );
 
         // Update progress with accumulated final stats
-        {
-            let mut p = progress.write().await;
-            if let Some(states) = p.as_mut() {
-                if let Some(s) = states.get_mut("bytes") {
-                    s.progress = uploaded;
-                }
-                if let Some(s) = states.get_mut("files_added") {
-                    s.progress = changed;
-                }
-                if let Some(s) = states.get_mut("files_skipped") {
-                    s.progress = skipped;
-                }
-                if let Some(s) = states.get_mut("files_errored") {
-                    s.progress = errored;
-                }
+        reporter.update_progress(|states| {
+            if let Some(s) = states.get_mut("bytes") {
+                s.progress = uploaded;
             }
-        }
+            if let Some(s) = states.get_mut("files_added") {
+                s.progress = changed;
+            }
+            if let Some(s) = states.get_mut("files_skipped") {
+                s.progress = skipped;
+            }
+            if let Some(s) = states.get_mut("files_errored") {
+                s.progress = errored;
+            }
+        });
 
         let BackupResult { snapshot, was_cancelled: source_cancelled } = result;
         if source_cancelled {

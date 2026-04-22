@@ -224,7 +224,8 @@ pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Poll a task until it finishes, printing progress updates.
-/// Uses indicatif's built-in byte formatting and throughput calculation.
+/// Uses a streaming RPC to receive status updates as they happen,
+/// avoiding tight polling loops.
 async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     // Create a spinner for initial state
     let pb = new_progress_bar();
@@ -252,6 +253,9 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
         }
     });
 
+    // Open a streaming RPC to get status updates as they happen.
+    let mut rx = client.watch_task_status(task_id).await?;
+
     loop {
         tokio::select! {
             // Check if Ctrl+C was pressed
@@ -260,16 +264,26 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 return Ok(());
             }
-            // Poll task status
-            resp = client.get_task_status(task_id) => {
-                let resp = resp?;
+            // Receive next status update from the server stream
+            msg = rx.recv() => {
+                let resp = match msg {
+                    Ok(Some(resp)) => resp,
+                    Ok(None) => {
+                        // Stream ended normally (server closed)
+                        pb.finish_with_message(format!("⚠ task {} stream ended", task_id));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        pb.finish_with_message(format!("⚠ task {} stream error: {}", task_id, e));
+                        return Ok(());
+                    }
+                };
 
                 match &resp.state {
                     TaskState::Pending | TaskState::Running => {
                         if let Some(ref progress) = resp.progress {
                             update_progress_bar(&pb, progress);
                         }
-                        // Continue polling
                     }
                     TaskState::Completed => {
                         if let Some(ref progress) = resp.progress {

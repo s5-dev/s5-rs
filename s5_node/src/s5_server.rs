@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use irpc::channel::oneshot;
+use irpc::channel::{mpsc, oneshot};
 use irpc_iroh::read_request;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot as tokio_oneshot;
@@ -18,7 +18,7 @@ use s5_node_api::{
     CancelTask, CancelTaskResponse, GetConfig, GetConfigResponse, GetStatus, GetStatusResponse,
     GetTaskStatus, ListSnapshots, ListSnapshotsResponse, ListTasksResponse, PatchConfig,
     PatchConfigResponse, RunTask, RunTaskResponse, S5NodeMessage, S5NodeProto, SnapshotInfo,
-    TaskState, TaskStatusResponse,
+    TaskState, TaskStatusResponse, WatchTaskStatus,
 };
 
 use crate::config::S5NodeConfig;
@@ -401,6 +401,71 @@ impl S5NodeServer {
             tx.send(()).ok();
         }
     }
+
+    /// Stream task status updates.
+    ///
+    /// Sends the initial status immediately, then waits on the watch channel
+    /// for change notifications. The watch channel's latest-value semantics
+    /// coalesce rapid updates — multiple producer send_modify() calls between
+    /// two receiver poll points collapse into a single notification with the
+    /// newest value. The stream ends when the task reaches a terminal state
+    /// or the client disconnects.
+    async fn handle_watch_task_status(
+        &self,
+        req: WatchTaskStatus,
+        tx: mpsc::Sender<TaskStatusResponse>,
+    ) {
+        let Some(mut rx) = self.executor.watch_status(req.task_id).await else {
+            // Task not found — send a single error status and close.
+            let _ = tx
+                .send(TaskStatusResponse {
+                    task_id: req.task_id,
+                    state: TaskState::Failed {
+                        error: format!("task {} not found", req.task_id),
+                    },
+                    progress: None,
+                })
+                .await;
+            return;
+        };
+
+        // Send the current state immediately.
+        let initial = (*rx.borrow_and_update()).clone();
+        let is_terminal = matches!(
+            initial.state,
+            TaskState::Completed | TaskState::Failed { .. } | TaskState::Cancelled
+        );
+        if tx.send(initial).await.is_err() {
+            return; // client disconnected
+        }
+        if is_terminal {
+            return;
+        }
+
+        // Stream updates. The watch channel's "latest value" semantics
+        // naturally coalesce rapid updates — if multiple send_modify()
+        // calls happen before we poll changed(), we only see the latest.
+        loop {
+            // Wait for a change notification.
+            if rx.changed().await.is_err() {
+                break; // sender dropped (task handle removed)
+            }
+
+            // Take the latest value (skipping any intermediate states).
+            let status = (*rx.borrow_and_update()).clone();
+            let is_terminal = matches!(
+                status.state,
+                TaskState::Completed | TaskState::Failed { .. } | TaskState::Cancelled
+            );
+
+            if tx.send(status).await.is_err() {
+                break; // client disconnected
+            }
+            if is_terminal {
+                break;
+            }
+        }
+    }
 }
 
 impl ProtocolHandler for S5NodeServer {
@@ -417,6 +482,9 @@ impl ProtocolHandler for S5NodeServer {
                 S5NodeMessage::GetTaskStatus(irpc::WithChannels { inner, tx, .. }) => {
                     let resp = self.handle_get_task_status(inner).await;
                     let _ = oneshot::Sender::send(tx, resp).await;
+                }
+                S5NodeMessage::WatchTaskStatus(irpc::WithChannels { inner, tx, .. }) => {
+                    self.handle_watch_task_status(inner, tx).await;
                 }
                 S5NodeMessage::CancelTask(irpc::WithChannels { inner, tx, .. }) => {
                     let resp = self.handle_cancel_task(inner).await;
