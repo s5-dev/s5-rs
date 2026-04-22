@@ -14,7 +14,7 @@ use s5_core::blob::tee::TeeBlobsWrite;
 use s5_core::{BlobsRead, FallbackBlobsRead};
 use s5_fs_local::{BackupConfig, BackupResult, BackupStats, WalkBuilder, backup};
 use s5_fs_v2::snapshot::Snapshot;
-use s5_node_api::TaskProgress;
+use s5_node_api::TaskProgressMap;
 use s5_store_local::LocalStore;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,7 @@ use super::{
 /// 4. Build a WalkBuilder from source config.
 /// 5. Call `s5_fs_local::backup()` for each source path.
 /// 6. Save new snapshot as age-encrypted Transparent Node.
+///
 /// Returns `Ok(was_cancelled)` where `was_cancelled` is true if the task
 /// was cancelled mid-backup (partial snapshot was saved).
 pub async fn run_ingest(
@@ -42,7 +43,7 @@ pub async fn run_ingest(
     source_name: &str,
     blob_store_name: &str,
     _target_path: Option<&str>,
-    progress: Arc<RwLock<Option<TaskProgress>>>,
+    progress: Arc<RwLock<Option<TaskProgressMap>>>,
     cancel: CancellationToken,
 ) -> anyhow::Result<bool> {
     // -- Resolve config references --
@@ -119,17 +120,19 @@ pub async fn run_ingest(
         }
     };
 
-    // -- Initialize progress --
+    // -- Initialize progress (shared across all sources) --
     {
         let mut p = progress.write().await;
-        *p = Some(TaskProgress::Ingest {
-            files_scanned: 0,
-            files_changed: 0,
-            files_skipped: 0,
-            files_errored: 0,
-            bytes_uploaded: 0,
-        });
+        let mut states = TaskProgressMap::new();
+        states.bytes("bytes", 0, None);
+        states.count("files_added", 0, None);
+        states.count("files_skipped", 0, None);
+        states.count("files_errored", 0, None);
+        *p = Some(states);
     }
+
+    // Shared stats accumulator across all sources
+    let stats = Arc::new(BackupStats::default());
 
     // -- Run backup for each source path --
     let mut current_snapshot = prev_snapshot;
@@ -200,9 +203,6 @@ pub async fn run_ingest(
         // so disaster recovery is possible from the remote alone.
         let tee_meta = TeeBlobsWrite::new(&meta_store, blob_store);
 
-        // Shared stats for live progress updates.
-        let stats = Arc::new(BackupStats::default());
-
         // Spawn a background task that reports live progress 5 times per second.
         let stats_for_reporter = stats.clone();
         let progress_for_reporter = progress.clone();
@@ -222,13 +222,21 @@ pub async fn run_ingest(
                     .bytes_uploaded
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let mut p = progress_for_reporter.write().await;
-                *p = Some(TaskProgress::Ingest {
-                    files_scanned: changed + skipped + errored,
-                    files_changed: changed,
-                    files_skipped: skipped,
-                    files_errored: errored,
-                    bytes_uploaded: uploaded,
-                });
+                if let Some(states) = p.as_mut() {
+                    // Update existing states (accumulate across sources)
+                    if let Some(s) = states.get_mut("bytes") {
+                        s.progress = uploaded;
+                    }
+                    if let Some(s) = states.get_mut("files_added") {
+                        s.progress = changed;
+                    }
+                    if let Some(s) = states.get_mut("files_skipped") {
+                        s.progress = skipped;
+                    }
+                    if let Some(s) = states.get_mut("files_errored") {
+                        s.progress = errored;
+                    }
+                }
             }
         });
 
@@ -243,11 +251,16 @@ pub async fn run_ingest(
             Some(stats.clone()),
             Some(cancel.clone()),
         )
-        .await
-        .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
+        .await;
 
-        // Stop the live reporter and write final stats.
+        // Stop the live reporter BEFORE propagating any error — otherwise
+        // `?` on a backup failure skips the abort and leaks a 5 Hz task that
+        // keeps overwriting the terminal state via the shared reporter.
         reporter_handle.abort();
+
+        let result = result.with_context(|| {
+            format!("backup failed for source path {}", source_path.display())
+        })?;
 
         let changed = stats
             .files_changed
@@ -271,16 +284,23 @@ pub async fn run_ingest(
             "ingest completed for source path"
         );
 
-        // Update progress with final stats
+        // Update progress with accumulated final stats
         {
             let mut p = progress.write().await;
-            *p = Some(TaskProgress::Ingest {
-                files_scanned: changed + skipped + errored,
-                files_changed: changed,
-                files_skipped: skipped,
-                files_errored: errored,
-                bytes_uploaded: uploaded,
-            });
+            if let Some(states) = p.as_mut() {
+                if let Some(s) = states.get_mut("bytes") {
+                    s.progress = uploaded;
+                }
+                if let Some(s) = states.get_mut("files_added") {
+                    s.progress = changed;
+                }
+                if let Some(s) = states.get_mut("files_skipped") {
+                    s.progress = skipped;
+                }
+                if let Some(s) = states.get_mut("files_errored") {
+                    s.progress = errored;
+                }
+            }
         }
 
         let BackupResult { snapshot, was_cancelled: source_cancelled } = result;

@@ -91,8 +91,8 @@ pub struct RunTaskResponse {
 pub struct TaskStatusResponse {
     pub task_id: u64,
     pub state: TaskState,
-    /// Task-type-specific progress counters as JSON string.
-    pub progress_json: Option<String>,
+    /// Task progress states. Keys are state names (e.g. "bytes", "files_added").
+    pub progress: Option<TaskProgressMap>,
 }
 
 /// Current state of a task.
@@ -110,21 +110,101 @@ pub enum TaskState {
     Cancelled,
 }
 
-/// Task-type-specific progress counters.
+/// Type of a progress metric.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressType {
+    Count,
+    Bytes,
+}
+
+/// A single progress metric for a task.
+///
+/// Each metric has a label (used as map key), a type (count or bytes),
+/// an optional total (None for counters like "skipped" that have no natural bound),
+/// a current progress value, and a complete flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TaskProgress {
-    Ingest {
-        files_scanned: u64,
-        files_changed: u64,
-        files_skipped: u64,
-        files_errored: u64,
-        bytes_uploaded: u64,
-    },
-    Restore {
-        files_restored: u64,
-        bytes_restored: u64,
-    },
+#[serde(rename_all = "snake_case")]
+pub struct ProgressState {
+    /// Human-readable label (e.g., "bytes", "files_added", "files_skipped").
+    pub label: String,
+    /// Whether this metric is in bytes or a plain count.
+    #[serde(rename = "type")]
+    pub progress_type: ProgressType,
+    /// Total expected value, or None if no natural bound.
+    pub total: Option<u64>,
+    /// Current value.
+    pub progress: u64,
+    /// Whether this metric has reached a terminal state.
+    pub complete: bool,
+}
+
+impl ProgressState {
+    pub fn new(label: String, progress_type: ProgressType, total: Option<u64>) -> Self {
+        Self {
+            label,
+            progress_type,
+            total,
+            progress: 0,
+            complete: false,
+        }
+    }
+
+    pub fn add(&mut self, n: u64) {
+        self.progress += n;
+        if let Some(total) = self.total {
+            self.complete = self.progress >= total;
+        }
+    }
+}
+
+/// An ordered list of progress states (insertion order = display order).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskProgressMap(pub Vec<ProgressState>);
+
+impl TaskProgressMap {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Add a bytes progress state.
+    pub fn bytes(&mut self, label: &str, progress: u64, total: Option<u64>) -> &mut ProgressState {
+        self.0.push(ProgressState {
+            label: label.into(),
+            progress_type: ProgressType::Bytes,
+            total,
+            progress,
+            complete: total.is_some_and(|t| progress >= t),
+        });
+        self.0.last_mut().unwrap()
+    }
+
+    /// Add a count progress state.
+    pub fn count(&mut self, label: &str, progress: u64, total: Option<u64>) -> &mut ProgressState {
+        self.0.push(ProgressState {
+            label: label.into(),
+            progress_type: ProgressType::Count,
+            total,
+            progress,
+            complete: total.is_some_and(|t| progress >= t),
+        });
+        self.0.last_mut().unwrap()
+    }
+
+    /// Get a state by label.
+    pub fn get(&self, label: &str) -> Option<&ProgressState> {
+        self.0.iter().find(|s| s.label == label)
+    }
+
+    /// Get a mutable state by label.
+    pub fn get_mut(&mut self, label: &str) -> Option<&mut ProgressState> {
+        self.0.iter_mut().find(|s| s.label == label)
+    }
+
+    /// Iterate over states.
+    pub fn iter(&self) -> impl Iterator<Item = &ProgressState> {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

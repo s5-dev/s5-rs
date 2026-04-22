@@ -1,5 +1,6 @@
 mod cmd;
 mod node;
+mod progress;
 mod recovery;
 
 use anyhow::Result;

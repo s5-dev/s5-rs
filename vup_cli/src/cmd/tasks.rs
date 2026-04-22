@@ -5,14 +5,11 @@
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use indicatif::{ProgressBar, ProgressStyle};
 use s5_node_api::config::TaskSpec;
-use s5_node_api::{S5NodeClient, TaskProgress, TaskState};
+use s5_node_api::{S5NodeClient, TaskProgressMap, TaskState};
 use tokio_util::sync::CancellationToken;
 
-fn format_bytes(bytes: u64) -> String {
-    humansize::format_size(bytes, humansize::BINARY)
-}
+use crate::progress::{new_progress_bar, update_progress_bar, format_one_line};
 
 /// `vup run-task <name>` — run a named task from node config and poll progress.
 pub async fn run_task_by_name(client: &S5NodeClient, name: &str) -> Result<()> {
@@ -193,8 +190,7 @@ pub async fn run_remote_restore_task(
 /// `vup task-status <id>` — show task status.
 pub async fn task_status(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let resp = client.get_task_status(task_id).await?;
-    let progress = parse_progress(resp.progress_json.as_deref());
-    print_status(resp.task_id, &resp.state, progress.as_ref());
+    print_status(resp.task_id, &resp.state, resp.progress.as_ref());
     Ok(())
 }
 
@@ -206,8 +202,7 @@ pub async fn list_tasks(client: &S5NodeClient) -> Result<()> {
         return Ok(());
     }
     for t in &resp.tasks {
-        let progress = parse_progress(t.progress_json.as_deref());
-        print_status(t.task_id, &t.state, progress.as_ref());
+        print_status(t.task_id, &t.state, t.progress.as_ref());
         println!();
     }
     Ok(())
@@ -228,21 +223,11 @@ pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Deserialize a `TaskProgress` from an optional JSON string.
-fn parse_progress(json: Option<&str>) -> Option<TaskProgress> {
-    json.and_then(|s| serde_json::from_str(s).ok())
-}
-
 /// Poll a task until it finishes, printing progress updates.
-/// Handles Ctrl+C by cancelling the task on the daemon before exiting.
+/// Uses indicatif's built-in byte formatting and throughput calculation.
 async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
-    let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(120));
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
+    // Create a spinner for initial state
+    let pb = new_progress_bar();
     pb.set_message("starting…");
 
     // Create a cancellation token to signal Ctrl+C
@@ -278,18 +263,17 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
             // Poll task status
             resp = client.get_task_status(task_id) => {
                 let resp = resp?;
-                let progress = parse_progress(resp.progress_json.as_deref());
 
                 match &resp.state {
                     TaskState::Pending | TaskState::Running => {
-                        if let Some(ref p) = progress {
-                            pb.set_message(format_progress(p));
+                        if let Some(ref progress) = resp.progress {
+                            update_progress_bar(&pb, progress);
                         }
                         // Continue polling
                     }
                     TaskState::Completed => {
-                        if let Some(ref p) = progress {
-                            pb.set_message(format_progress(p));
+                        if let Some(ref progress) = resp.progress {
+                            update_progress_bar(&pb, progress);
                         }
                         pb.finish_with_message(format!("✓ task {} completed", task_id));
                         return Ok(());
@@ -308,43 +292,7 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     }
 }
 
-fn format_progress(progress: &TaskProgress) -> String {
-    match progress {
-        TaskProgress::Ingest {
-            files_scanned,
-            files_changed,
-            files_skipped,
-            files_errored,
-            bytes_uploaded,
-        } => {
-            let error_str = if *files_errored > 0 {
-                format!(" | errored: {}", files_errored)
-            } else {
-                String::new()
-            };
-            format!(
-                "scanned: {} | changed: {} | skipped: {}{} | uploaded: {}",
-                files_scanned,
-                files_changed,
-                files_skipped,
-                error_str,
-                format_bytes(*bytes_uploaded),
-            )
-        }
-        TaskProgress::Restore {
-            files_restored,
-            bytes_restored,
-        } => {
-            format!(
-                "files: {} | written: {}",
-                files_restored,
-                format_bytes(*bytes_restored),
-            )
-        }
-    }
-}
-
-fn print_status(task_id: u64, state: &TaskState, progress: Option<&TaskProgress>) {
+fn print_status(task_id: u64, state: &TaskState, progress: Option<&TaskProgressMap>) {
     let state_str = match state {
         TaskState::Pending => "pending",
         TaskState::Running => "running",
@@ -358,38 +306,6 @@ fn print_status(task_id: u64, state: &TaskState, progress: Option<&TaskProgress>
     }
     println!();
     if let Some(p) = progress {
-        match p {
-            TaskProgress::Ingest {
-                files_scanned,
-                files_changed,
-                files_skipped,
-                files_errored,
-                bytes_uploaded,
-            } => {
-                let error_str = if *files_errored > 0 {
-                    format!(" | errored: {}", files_errored)
-                } else {
-                    String::new()
-                };
-                println!(
-                    "  scanned: {} | changed: {} | skipped: {}{} | uploaded: {}",
-                    files_scanned,
-                    files_changed,
-                    files_skipped,
-                    error_str,
-                    format_bytes(*bytes_uploaded),
-                );
-            }
-            TaskProgress::Restore {
-                files_restored,
-                bytes_restored,
-            } => {
-                println!(
-                    "  files: {} | written: {}",
-                    files_restored,
-                    format_bytes(*bytes_restored),
-                );
-            }
-        }
+        println!("  {}", format_one_line(p));
     }
 }

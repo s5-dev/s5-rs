@@ -20,7 +20,7 @@ use s5_core::{BlobsRead, FallbackBlobsRead, RegistryApi, StreamKey};
 use s5_fs_local::{RestoreConfig, restore};
 use s5_fs_v2::node::Node;
 use s5_fs_v2::snapshot::Snapshot;
-use s5_node_api::TaskProgress;
+use s5_node_api::TaskProgressMap;
 use s5_store_local::LocalStore;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,7 @@ pub async fn run_restore(
     vault_name: &str,
     target_path: &str,
     blob_store_override: Option<&str>,
-    progress: Arc<RwLock<Option<TaskProgress>>>,
+    progress: Arc<RwLock<Option<TaskProgressMap>>>,
     _cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let vault = {
@@ -119,10 +119,10 @@ pub async fn run_restore(
     // Initialize progress
     {
         let mut p = progress.write().await;
-        *p = Some(TaskProgress::Restore {
-            files_restored: 0,
-            bytes_restored: 0,
-        });
+        let mut states = TaskProgressMap::new();
+        states.count("files_restored", 0, None);
+        states.bytes("bytes", 0, None);
+        *p = Some(states);
     }
 
     let stats = restore(&snapshot, &target, &config)
@@ -145,10 +145,10 @@ pub async fn run_restore(
 
     {
         let mut p = progress.write().await;
-        *p = Some(TaskProgress::Restore {
-            files_restored,
-            bytes_restored: bytes_written,
-        });
+        let mut states = TaskProgressMap::new();
+        states.count("files_restored", files_restored, None);
+        states.bytes("bytes", bytes_written, None);
+        *p = Some(states);
     }
 
     tracing::info!(
@@ -183,7 +183,7 @@ pub async fn run_remote_restore(
     vault_name: &str,
     blob_store_name: &str,
     target_path: &str,
-    progress: Arc<RwLock<Option<TaskProgress>>>,
+    progress: Arc<RwLock<Option<TaskProgressMap>>>,
     _cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let registry = ctx
@@ -295,10 +295,10 @@ pub async fn run_remote_restore(
     // Initialize progress
     {
         let mut p = progress.write().await;
-        *p = Some(TaskProgress::Restore {
-            files_restored: 0,
-            bytes_restored: 0,
-        });
+        let mut states = TaskProgressMap::new();
+        states.count("files_restored", 0, None);
+        states.bytes("bytes", 0, None);
+        *p = Some(states);
     }
 
     let stats = restore(&snapshot, &target, &config)
@@ -325,10 +325,10 @@ pub async fn run_remote_restore(
 
     {
         let mut p = progress.write().await;
-        *p = Some(TaskProgress::Restore {
-            files_restored,
-            bytes_restored: bytes_written,
-        });
+        let mut states = TaskProgressMap::new();
+        states.count("files_restored", files_restored, None);
+        states.bytes("bytes", bytes_written, None);
+        *p = Some(states);
     }
 
     tracing::info!(

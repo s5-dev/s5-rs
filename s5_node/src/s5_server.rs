@@ -125,7 +125,7 @@ impl S5NodeServer {
                 state: TaskState::Failed {
                     error: format!("task {} not found", req.task_id),
                 },
-                progress_json: None,
+                progress: None,
             },
         }
     }

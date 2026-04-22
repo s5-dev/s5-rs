@@ -18,7 +18,7 @@ use anyhow::anyhow;
 use s5_core::RegistryApi;
 use s5_core::blob::BlobStore;
 use s5_node_api::config::{NodeConfigKey, NodeConfigSource, NodeConfigVault, TaskSpec};
-use s5_node_api::{TaskProgress, TaskState, TaskStatusResponse};
+use s5_node_api::{TaskProgressMap, TaskState, TaskStatusResponse};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -60,7 +60,7 @@ struct TaskHandle {
     /// Current task state.
     state: Arc<RwLock<TaskState>>,
     /// Optional progress counters (task-type-specific).
-    progress: Arc<RwLock<Option<TaskProgress>>>,
+    progress: Arc<RwLock<Option<TaskProgressMap>>>,
     /// Cancellation token — dropping or cancelling stops the task.
     cancel: CancellationToken,
     /// JoinHandle for the spawned tokio task.
@@ -100,7 +100,7 @@ impl TaskExecutor {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let state = Arc::new(RwLock::new(TaskState::Running));
-        let progress: Arc<RwLock<Option<TaskProgress>>> = Arc::new(RwLock::new(None));
+        let progress: Arc<RwLock<Option<TaskProgressMap>>> = Arc::new(RwLock::new(None));
 
         // Clone what the spawned future needs.
         let ctx = self.ctx.clone();
@@ -149,9 +149,7 @@ impl TaskExecutor {
         Some(TaskStatusResponse {
             task_id,
             state,
-            progress_json: progress
-                .as_ref()
-                .and_then(|p| serde_json::to_string(p).ok()),
+            progress,
         })
     }
 
@@ -176,9 +174,7 @@ impl TaskExecutor {
             out.push(TaskStatusResponse {
                 task_id: handle.id,
                 state,
-                progress_json: progress
-                    .as_ref()
-                    .and_then(|p| serde_json::to_string(p).ok()),
+                progress,
             });
         }
         out
@@ -193,7 +189,7 @@ impl TaskExecutor {
 async fn run_task(
     ctx: Arc<TaskExecutorContext>,
     spec: &TaskSpec,
-    progress: Arc<RwLock<Option<TaskProgress>>>,
+    progress: Arc<RwLock<Option<TaskProgressMap>>>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     match spec {
