@@ -28,7 +28,7 @@ use super::TaskReporter;
 
 use super::publish::{age_decrypt_with_secret_key, recovery_signing_key};
 use super::vault_persist::{load_vault_root, node_to_snapshot_parts, vault_root_path};
-use super::{TaskExecutorContext, resolve_store, resolve_vault, vault_meta_store_path};
+use super::{TaskExecutorContext, resolve_store, resolve_vault, resolve_vault_key_info, vault_meta_store_path};
 
 /// Run a restore task.
 ///
@@ -45,15 +45,17 @@ pub async fn run_restore(
     reporter: TaskReporter,
     _cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let vault = {
+    let (vault, identity_files) = {
         let config = ctx.config.read().await;
-        resolve_vault(&config, vault_name)?.clone()
+        let vault = resolve_vault(&config, vault_name)?.clone();
+        let (_, id_files) = resolve_vault_key_info(&config, vault_name)?;
+        (vault, id_files)
     };
 
     // -- Load vault root from Transparent Node --
     let current_path = vault_root_path(&vault.root_path);
     let (root, root_plaintext_hash, context) =
-        load_vault_root(&current_path, &ctx.node_secret, vault_name)
+        load_vault_root(&current_path, &identity_files)
             .context("reading vault root")?
             .ok_or_else(|| {
                 anyhow!(

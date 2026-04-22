@@ -303,8 +303,14 @@ impl S5NodeServer {
 
             // Fallback: read local vault root (current snapshot only).
             let root_path = crate::tasks::vault_persist::vault_root_path(&vault.root_path);
+            let id_files: Vec<String> = config
+                .key
+                .get(&vault.key)
+                .and_then(|k| k.identity_file.clone())
+                .into_iter()
+                .collect();
             if let Ok(Some(node)) =
-                crate::tasks::vault_persist::load_node(&root_path, &ctx.node_secret, vault_name)
+                crate::tasks::vault_persist::load_node(&root_path, &id_files)
                 && let Some(entry) = node.transparent_entry()
                 && let Some(ref content) = entry.content
             {

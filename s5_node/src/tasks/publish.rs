@@ -17,7 +17,7 @@
 //! decrypt it with their age identity, and recover the full `TraversalContext`
 //! (keys, pipelines) needed to traverse the vault.
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
@@ -26,8 +26,11 @@ use s5_core::blob::BlobStore;
 use s5_core::{BlobsRead, BlobsWrite, Hash, RegistryApi, StreamKey, StreamMessage};
 use s5_fs_v2::node::{ContentRef, Node, NodeEntry, Structural};
 
-use super::vault_persist::{load_vault_root_cbor, vault_root_path};
-use super::{TaskExecutorContext, resolve_key, resolve_store, resolve_vault};
+use super::vault_persist::{
+    age_encrypt_for_recipients, age_decrypt_with_identity_files,
+    load_vault_root_cbor, vault_root_path,
+};
+use super::{TaskExecutorContext, resolve_key, resolve_store, resolve_vault, resolve_vault_key_info};
 
 /// Derive the Ed25519 signing key for a vault's snapshot publishing.
 ///
@@ -147,40 +150,6 @@ fn sign_registry_entry(
         .map_err(|e| anyhow!("creating signed registry entry: {e}"))
 }
 
-/// Age-encrypt bytes for the given recipients (age public key strings).
-///
-/// Parses each string as an `age::x25519::Recipient` and encrypts for all of them.
-fn age_encrypt_for_recipients(
-    plaintext: &[u8],
-    recipient_strings: &[String],
-) -> anyhow::Result<Vec<u8>> {
-    if recipient_strings.is_empty() {
-        return Err(anyhow!("no recipients specified for publish encryption"));
-    }
-
-    let recipients: Vec<age::x25519::Recipient> = recipient_strings
-        .iter()
-        .map(|s| {
-            s.parse::<age::x25519::Recipient>()
-                .map_err(|e| anyhow!("invalid age recipient '{}': {}", s, e))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let encryptor =
-        age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
-            .map_err(|e| anyhow!("creating age encryptor: {e}"))?;
-
-    let mut ciphertext = vec![];
-    let mut writer = encryptor
-        .wrap_output(&mut ciphertext)
-        .map_err(|e| anyhow!("age encrypt: {e}"))?;
-    writer
-        .write_all(plaintext)
-        .context("writing age ciphertext")?;
-    writer.finish().context("finishing age encryption")?;
-    Ok(ciphertext)
-}
-
 /// Age-decrypt bytes using a raw age secret key string (e.g. `AGE-SECRET-KEY-1...`).
 ///
 /// Used for disaster recovery: the user has only their paper key, no identity
@@ -205,62 +174,6 @@ pub(crate) fn age_decrypt_with_secret_key(
         .read_to_end(&mut plaintext)
         .context("reading age plaintext")?;
     Ok(plaintext)
-}
-
-/// Age-decrypt bytes using identity files from the configured keys.
-///
-/// Tries each key that has an `identity_file` until one succeeds.
-/// Returns the decrypted plaintext, or an error if no identity could decrypt.
-fn age_decrypt_with_identity_files(
-    ciphertext: &[u8],
-    identity_files: &[String],
-) -> anyhow::Result<Vec<u8>> {
-    if identity_files.is_empty() {
-        return Err(anyhow!(
-            "no identity files available for decryption — \
-             at least one key must have identity_file set"
-        ));
-    }
-
-    for path in identity_files {
-        let file_content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading identity file '{path}'"))?;
-
-        let identity_file =
-            age::IdentityFile::from_buffer(std::io::BufReader::new(file_content.as_bytes()))
-                .with_context(|| format!("parsing identity file '{path}'"))?;
-
-        let identities = identity_file
-            .into_identities()
-            .map_err(|e| anyhow!("loading identities from '{path}': {e}"))?;
-
-        let decryptor = match age::Decryptor::new(ciphertext) {
-            Ok(d) => d,
-            Err(e) => return Err(anyhow!("age decryptor: {e}")),
-        };
-
-        let identity_refs: Vec<&dyn age::Identity> =
-            identities.iter().map(|i| i.as_ref()).collect();
-
-        match decryptor.decrypt(identity_refs.into_iter()) {
-            Ok(mut reader) => {
-                let mut plaintext = vec![];
-                reader
-                    .read_to_end(&mut plaintext)
-                    .context("reading age plaintext")?;
-                return Ok(plaintext);
-            }
-            Err(_) => {
-                // This identity didn't work, try the next one.
-                continue;
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "none of the {} identity files could decrypt the blob",
-        identity_files.len()
-    ))
 }
 
 /// Fetch the previously published encrypted Transparent Node, decrypt it,
@@ -367,7 +280,7 @@ pub async fn run_publish(
     vault_name: &str,
     key_names: &[String],
 ) -> anyhow::Result<()> {
-    let (vault, key_configs) = {
+    let (vault, key_configs, vault_identity_files) = {
         let config = ctx.config.read().await;
         let vault = resolve_vault(&config, vault_name)?.clone();
         let mut key_configs = Vec::new();
@@ -377,7 +290,9 @@ pub async fn run_publish(
                 .clone();
             key_configs.push(kc);
         }
-        (vault, key_configs)
+        let (_, id_files) = resolve_vault_key_info(&config, vault_name)
+            .context("resolving vault key for local decryption")?;
+        (vault, key_configs, id_files)
     };
     let registry = ctx
         .registry
@@ -386,7 +301,7 @@ pub async fn run_publish(
 
     // -- Load the raw CBOR of the Transparent Node --
     let current_path = vault_root_path(&vault.root_path);
-    let cbor = load_vault_root_cbor(&current_path, &ctx.node_secret, vault_name)
+    let cbor = load_vault_root_cbor(&current_path, &vault_identity_files)
         .context("reading vault root for publish")?
         .ok_or_else(|| {
             anyhow!(

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use s5_core::RegistryApi;
 use s5_core::blob::BlobStore;
 use s5_node_api::config::{NodeConfigKey, NodeConfigSource, NodeConfigVault, TaskSpec};
@@ -371,6 +371,29 @@ pub(crate) fn resolve_key<'a>(
         .key
         .get(name)
         .ok_or_else(|| anyhow!("key '{}' not found in config", name))
+}
+
+/// Resolve a vault's key to its recipient public keys and identity files.
+///
+/// Looks up the vault's `key` field in config, then resolves the key config
+/// to get the `public_key` (recipient) and optional `identity_file`.
+/// Returns `(recipients, identity_files)` for use with age encrypt/decrypt.
+pub(crate) fn resolve_vault_key_info(
+    config: &S5NodeConfig,
+    vault_name: &str,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let vault = resolve_vault(config, vault_name)?;
+    let key_config = resolve_key(config, &vault.key)
+        .with_context(|| format!("resolving key for vault '{vault_name}'"))?;
+
+    let recipients = vec![key_config.public_key.clone()];
+    let identity_files = key_config
+        .identity_file
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok((recipients, identity_files))
 }
 
 /// Build a meta store path from a vault's root_path.

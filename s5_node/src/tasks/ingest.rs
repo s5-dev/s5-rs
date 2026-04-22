@@ -24,7 +24,8 @@ use super::vault_persist::{
     inprogress_root_path, load_vault_root, remove_inprogress, save_vault_root, vault_root_path,
 };
 use super::{
-    TaskExecutorContext, resolve_source, resolve_store, resolve_vault, vault_meta_store_path,
+    TaskExecutorContext, resolve_source, resolve_store, resolve_vault, resolve_vault_key_info,
+    vault_meta_store_path,
 };
 
 /// Run an ingest task.
@@ -50,11 +51,12 @@ pub async fn run_ingest(
     // -- Resolve config references --
     // Clone the config data we need and drop the lock immediately so that
     // config patches (e.g. `vup add`) are not blocked during a long backup.
-    let (vault, source) = {
+    let (vault, source, recipients, identity_files) = {
         let config = ctx.config.read().await;
         let vault = resolve_vault(&config, vault_name)?.clone();
         let source = resolve_source(&config, source_name)?.clone();
-        (vault, source)
+        let (recipients, identity_files) = resolve_vault_key_info(&config, vault_name)?;
+        (vault, source, recipients, identity_files)
     };
     let blob_store = resolve_store(&ctx.stores, blob_store_name)?;
 
@@ -82,20 +84,25 @@ pub async fn run_ingest(
         let inprogress_path = inprogress_root_path(&vault.root_path);
         let current_path = vault_root_path(&vault.root_path);
 
-        // Check if inprogress exists
         let has_ip = inprogress_path.exists();
         let has_cur = current_path.exists();
         tracing::debug!(inprogress_exists = has_ip, current_exists = has_cur, "resume check");
 
-        let vault_root = load_vault_root(&inprogress_path, &ctx.node_secret, vault_name)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                tracing::debug!("no inprogress snapshot, trying current path");
-                load_vault_root(&current_path, &ctx.node_secret, vault_name)
-                    .ok()
-                    .flatten()
-            });
+        // Load the previous vault root. We MUST propagate decrypt/parse errors
+        // here: silently falling through to "no previous snapshot" would
+        // generate a fresh master key and overwrite the real vault root,
+        // destroying access to every existing blob. Only "file does not exist"
+        // (i.e. `Ok(None)`) is a legitimate reason to start fresh.
+        let vault_root = if has_ip {
+            load_vault_root(&inprogress_path, &identity_files)
+                .with_context(|| format!("loading inprogress vault root at {}", inprogress_path.display()))?
+        } else if has_cur {
+            tracing::debug!("no inprogress snapshot, trying current path");
+            load_vault_root(&current_path, &identity_files)
+                .with_context(|| format!("loading current vault root at {}", current_path.display()))?
+        } else {
+            None
+        };
 
         match vault_root {
             Some((root, root_plaintext_hash, context)) => {
@@ -312,7 +319,7 @@ pub async fn run_ingest(
                 let ip_path = inprogress_root_path(&vault.root_path);
                 std::fs::create_dir_all(&vault.root_path).ok();
                 if let Err(e) =
-                    save_vault_root(&ip_path, &current_snapshot, &ctx.node_secret, vault_name)
+                    save_vault_root(&ip_path, &current_snapshot, &recipients)
                 {
                     tracing::warn!(error = %e, "failed to save inprogress checkpoint");
                 }
@@ -338,8 +345,7 @@ pub async fn run_ingest(
         save_vault_root(
             &current_path,
             &current_snapshot,
-            &ctx.node_secret,
-            vault_name,
+            &recipients,
         )
         .context("saving vault root")?;
 
