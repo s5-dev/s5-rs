@@ -626,7 +626,7 @@ async fn process_entry(
 
         let semantic = build_semantic(path, &meta, FileType::Symlink, config.backup);
         let node_entry = prev_snapshot
-            .import_bytes(target_bytes, blob_store, Some(semantic))
+            .import_bytes(target_bytes, blob_store, Some(semantic), None)
             .await?;
 
         overlay.put(key, node_entry);

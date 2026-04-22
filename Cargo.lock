@@ -5663,6 +5663,7 @@ dependencies = [
  "gearhash",
  "minicbor",
  "s5_core",
+ "s5_store_memory",
  "serde",
  "tokio",
  "tokio-stream",

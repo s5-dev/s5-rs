@@ -284,6 +284,7 @@ impl Snapshot {
             plaintext_size,
             KDF_META,
             self.ctx.keys.as_ref(),
+            None, // nodes never use dictionary compression
         )?;
 
         let node =
@@ -340,6 +341,7 @@ impl Snapshot {
             &plaintext_hash,
             KDF_META,
             self.ctx.keys.as_ref(),
+            None, // nodes never use dictionary compression
         )?;
 
         let blob_id = store
@@ -375,8 +377,8 @@ impl Snapshot {
         let first_chunk = match chunker.next_chunk().await {
             Ok(Some(c)) => c,
             Ok(None) => {
-                // Empty file
-                return self.import_bytes(&[], store, semantic).await;
+                // Empty file — no dictionary needed.
+                return self.import_bytes(&[], store, semantic, None).await;
             }
             Err(e) => return Err(anyhow::anyhow!("cdc error: {e}")),
         };
@@ -384,11 +386,11 @@ impl Snapshot {
         let second_chunk = chunker.next_chunk().await.map_err(|e| anyhow::anyhow!("cdc error: {e}"))?;
 
         if second_chunk.is_none() {
-            // It's a single chunk! Just upload it as a Leaf.
-            return self.import_bytes(&first_chunk, store, semantic).await;
+            // Single-chunk file — no dictionary needed (always a D-chunk).
+            return self.import_bytes(&first_chunk, store, semantic, None).await;
         }
 
-        // It's a multi-chunk file! We need to collect the chunk entries.
+        // Multi-chunk file — apply D-chunk dictionary compression.
         let mut all_chunks = vec![first_chunk];
         if let Some(c) = second_chunk {
             all_chunks.push(c);
@@ -398,13 +400,46 @@ impl Snapshot {
             all_chunks.push(chunk);
         }
 
+        // Extract D-chunk mask from the leaf compression strategy.
+        let dict_mask = self
+            .ctx
+            .leaf
+            .as_ref()
+            .and_then(|p| match &p.compression {
+                Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => Some(*mask),
+                _ => None,
+            });
+
         let mut entries = Vec::with_capacity(all_chunks.len());
         let mut offset: u64 = 0;
         let mut total_size: u64 = 0;
+        // Current D-chunk content (used as dictionary for subsequent chunks).
+        let mut dict_content: Option<Vec<u8>> = None;
 
-        for chunk in all_chunks {
-            let chunk_entry = self.import_bytes(&chunk, store, None).await?;
-            // Pad the byte offset to ensure correct string-based sorting.
+        for (i, chunk) in all_chunks.iter().enumerate() {
+            let plaintext_hash: [u8; 32] = *blake3::hash(chunk).as_bytes();
+
+            // Determine if this chunk is a D-chunk:
+            // - First chunk of a file is always a D-chunk
+            // - Any chunk where plaintext_hash[0] & mask == 0
+            let is_d_chunk = match dict_mask {
+                Some(mask) => i == 0 || (plaintext_hash[0] & mask) == 0,
+                None => true, // no dict compression — every chunk is independent
+            };
+
+            let dictionary = if is_d_chunk {
+                None // D-chunks use plain Zstd (no dictionary)
+            } else {
+                dict_content.as_deref()
+            };
+
+            let chunk_entry = self.import_bytes(chunk, store, None, dictionary).await?;
+
+            // Update dictionary: D-chunks become the new dictionary.
+            if is_d_chunk && dict_mask.is_some() {
+                dict_content = Some(chunk.to_vec());
+            }
+
             let key = format!("{:016x}", offset);
             entries.push((key, chunk_entry));
             offset += chunk.len() as u64;
@@ -441,11 +476,14 @@ impl Snapshot {
     /// Pipeline: hash plaintext → compress → pad → encrypt → upload → NodeEntry
     ///
     /// Uses the leaf pipeline from the traversal context.
+    /// `dictionary` is the decompressed content of the preceding D-chunk for
+    /// dictionary-based compression (pass `None` for D-chunks or non-dict strategies).
     pub async fn import_bytes(
         &self,
         plaintext: &[u8],
         store: &dyn BlobsWrite,
         semantic: Option<SemanticMeta>,
+        dictionary: Option<&[u8]>,
     ) -> anyhow::Result<NodeEntry> {
         let plaintext_size = plaintext.len() as u64;
         let plaintext_hash_bytes: [u8; 32] = *blake3::hash(plaintext).as_bytes();
@@ -456,6 +494,7 @@ impl Snapshot {
             &plaintext_hash_bytes,
             KDF_LEAF,
             self.ctx.keys.as_ref(),
+            dictionary,
         )?;
 
         let blob_id = store
@@ -509,48 +548,101 @@ impl Snapshot {
                 }
 
                 let child_snap = self.child(entry);
+
+                // Extract D-chunk mask for dictionary-aware decoding.
+                let dict_mask = child_snap
+                    .ctx
+                    .leaf
+                    .as_ref()
+                    .and_then(|p| match &p.compression {
+                        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => Some(*mask),
+                        _ => None,
+                    });
+
                 use futures::StreamExt;
                 let mut stream = child_snap.walk_byte_stream(content.hash(), content.plaintext_hash);
                 
                 let mut all_bytes = bytes::BytesMut::with_capacity(content.size as usize);
+                let mut dict_content: Option<Vec<u8>> = None;
+                let mut chunk_index: usize = 0;
+
                 while let Some(res) = stream.next().await {
                     let chunk_entry = res?;
-                    let chunk_bytes = child_snap.export_bytes(&chunk_entry).await?;
+
+                    // Determine if this chunk is a D-chunk.
+                    let is_d_chunk = match (dict_mask, chunk_entry.content.as_ref().and_then(|c| c.plaintext_hash.as_ref())) {
+                        (Some(mask), Some(ph)) => chunk_index == 0 || (ph[0] & mask) == 0,
+                        _ => true, // no dict compression or no plaintext_hash → treat as independent
+                    };
+
+                    let dictionary = if is_d_chunk {
+                        None
+                    } else {
+                        dict_content.as_deref()
+                    };
+
+                    let chunk_bytes = child_snap.export_leaf(&chunk_entry, dictionary).await?;
+
+                    // Update dictionary: D-chunks become the new dictionary.
+                    if is_d_chunk && dict_mask.is_some() {
+                        dict_content = Some(chunk_bytes.to_vec());
+                    }
+
                     all_bytes.extend_from_slice(&chunk_bytes);
+                    chunk_index += 1;
                 }
                 return Ok(all_bytes.freeze());
             }
 
-            let ciphertext = self
-                .store
-                .blob_download(content.hash())
-                .await
-                .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
-
-            let plaintext = context::pipeline_decode(
-                ciphertext,
-                self.ctx.leaf.as_ref(),
-                content.plaintext_hash.as_ref(),
-                content.size,
-                KDF_LEAF,
-                self.ctx.keys.as_ref(),
-            )?;
-
-            // Verify plaintext hash if available.
-            if let Some(expected_hash) = &content.plaintext_hash {
-                let actual_hash = blake3::hash(&plaintext);
-                if actual_hash.as_bytes() != expected_hash {
-                    anyhow::bail!(
-                        "plaintext hash mismatch for blob {}: expected {}, got {}",
-                        content.hash(),
-                        Hash::from(*expected_hash),
-                        actual_hash,
-                    );
-                }
-            }
-
-            Ok(plaintext)
+            // Single leaf entry — no dictionary.
+            self.export_leaf(entry, None).await
         })
+    }
+
+    /// Download, decrypt, decompress, and verify a single leaf blob.
+    ///
+    /// `dictionary` is the decompressed D-chunk content for dictionary-based
+    /// decompression (pass `None` for D-chunks or non-dict strategies).
+    async fn export_leaf(
+        &self,
+        entry: &NodeEntry,
+        dictionary: Option<&[u8]>,
+    ) -> anyhow::Result<Bytes> {
+        let content = entry
+            .content
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cannot export tombstone entry"))?;
+
+        let ciphertext = self
+            .store
+            .blob_download(content.hash())
+            .await
+            .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
+
+        let plaintext = context::pipeline_decode(
+            ciphertext,
+            self.ctx.leaf.as_ref(),
+            content.plaintext_hash.as_ref(),
+            content.size,
+            KDF_LEAF,
+            self.ctx.keys.as_ref(),
+            dictionary,
+        )?;
+
+        // Verify plaintext hash if available.
+        if let Some(expected_hash) = &content.plaintext_hash {
+            let actual_hash = blake3::hash(&plaintext);
+            if actual_hash.as_bytes() != expected_hash {
+                anyhow::bail!(
+                    "plaintext hash mismatch for blob {}: expected {}, got {}",
+                    content.hash(),
+                    Hash::from(*expected_hash),
+                    actual_hash,
+                );
+            }
+        }
+
+        Ok(plaintext)
     }
 
     // =====================================================================
@@ -828,15 +920,32 @@ impl ReadableLayer for Snapshot {
 // Context Construction
 // ---------------------------------------------------------------------------
 
+/// Default D-chunk mask: `plaintext_hash[0] & 0x07 == 0` ≈ 1 in 8 D-chunks.
+///
+/// With ~64KB average chunks, this means a D-chunk roughly every 512KB.
+/// Provides good dictionary locality while keeping overhead low.
+const DEFAULT_DICT_MASK: u8 = 0x07;
+
 /// Creates the default encrypted `TraversalContext`.
 ///
-/// Both leaf and node pipelines use Zstd compression, 1KiB padding,
-/// and DeterministicChaCha20 encryption.
+/// Leaf pipeline uses Zstd dictionary compression (preceding-entry dictionary),
+/// node pipeline uses plain Zstd. Both use 1KiB padding and
+/// DeterministicChaCha20 encryption.
 fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
     let mut keys = BTreeMap::new();
     keys.insert(KEY_SLOT_MASTER, master_secret);
 
-    let pipeline = BlobPipeline {
+    let leaf_pipeline = BlobPipeline {
+        compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry {
+            mask: DEFAULT_DICT_MASK,
+        }),
+        padding: Some(PaddingStrategy {
+            block_size: DEFAULT_PAD_BLOCK_SIZE,
+        }),
+        encryption: Some((EncryptionStrategy::DeterministicChaCha20, KEY_SLOT_MASTER)),
+    };
+
+    let node_pipeline = BlobPipeline {
         compression: Some(CompressionStrategy::Zstd),
         padding: Some(PaddingStrategy {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
@@ -846,8 +955,8 @@ fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
 
     TraversalContext {
         keys: Some(keys),
-        leaf: Some(pipeline.clone()),
-        node: Some(pipeline),
+        leaf: Some(leaf_pipeline),
+        node: Some(node_pipeline),
     }
 }
 
@@ -861,7 +970,9 @@ fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalC
     keys.insert(KEY_SLOT_NODE, node_key);
 
     let leaf_pipeline = BlobPipeline {
-        compression: Some(CompressionStrategy::Zstd),
+        compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry {
+            mask: DEFAULT_DICT_MASK,
+        }),
         padding: Some(PaddingStrategy {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
@@ -947,5 +1058,91 @@ fn range_end_after(end: &Bound<String>, value: &str) -> bool {
         Bound::Unbounded => true,
         Bound::Included(e) => value <= e.as_str(),
         Bound::Excluded(e) => value < e.as_str(),
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s5_core::blob::BlobStore;
+    use s5_store_memory::MemoryStore;
+
+    fn test_rw_store() -> Arc<BlobStore> {
+        Arc::new(BlobStore::new(MemoryStore::new()))
+    }
+
+    /// Round-trip: import_stream → export_bytes for a small (single-chunk) file.
+    #[tokio::test]
+    async fn import_export_single_chunk() {
+        let store = test_rw_store();
+        let master = [42u8; 32];
+        let snap = Snapshot::empty_encrypted(store.clone(), master);
+
+        // 1 KB of text — well below the ~8KB min chunk size
+        let data = b"hello world! ".repeat(80);
+        let reader = tokio::io::BufReader::new(&data[..]);
+
+        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+
+        // Should be a Leaf (single chunk, not a Link tree)
+        let content = entry.content.as_ref().unwrap();
+        assert_eq!(content.structural, Structural::Leaf);
+        assert_eq!(content.size, data.len() as u64);
+
+        let restored = snap.export_bytes(&entry).await.unwrap();
+        assert_eq!(&restored[..], &data[..], "single-chunk round-trip mismatch");
+    }
+
+    /// Round-trip: import_stream → export_bytes for a large (multi-chunk) file.
+    #[tokio::test]
+    async fn import_export_multi_chunk() {
+        let store = test_rw_store();
+        let master = [42u8; 32];
+        let snap = Snapshot::empty_encrypted(store.clone(), master);
+
+        // ~512 KB of compressible data — should produce multiple CDC chunks
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        let reader = tokio::io::BufReader::new(&data[..]);
+
+        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+
+        // Should be a Link (multi-chunk ByteStream tree)
+        let content = entry.content.as_ref().unwrap();
+        assert_eq!(content.structural, Structural::Link, "expected multi-chunk Link");
+        assert_eq!(content.size, data.len() as u64);
+
+        let restored = snap.export_bytes(&entry).await.unwrap();
+        assert_eq!(restored.len(), data.len(), "restored length mismatch");
+        assert_eq!(&restored[..], &data[..], "multi-chunk round-trip mismatch");
+    }
+
+    /// Round-trip: import_stream → export_bytes for a large file with
+    /// random (incompressible) data to stress dictionary compression.
+    #[tokio::test]
+    async fn import_export_multi_chunk_random() {
+        let store = test_rw_store();
+        let master = [42u8; 32];
+        let snap = Snapshot::empty_encrypted(store.clone(), master);
+
+        // ~256 KB of pseudo-random data (uses a simple PRNG, not truly random)
+        let mut data = vec![0u8; 256 * 1024];
+        let mut state: u64 = 0xDEADBEEF;
+        for byte in data.iter_mut() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *byte = (state >> 33) as u8;
+        }
+        let reader = tokio::io::BufReader::new(&data[..]);
+
+        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+        let content = entry.content.as_ref().unwrap();
+        assert_eq!(content.size, data.len() as u64);
+
+        let restored = snap.export_bytes(&entry).await.unwrap();
+        assert_eq!(restored.len(), data.len(), "restored length mismatch");
+        assert_eq!(&restored[..], &data[..], "random-data round-trip mismatch");
     }
 }
