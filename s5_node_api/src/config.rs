@@ -71,6 +71,11 @@ pub struct NodeConfigSource {
     /// Glob patterns to exclude from this source.
     #[serde(default)]
     pub exclude: Vec<String>,
+
+    /// Stay on the same filesystem — do not cross mount boundaries.
+    /// Default: false.
+    #[serde(default)]
+    pub one_file_system: bool,
 }
 
 // ---------------------------------------------------------------------------

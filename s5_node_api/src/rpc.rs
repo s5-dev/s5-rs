@@ -118,6 +118,7 @@ pub enum TaskProgress {
         files_scanned: u64,
         files_changed: u64,
         files_skipped: u64,
+        files_errored: u64,
         bytes_uploaded: u64,
     },
     Restore {

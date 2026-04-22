@@ -279,13 +279,20 @@ fn format_progress(progress: &TaskProgress) -> String {
             files_scanned,
             files_changed,
             files_skipped,
+            files_errored,
             bytes_uploaded,
         } => {
+            let error_str = if *files_errored > 0 {
+                format!(" | errored: {}", files_errored)
+            } else {
+                String::new()
+            };
             format!(
-                "scanned: {} | changed: {} | skipped: {} | uploaded: {}",
+                "scanned: {} | changed: {} | skipped: {}{} | uploaded: {}",
                 files_scanned,
                 files_changed,
                 files_skipped,
+                error_str,
                 format_bytes(*bytes_uploaded),
             )
         }
@@ -321,13 +328,20 @@ fn print_status(task_id: u64, state: &TaskState, progress: Option<&TaskProgress>
                 files_scanned,
                 files_changed,
                 files_skipped,
+                files_errored,
                 bytes_uploaded,
             } => {
+                let error_str = if *files_errored > 0 {
+                    format!(" | errored: {}", files_errored)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  scanned: {} | changed: {} | skipped: {} | uploaded: {}",
+                    "  scanned: {} | changed: {} | skipped: {}{} | uploaded: {}",
                     files_scanned,
                     files_changed,
                     files_skipped,
+                    error_str,
                     format_bytes(*bytes_uploaded),
                 );
             }

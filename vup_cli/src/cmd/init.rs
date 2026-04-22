@@ -319,6 +319,16 @@ blob_stores = {blob_stores}
 
 [source.default]
 paths = []
+one_file_system = false
+exclude = [
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/tmp",
+    "/var/run",
+    "/var/tmp"
+]
 "#,
         node_secret = node_secret_path.display(),
         store_section = store_section,

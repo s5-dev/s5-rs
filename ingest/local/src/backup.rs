@@ -16,6 +16,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::time::Duration;
+
 use anyhow::Context;
 use futures::{StreamExt, TryStreamExt};
 use ignore::WalkBuilder;
@@ -62,6 +64,8 @@ pub struct BackupStats {
     pub files_changed: AtomicU64,
     /// Files skipped (unchanged).
     pub files_skipped: AtomicU64,
+    /// Files skipped due to errors (permission denied, IO errors).
+    pub files_errored: AtomicU64,
     /// Directories processed.
     pub dirs_processed: AtomicU64,
     /// Symlinks processed.
@@ -184,6 +188,7 @@ pub async fn backup(
     let mut stats = Arc::try_unwrap(stats).unwrap_or_else(|arc| BackupStats {
         files_changed: AtomicU64::new(arc.files_changed.load(Ordering::Relaxed)),
         files_skipped: AtomicU64::new(arc.files_skipped.load(Ordering::Relaxed)),
+        files_errored: AtomicU64::new(arc.files_errored.load(Ordering::Relaxed)),
         dirs_processed: AtomicU64::new(arc.dirs_processed.load(Ordering::Relaxed)),
         symlinks_processed: AtomicU64::new(arc.symlinks_processed.load(Ordering::Relaxed)),
         special_skipped: AtomicU64::new(arc.special_skipped.load(Ordering::Relaxed)),
@@ -432,6 +437,42 @@ async fn is_changed(
 // Entry processing
 // ===========================================================================
 
+/// Retry a filesystem operation.
+///
+/// Permission denied errors fail immediately. Other I/O errors are retried
+/// with exponential backoff up to 3 times (max ~3 seconds).
+async fn retry_io<F, Fut, T>(path: &Path, op_name: &str, mut f: F) -> anyhow::Result<Option<T>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut delay = Duration::from_millis(100);
+    let mut attempts = 0;
+    let max_attempts = 4; // Initial + 3 retries
+
+    loop {
+        attempts += 1;
+        match f().await {
+            Ok(v) => return Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Permission denied: don't retry, just warn and skip.
+                tracing::warn!(path = %path.display(), error = %e, "permission denied, skipping {}", op_name);
+                return Ok(None);
+            }
+            Err(e) if attempts >= max_attempts => {
+                // Out of retries: warn and skip.
+                tracing::warn!(path = %path.display(), error = %e, "failed to {} after {} attempts, skipping", op_name, attempts);
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, attempt = attempts, "retrying {}", op_name);
+                tokio::time::sleep(delay).await;
+                delay *= 2; // Exponential backoff
+            }
+        }
+    }
+}
+
 /// Process a single directory entry from the walker.
 async fn process_entry(
     entry: ignore::DirEntry,
@@ -443,9 +484,13 @@ async fn process_entry(
     config: &BackupConfig,
 ) -> anyhow::Result<()> {
     let path = entry.path();
-    let meta = entry
-        .metadata()
-        .with_context(|| format!("metadata for {}", path.display()))?;
+
+    // 1. Stat the entry
+    let meta_opt = retry_io(path, "stat", || async { std::fs::metadata(path) }).await?;
+    let Some(meta) = meta_opt else {
+        stats.files_errored.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    };
 
     let ft = meta.file_type();
 
@@ -480,8 +525,11 @@ async fn process_entry(
         }
 
         // Symlink: store raw target bytes as blob content.
-        let target = std::fs::read_link(path)
-            .with_context(|| format!("reading symlink {}", path.display()))?;
+        let target_opt = retry_io(path, "read_link", || async { std::fs::read_link(path) }).await?;
+        let Some(target) = target_opt else {
+            stats.files_errored.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
         let target_bytes = target.as_os_str().as_bytes();
 
         let semantic = build_semantic(path, &meta, FileType::Symlink, config.backup);
@@ -503,9 +551,11 @@ async fn process_entry(
         }
 
         // Regular file: read content, upload blob.
-        let content = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content_opt = retry_io(path, "read", || tokio::fs::read(path)).await?;
+        let Some(content) = content_opt else {
+            stats.files_errored.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
         let content_len = content.len() as u64;
 
         let semantic = build_semantic(path, &meta, FileType::Regular, config.backup);

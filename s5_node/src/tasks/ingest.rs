@@ -118,6 +118,7 @@ pub async fn run_ingest(
             files_scanned: 0,
             files_changed: 0,
             files_skipped: 0,
+            files_errored: 0,
             bytes_uploaded: 0,
         });
     }
@@ -175,6 +176,7 @@ pub async fn run_ingest(
 
         let backup_config = BackupConfig {
             backup: true,
+            one_file_system: source.one_file_system,
             ..Default::default()
         };
 
@@ -208,6 +210,9 @@ pub async fn run_ingest(
             let skipped = stats
                 .files_skipped
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let errored = stats
+                .files_errored
+                .load(std::sync::atomic::Ordering::Relaxed);
             let uploaded = stats
                 .bytes_uploaded
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -216,6 +221,7 @@ pub async fn run_ingest(
                 source = source_path_str,
                 files_changed = changed,
                 files_skipped = skipped,
+                files_errored = errored,
                 bytes_uploaded = uploaded,
                 "ingest completed for source path"
             );
@@ -224,9 +230,10 @@ pub async fn run_ingest(
             {
                 let mut p = progress.write().await;
                 *p = Some(TaskProgress::Ingest {
-                    files_scanned: changed + skipped,
+                    files_scanned: changed + skipped + errored,
                     files_changed: changed,
                     files_skipped: skipped,
+                    files_errored: errored,
                     bytes_uploaded: uploaded,
                 });
             }
