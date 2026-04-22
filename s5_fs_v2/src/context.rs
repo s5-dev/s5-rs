@@ -99,8 +99,8 @@ fn stored_blocks(len: usize, block_size: u32) -> u64 {
 ///
 /// Uses nonce = 0 because each blob has a unique derived key.
 fn apply_chacha20(key: &[u8; 32], data: &mut [u8]) {
-    use chacha20::ChaCha20;
     use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use chacha20::ChaCha20;
 
     let nonce = [0u8; 12];
     let mut cipher = ChaCha20::new(key.into(), &nonce.into());
@@ -310,7 +310,7 @@ mod tests {
 
         let pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
-            padding: Some(PaddingStrategy { block_size: 4096 }),
+            padding: Some(PaddingStrategy { block_size: 1024 }),
             encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
         };
 
@@ -324,7 +324,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.bytes.len(), 4096);
+        assert_eq!(result.bytes.len(), 1024);
 
         // Decode
         let decoded = pipeline_decode(

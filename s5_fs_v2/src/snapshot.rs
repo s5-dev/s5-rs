@@ -42,8 +42,8 @@ pub const KEY_SLOT_LEAF: u8 = 0x10;
 /// Node blob encryption key slot (serialized metadata).
 pub const KEY_SLOT_NODE: u8 = 0x11;
 
-/// Default padding block size (4 KiB).
-const DEFAULT_PAD_BLOCK_SIZE: u32 = 4096;
+/// Default padding block size (1 KiB).
+const DEFAULT_PAD_BLOCK_SIZE: u32 = 1024;
 
 /// An immutable snapshot backed by a prolly tree in the blob store.
 ///
@@ -830,7 +830,7 @@ impl ReadableLayer for Snapshot {
 
 /// Creates the default encrypted `TraversalContext`.
 ///
-/// Both leaf and node pipelines use Zstd compression, 4KiB padding,
+/// Both leaf and node pipelines use Zstd compression, 1KiB padding,
 /// and DeterministicChaCha20 encryption.
 fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
     let mut keys = BTreeMap::new();

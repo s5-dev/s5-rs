@@ -854,6 +854,7 @@ pub enum CompressionStrategy {
 /// size is `ContentRef.stored_blocks * block_size`.
 ///
 /// A `block_size` of 1 means no padding (exact byte count).
+/// A `block_size` of 1024 pads to 1KiB boundaries (default).
 /// A `block_size` of 4096 pads to 4KiB boundaries.
 ///
 /// Uses `Option<PaddingStrategy>` in [`BlobPipeline`] where `None`
