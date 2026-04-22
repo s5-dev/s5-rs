@@ -327,7 +327,9 @@ exclude = [
     "/run",
     "/tmp",
     "/var/run",
-    "/var/tmp"
+    "/var/tmp",
+    "**/.cache",
+    "**/node_modules"
 ]
 "#,
         node_secret = node_secret_path.display(),

@@ -333,7 +333,7 @@ impl Snapshot {
     /// root of the `ByteStream` chunk tree.
     pub async fn import_stream<R: tokio::io::AsyncRead + std::marker::Unpin>(
         &self,
-        mut stream: R,
+        stream: R,
         store: &dyn BlobsWrite,
         semantic: Option<SemanticMeta>,
     ) -> anyhow::Result<NodeEntry> {
