@@ -11,7 +11,7 @@ use anyhow::{Context, anyhow};
 use rand::RngCore;
 use s5_core::blob::BlobStore;
 use s5_core::blob::tee::TeeBlobsWrite;
-use s5_core::{BlobsRead, FallbackBlobsRead};
+use s5_core::{BlobsRead, CachedBlobsRead, FallbackBlobsRead};
 use s5_fs_local::{BackupConfig, BackupResult, BackupStats, WalkBuilder, backup};
 use s5_fs_v2::snapshot::Snapshot;
 use s5_node_api::TaskProgressMap;
@@ -73,8 +73,13 @@ pub async fn run_ingest(
     }));
 
     // -- Build a combined read store (meta + blob) --
+    // Wrap the meta store in a read cache: prolly tree nodes are small
+    // (4-16 KiB) and read repeatedly during change detection — caching
+    // them avoids redundant disk I/O + decryption for each file checked.
+    let cached_meta: Arc<dyn BlobsRead> =
+        Arc::new(CachedBlobsRead::new(Arc::new(meta_store.clone())));
     let read_store: Arc<dyn BlobsRead> = Arc::new(FallbackBlobsRead::new(
-        Arc::new(meta_store.clone()),
+        cached_meta,
         Arc::new(blob_store.clone()),
     ));
 

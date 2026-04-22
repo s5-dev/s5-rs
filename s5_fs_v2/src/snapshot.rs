@@ -17,8 +17,9 @@
 //!   the first key in each child.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -57,6 +58,12 @@ pub struct Snapshot {
     store: Arc<dyn BlobsRead>,
     /// On-wire context: keys and blob processing pipelines.
     ctx: TraversalContext,
+    /// Decoded node cache — avoids repeated blob_download + decrypt +
+    /// decompress + CBOR parse for the same prolly tree node. Shared
+    /// across clones so concurrent `is_changed()` calls benefit.
+    /// Values are `Arc<Node>` so cache hits return a cheap pointer bump
+    /// instead of cloning the entire `BTreeMap` inside each `Node`.
+    node_cache: Arc<RwLock<HashMap<Hash, Arc<Node>>>>,
 }
 
 impl Snapshot {
@@ -80,6 +87,7 @@ impl Snapshot {
             root_plaintext_hash,
             store,
             ctx,
+            node_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -98,6 +106,7 @@ impl Snapshot {
             root_plaintext_hash: None,
             store,
             ctx,
+            node_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -222,6 +231,7 @@ impl Snapshot {
             root_plaintext_hash: content.plaintext_hash,
             store: self.store.clone(),
             ctx: child_ctx,
+            node_cache: self.node_cache.clone(),
         }
     }
 
@@ -234,11 +244,22 @@ impl Snapshot {
     /// Uses the node pipeline for decryption/decompression. `plaintext_hash`
     /// is needed for encrypted nodes — it comes from the parent
     /// `ContentRef.plaintext_hash`.
+    ///
+    /// Results are cached by hash — repeated loads of the same node skip
+    /// blob download, decryption, decompression, and CBOR parsing entirely.
     pub async fn load(
         &self,
         hash: Hash,
         plaintext_hash: Option<&[u8; 32]>,
-    ) -> anyhow::Result<Node> {
+    ) -> anyhow::Result<Arc<Node>> {
+        // Fast path: return cached decoded node (cheap Arc bump).
+        {
+            let cache = self.node_cache.read().unwrap();
+            if let Some(node) = cache.get(&hash) {
+                return Ok(Arc::clone(node));
+            }
+        }
+
         let bytes = self
             .store
             .blob_download(hash)
@@ -265,15 +286,26 @@ impl Snapshot {
             self.ctx.keys.as_ref(),
         )?;
 
-        Node::from_bytes(&decoded).map_err(|e| anyhow::anyhow!("decoding Node {hash}: {e}"))
+        let node =
+            Node::from_bytes(&decoded).map_err(|e| anyhow::anyhow!("decoding Node {hash}: {e}"))?;
+
+        let node = Arc::new(node);
+
+        // Cache the decoded node.
+        {
+            let mut cache = self.node_cache.write().unwrap();
+            cache.insert(hash, Arc::clone(&node));
+        }
+
+        Ok(node)
     }
 
     /// Loads the root node of this snapshot.
     ///
     /// Returns an empty `Node` for empty snapshots (no tree in the store).
-    pub async fn load_root(&self) -> anyhow::Result<Node> {
+    pub async fn load_root(&self) -> anyhow::Result<Arc<Node>> {
         if self.is_empty() {
-            return Ok(Node::new());
+            return Ok(Arc::new(Node::new()));
         }
         self.load(self.root, self.root_plaintext_hash.as_ref())
             .await
@@ -658,7 +690,7 @@ impl Snapshot {
     // =====================================================================
 
     /// Walks the tree from root to the leaf containing `key`.
-    async fn walk_to_leaf(&self, key: &str) -> anyhow::Result<Option<Node>> {
+    async fn walk_to_leaf(&self, key: &str) -> anyhow::Result<Option<Arc<Node>>> {
         let mut node = self.load_root().await?;
 
         loop {
@@ -729,6 +761,7 @@ impl Clone for Snapshot {
             root_plaintext_hash: self.root_plaintext_hash,
             store: self.store.clone(),
             ctx: self.ctx.clone(),
+            node_cache: self.node_cache.clone(),
         }
     }
 }

@@ -1,3 +1,4 @@
+pub mod cached;
 pub mod fallback;
 pub mod identifier;
 pub mod import;
