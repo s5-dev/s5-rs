@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use s5_node_api::config::TaskSpec;
 use s5_node_api::{S5NodeClient, TaskProgress, TaskState};
+use tokio_util::sync::CancellationToken;
 
 fn format_bytes(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
@@ -233,6 +234,7 @@ fn parse_progress(json: Option<&str>) -> Option<TaskProgress> {
 }
 
 /// Poll a task until it finishes, printing progress updates.
+/// Handles Ctrl+C by cancelling the task on the daemon before exiting.
 async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let pb = ProgressBar::new_spinner();
     pb.enable_steady_tick(Duration::from_millis(120));
@@ -243,31 +245,64 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     );
     pb.set_message("starting…");
 
-    loop {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let resp = client.get_task_status(task_id).await?;
-        let progress = parse_progress(resp.progress_json.as_deref());
+    // Create a cancellation token to signal Ctrl+C
+    let cancel_token = CancellationToken::new();
 
-        match &resp.state {
-            TaskState::Pending | TaskState::Running => {
-                if let Some(ref p) = progress {
-                    pb.set_message(format_progress(p));
+    // Spawn a task to listen for Ctrl+C and cancel the task on the daemon
+    let sig_client = client.clone();
+    let sig_task_id = task_id;
+    let cancel_clone = cancel_token.clone();
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::debug!(task_id = sig_task_id, "Ctrl+C received, cancelling task");
+                cancel_clone.cancel();
+                if let Err(e) = sig_client.cancel_task(sig_task_id).await {
+                    tracing::warn!(task_id = sig_task_id, error = %e, "failed to cancel task");
                 }
             }
-            TaskState::Completed => {
-                if let Some(ref p) = progress {
-                    pb.set_message(format_progress(p));
+            Err(e) => {
+                tracing::warn!("failed to listen for ctrl+c: {}", e);
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            // Check if Ctrl+C was pressed
+            _ = cancel_token.cancelled() => {
+                pb.finish_with_message(format!("⊘ task {} cancelled (waiting for daemon to save state...)", task_id));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Ok(());
+            }
+            // Poll task status
+            resp = client.get_task_status(task_id) => {
+                let resp = resp?;
+                let progress = parse_progress(resp.progress_json.as_deref());
+
+                match &resp.state {
+                    TaskState::Pending | TaskState::Running => {
+                        if let Some(ref p) = progress {
+                            pb.set_message(format_progress(p));
+                        }
+                        // Continue polling
+                    }
+                    TaskState::Completed => {
+                        if let Some(ref p) = progress {
+                            pb.set_message(format_progress(p));
+                        }
+                        pb.finish_with_message(format!("✓ task {} completed", task_id));
+                        return Ok(());
+                    }
+                    TaskState::Failed { error } => {
+                        pb.finish_with_message(format!("✗ task {} failed", task_id));
+                        bail!("Task {} failed: {}", task_id, error);
+                    }
+                    TaskState::Cancelled => {
+                        pb.finish_with_message(format!("⊘ task {} cancelled", task_id));
+                        return Ok(());
+                    }
                 }
-                pb.finish_with_message(format!("✓ task {} completed", task_id));
-                return Ok(());
-            }
-            TaskState::Failed { error } => {
-                pb.finish_with_message(format!("✗ task {} failed", task_id));
-                bail!("Task {} failed: {}", task_id, error);
-            }
-            TaskState::Cancelled => {
-                pb.finish_with_message(format!("⊘ task {} cancelled", task_id));
-                return Ok(());
             }
         }
     }

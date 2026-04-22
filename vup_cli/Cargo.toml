@@ -27,6 +27,7 @@ s5_store_s3 = { path = "../blob_stores/s3" }
 serde_json.workspace = true
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2.4"

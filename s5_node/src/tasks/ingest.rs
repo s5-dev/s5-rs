@@ -34,6 +34,8 @@ use super::{
 /// 4. Build a WalkBuilder from source config.
 /// 5. Call `s5_fs_local::backup()` for each source path.
 /// 6. Save new snapshot as age-encrypted Transparent Node.
+/// Returns `Ok(was_cancelled)` where `was_cancelled` is true if the task
+/// was cancelled mid-backup (partial snapshot was saved).
 pub async fn run_ingest(
     ctx: &TaskExecutorContext,
     vault_name: &str,
@@ -42,7 +44,7 @@ pub async fn run_ingest(
     _target_path: Option<&str>,
     progress: Arc<RwLock<Option<TaskProgress>>>,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // -- Resolve config references --
     // Clone the config data we need and drop the lock immediately so that
     // config patches (e.g. `vup add`) are not blocked during a long backup.
@@ -131,10 +133,11 @@ pub async fn run_ingest(
 
     // -- Run backup for each source path --
     let mut current_snapshot = prev_snapshot;
+    let mut was_cancelled = false;
 
     for source_path_str in &source.paths {
         if cancel.is_cancelled() {
-            return Err(anyhow!("task cancelled"));
+            return Ok(true); // Return that we were cancelled
         }
 
         let source_path = PathBuf::from(source_path_str);
@@ -280,13 +283,17 @@ pub async fn run_ingest(
             });
         }
 
-        let BackupResult { snapshot, was_cancelled } = result;
+        let BackupResult { snapshot, was_cancelled: source_cancelled } = result;
+        if source_cancelled {
+            was_cancelled = true;
+            tracing::info!("source {} was cancelled, stopping", source_path_str);
+        }
         if let Some((new_snapshot, _stats)) = snapshot {
             current_snapshot = new_snapshot;
 
             // Save in-progress checkpoint on cancellation OR when running multiple source paths.
             // This ensures partial state is preserved for resume.
-            if !current_snapshot.is_empty() && (was_cancelled || source.paths.len() > 1) {
+            if !current_snapshot.is_empty() && (source_cancelled || source.paths.len() > 1) {
                 let ip_path = inprogress_root_path(&vault.root_path);
                 std::fs::create_dir_all(&vault.root_path).ok();
                 if let Err(e) =
@@ -298,10 +305,16 @@ pub async fn run_ingest(
         } else {
             tracing::info!(source = source_path_str, "no changes detected");
         }
+
+        // If this source was cancelled, stop processing remaining sources
+        if was_cancelled {
+            break;
+        }
     }
 
     // -- Save snapshot root --
-    if !current_snapshot.is_empty() {
+    // Skip if cancelled — we already saved to inprogress, don't publish a partial snapshot
+    if !current_snapshot.is_empty() && !was_cancelled {
         let current_path = vault_root_path(&vault.root_path);
         // Ensure vault root_path exists
         std::fs::create_dir_all(&vault.root_path)
@@ -320,5 +333,5 @@ pub async fn run_ingest(
     }
 
     tracing::info!(vault = vault_name, "ingest task completed");
-    Ok(())
+    Ok(was_cancelled)
 }

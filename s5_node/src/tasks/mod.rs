@@ -203,7 +203,7 @@ async fn run_task(
             blob_store,
             target_path,
         } => {
-            ingest::run_ingest(
+            let _was_cancelled = ingest::run_ingest(
                 &ctx,
                 vault,
                 source,
@@ -212,7 +212,8 @@ async fn run_task(
                 progress,
                 cancel,
             )
-            .await
+            .await?;
+            Ok(())
         }
         TaskSpec::Restore {
             vault,
@@ -237,7 +238,7 @@ async fn run_task(
             target_path,
         } => {
             // Backup = Ingest + Publish
-            ingest::run_ingest(
+            let was_cancelled = ingest::run_ingest(
                 &ctx,
                 vault,
                 source,
@@ -247,6 +248,12 @@ async fn run_task(
                 cancel.clone(),
             )
             .await?;
+
+            // Skip publishing if cancelled — we saved partial state to inprogress for resume
+            if was_cancelled {
+                tracing::info!("backup was cancelled, skipping publish");
+                return Ok(());
+            }
 
             // Publish the snapshot to registry (if registry is available)
             publish::run_publish(&ctx, vault, keys).await?;
