@@ -12,7 +12,7 @@ use rand::RngCore;
 use s5_core::blob::BlobStore;
 use s5_core::blob::tee::TeeBlobsWrite;
 use s5_core::{BlobsRead, FallbackBlobsRead};
-use s5_fs_local::{BackupConfig, WalkBuilder, backup};
+use s5_fs_local::{BackupConfig, BackupStats, WalkBuilder, backup};
 use s5_fs_v2::snapshot::Snapshot;
 use s5_node_api::TaskProgress;
 use s5_store_local::LocalStore;
@@ -191,44 +191,28 @@ pub async fn run_ingest(
         // so disaster recovery is possible from the remote alone.
         let tee_meta = TeeBlobsWrite::new(&meta_store, blob_store);
 
-        let result = backup(
-            &source_path,
-            &current_snapshot,
-            blob_store,
-            &tee_meta,
-            read_store.clone(),
-            &backup_config,
-            walker,
-        )
-        .await
-        .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
+        // Shared stats for live progress updates.
+        let stats = Arc::new(BackupStats::default());
 
-        if let Some((new_snapshot, stats)) = result {
-            let changed = stats
-                .files_changed
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let skipped = stats
-                .files_skipped
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let errored = stats
-                .files_errored
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let uploaded = stats
-                .bytes_uploaded
-                .load(std::sync::atomic::Ordering::Relaxed);
-
-            tracing::info!(
-                source = source_path_str,
-                files_changed = changed,
-                files_skipped = skipped,
-                files_errored = errored,
-                bytes_uploaded = uploaded,
-                "ingest completed for source path"
-            );
-
-            // Update progress
-            {
-                let mut p = progress.write().await;
+        // Spawn a background task that reports live progress 5 times per second.
+        let stats_for_reporter = stats.clone();
+        let progress_for_reporter = progress.clone();
+        let reporter_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let changed = stats_for_reporter
+                    .files_changed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let skipped = stats_for_reporter
+                    .files_skipped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let errored = stats_for_reporter
+                    .files_errored
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let uploaded = stats_for_reporter
+                    .bytes_uploaded
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let mut p = progress_for_reporter.write().await;
                 *p = Some(TaskProgress::Ingest {
                     files_scanned: changed + skipped + errored,
                     files_changed: changed,
@@ -237,7 +221,58 @@ pub async fn run_ingest(
                     bytes_uploaded: uploaded,
                 });
             }
+        });
 
+        let result = backup(
+            &source_path,
+            &current_snapshot,
+            blob_store,
+            &tee_meta,
+            read_store.clone(),
+            &backup_config,
+            walker,
+            Some(stats.clone()),
+        )
+        .await
+        .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
+
+        // Stop the live reporter and write final stats.
+        reporter_handle.abort();
+        let changed = stats
+            .files_changed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let skipped = stats
+            .files_skipped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let errored = stats
+            .files_errored
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let uploaded = stats
+            .bytes_uploaded
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        tracing::info!(
+            source = source_path_str,
+            files_changed = changed,
+            files_skipped = skipped,
+            files_errored = errored,
+            bytes_uploaded = uploaded,
+            "ingest completed for source path"
+        );
+
+        // Update progress with final stats
+        {
+            let mut p = progress.write().await;
+            *p = Some(TaskProgress::Ingest {
+                files_scanned: changed + skipped + errored,
+                files_changed: changed,
+                files_skipped: skipped,
+                files_errored: errored,
+                bytes_uploaded: uploaded,
+            });
+        }
+
+        if let Some((new_snapshot, _stats)) = result {
             current_snapshot = new_snapshot;
 
             // Save in-progress checkpoint (for resume if we crash between source paths)

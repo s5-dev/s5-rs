@@ -111,6 +111,7 @@ pub async fn backup(
     read_store: Arc<dyn BlobsRead>,
     config: &BackupConfig,
     mut walker: WalkBuilder,
+    stats: Option<Arc<BackupStats>>,
 ) -> anyhow::Result<Option<(Snapshot, BackupStats)>> {
     let source_dir = source_dir
         .canonicalize()
@@ -123,7 +124,7 @@ pub async fn backup(
         None
     };
 
-    let stats = Arc::new(BackupStats::default());
+    let stats = stats.unwrap_or_else(|| Arc::new(BackupStats::default()));
     let overlay = Arc::new(WritableOverlay::new(Box::new(prev_snapshot.clone())));
 
     // Add one_file_system filter if configured.

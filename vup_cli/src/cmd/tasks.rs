@@ -244,7 +244,7 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     pb.set_message("starting…");
 
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = client.get_task_status(task_id).await?;
         let progress = parse_progress(resp.progress_json.as_deref());
 
