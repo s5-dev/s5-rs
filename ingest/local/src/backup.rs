@@ -151,11 +151,24 @@ pub async fn backup(
         });
     }
 
-    let walk = walker.build();
+    // Parallel walker: OS threads walk directories concurrently and send
+    // entries through a channel. The async side processes them with
+    // buffer_unordered for concurrent uploads.
+    let (tx, rx) = tokio::sync::mpsc::channel::<ignore::DirEntry>(512);
+
+    let walk_parallel = walker.build_parallel();
+    let walk_handle = std::thread::spawn(move || {
+        walk_parallel.visit(&mut ParallelSender(tx));
+    });
+
+    // Convert the mpsc receiver into a futures::Stream.
+    let entry_stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|entry| (entry, rx))
+    });
 
     // Process entries concurrently.
     // File content is uploaded to blob_store (remote), not meta_store.
-    let stream = futures::stream::iter(walk.filter_map(Result::ok))
+    let stream = entry_stream
         .map(|entry| {
             let source_dir = source_dir.clone();
             let stats = stats.clone();
@@ -194,6 +207,11 @@ pub async fn backup(
         stream.try_collect::<()>().await?;
         false
     };
+
+    // Wait for the walker threads to finish — join on a blocking thread so
+    // we don't stall a tokio worker if the walker is still unwinding a slow
+    // syscall (e.g. NFS, FUSE).
+    let _ = tokio::task::spawn_blocking(move || walk_handle.join()).await;
 
     // Persist the overlay into a new prolly tree.
     // Tree nodes go to meta_store (local vault).
@@ -389,6 +407,42 @@ fn lookup_groupname(gid: u32) -> Option<String> {
 
     let name = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) };
     name.to_str().ok().map(|s| s.to_owned())
+}
+
+// ===========================================================================
+// Parallel walker visitor
+// ===========================================================================
+
+/// Adapter that bridges `ignore`'s parallel walker into a `tokio::sync::mpsc`
+/// channel. Each walker thread gets its own `Sender` clone; when all threads
+/// finish, the channel closes naturally.
+struct ParallelSender(tokio::sync::mpsc::Sender<ignore::DirEntry>);
+
+impl ignore::ParallelVisitorBuilder<'_> for ParallelSender {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor> {
+        Box::new(ParallelSenderVisitor(self.0.clone()))
+    }
+}
+
+struct ParallelSenderVisitor(tokio::sync::mpsc::Sender<ignore::DirEntry>);
+
+impl ignore::ParallelVisitor for ParallelSenderVisitor {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        match entry {
+            Ok(dent) => {
+                if self.0.blocking_send(dent).is_err() {
+                    // Receiver dropped (e.g. backup cancelled) — stop walking.
+                    ignore::WalkState::Quit
+                } else {
+                    ignore::WalkState::Continue
+                }
+            }
+            Err(err) => {
+                tracing::warn!("walk error: {err}");
+                ignore::WalkState::Continue
+            }
+        }
+    }
 }
 
 // ===========================================================================
