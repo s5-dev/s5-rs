@@ -5634,6 +5634,7 @@ dependencies = [
  "s5_store_memory",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "xattr",
 ]

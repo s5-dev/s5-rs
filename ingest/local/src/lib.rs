@@ -28,6 +28,6 @@
 mod backup;
 mod restore;
 
-pub use backup::{BackupConfig, BackupStats, backup};
+pub use backup::{BackupConfig, BackupResult, BackupStats, backup};
 pub use ignore::WalkBuilder;
 pub use restore::{RestoreConfig, RestoreStats, restore};

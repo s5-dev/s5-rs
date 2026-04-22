@@ -15,7 +15,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 use std::time::Duration;
 
 use anyhow::Context;
@@ -27,6 +26,7 @@ use s5_fs_v2::node::{ExtendedAttribute, FileType, NodeEntry, SemanticMeta, UnixM
 use s5_fs_v2::overlay::WritableOverlay;
 use s5_fs_v2::persist::MergeStats;
 use s5_fs_v2::snapshot::Snapshot;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for a backup operation.
 ///
@@ -103,6 +103,13 @@ pub struct BackupStats {
 ///   them, or pass a single store if both are the same.
 ///
 /// For simple setups (tests, single store), pass the same store for all three.
+/// Result of a backup operation: (snapshot, stats, was_cancelled)
+pub struct BackupResult {
+    pub snapshot: Option<(Snapshot, BackupStats)>,
+    pub was_cancelled: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn backup(
     source_dir: &Path,
     prev_snapshot: &Snapshot,
@@ -112,7 +119,8 @@ pub async fn backup(
     config: &BackupConfig,
     mut walker: WalkBuilder,
     stats: Option<Arc<BackupStats>>,
-) -> anyhow::Result<Option<(Snapshot, BackupStats)>> {
+    cancel: Option<CancellationToken>,
+) -> anyhow::Result<BackupResult> {
     let source_dir = source_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", source_dir.display()))?;
@@ -147,7 +155,7 @@ pub async fn backup(
 
     // Process entries concurrently.
     // File content is uploaded to blob_store (remote), not meta_store.
-    futures::stream::iter(walk.filter_map(Result::ok))
+    let stream = futures::stream::iter(walk.filter_map(Result::ok))
         .map(|entry| {
             let source_dir = source_dir.clone();
             let stats = stats.clone();
@@ -165,9 +173,27 @@ pub async fn backup(
                 .await
             }
         })
-        .buffer_unordered(config.max_concurrent_ops)
-        .try_collect::<()>()
-        .await?;
+        .buffer_unordered(config.max_concurrent_ops);
+
+    // Race the backup stream against cancellation.
+    // Stream errors propagate via `?` in both branches; only cancellation
+    // itself is a clean early exit that still persists partial state.
+    let was_cancelled = if let Some(ref cancel) = cancel {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::info!("backup cancelled — saving partial state");
+                true
+            }
+            r = stream.try_collect::<()>() => {
+                r?;
+                false
+            }
+        }
+    } else {
+        stream.try_collect::<()>().await?;
+        false
+    };
 
     // Persist the overlay into a new prolly tree.
     // Tree nodes go to meta_store (local vault).
@@ -176,7 +202,11 @@ pub async fn backup(
         .await?;
 
     let Some((root_hash, root_plaintext_hash, merge_stats)) = result else {
-        return Ok(None);
+        // Empty overlay — return without snapshot but still report cancellation
+        return Ok(BackupResult {
+            snapshot: None,
+            was_cancelled,
+        });
     };
 
     let new_snapshot = Snapshot::new(
@@ -198,7 +228,10 @@ pub async fn backup(
     });
     stats.merge = Some(merge_stats);
 
-    Ok(Some((new_snapshot, stats)))
+    Ok(BackupResult {
+        snapshot: Some((new_snapshot, stats)),
+        was_cancelled,
+    })
 }
 
 // ===========================================================================

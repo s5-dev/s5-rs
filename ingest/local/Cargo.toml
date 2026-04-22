@@ -15,6 +15,7 @@ libc = "0.2"
 s5_core.workspace = true
 s5_fs_v2.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-util.workspace = true
 tracing.workspace = true
 xattr = "1"
 

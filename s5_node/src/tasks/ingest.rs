@@ -12,7 +12,7 @@ use rand::RngCore;
 use s5_core::blob::BlobStore;
 use s5_core::blob::tee::TeeBlobsWrite;
 use s5_core::{BlobsRead, FallbackBlobsRead};
-use s5_fs_local::{BackupConfig, BackupStats, WalkBuilder, backup};
+use s5_fs_local::{BackupConfig, BackupResult, BackupStats, WalkBuilder, backup};
 use s5_fs_v2::snapshot::Snapshot;
 use s5_node_api::TaskProgress;
 use s5_store_local::LocalStore;
@@ -232,12 +232,14 @@ pub async fn run_ingest(
             &backup_config,
             walker,
             Some(stats.clone()),
+            Some(cancel.clone()),
         )
         .await
         .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
 
         // Stop the live reporter and write final stats.
         reporter_handle.abort();
+
         let changed = stats
             .files_changed
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -272,11 +274,13 @@ pub async fn run_ingest(
             });
         }
 
-        if let Some((new_snapshot, _stats)) = result {
+        let BackupResult { snapshot, was_cancelled } = result;
+        if let Some((new_snapshot, _stats)) = snapshot {
             current_snapshot = new_snapshot;
 
-            // Save in-progress checkpoint (for resume if we crash between source paths)
-            if !current_snapshot.is_empty() && source.paths.len() > 1 {
+            // Save in-progress checkpoint on cancellation OR when running multiple source paths.
+            // This ensures partial state is preserved for resume.
+            if !current_snapshot.is_empty() && (was_cancelled || source.paths.len() > 1) {
                 let ip_path = inprogress_root_path(&vault.root_path);
                 std::fs::create_dir_all(&vault.root_path).ok();
                 if let Err(e) =
