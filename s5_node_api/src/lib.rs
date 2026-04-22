@@ -8,6 +8,13 @@
 /// ALPN identifier for the S5 node RPC protocol.
 pub const ALPN: &[u8] = b"s5/node/0";
 
+/// Build version string: `<cargo_version>+<git_hash>` or `<cargo_version>+<git_hash>-dirty`.
+///
+/// Used to detect CLI ↔ daemon version mismatches. When the CLI reads a
+/// lock file whose version differs from its own, it shuts down the stale
+/// daemon and spawns a fresh one.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("S5_GIT_VERSION"));
+
 mod client;
 pub mod config;
 mod rpc;

@@ -14,6 +14,14 @@ use crate::S5NodeClient;
 pub struct ServiceLock {
     /// The node's iroh endpoint address (id + direct addrs + relay URLs).
     pub endpoint_addr: iroh::EndpointAddr,
+    /// Build version of the daemon that wrote this lock file.
+    /// Clients compare this to their own [`crate::VERSION`] to detect mismatches.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// PID of the daemon process. Used as a fallback to kill a stale daemon
+    /// when the shutdown RPC fails (e.g. protocol mismatch after upgrade).
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 /// Default lock file path (`~/.local/share/s5/service.lock`).

@@ -467,9 +467,13 @@ pub async fn run_node(
 fn write_service_lockfile(node: &S5Node) -> anyhow::Result<()> {
     let endpoint_addr = node.endpoint.addr();
 
-    let lock = ServiceLock { endpoint_addr };
+    let lock = ServiceLock {
+        endpoint_addr,
+        version: Some(s5_node_api::VERSION.to_string()),
+        pid: Some(std::process::id()),
+    };
     write_lock(&lock)?;
 
-    info!(lock_path = %lock_path()?.display(), "service lock file written");
+    info!(lock_path = %lock_path()?.display(), version = s5_node_api::VERSION, "service lock file written");
     Ok(())
 }

@@ -20,13 +20,71 @@ pub fn default_config_path() -> Result<PathBuf> {
 
 /// Connect to a running s5 node, or spawn one and wait for it.
 ///
-/// 1. Try `connect()` — if the lock file exists and connection succeeds, return.
-/// 2. Otherwise spawn `vup _daemon --config <path>` as a detached child.
+/// 1. Try `connect()` — if the lock file exists, check the version matches.
+///    If the version is stale, shut down the old daemon first.
+/// 2. If no daemon is running, spawn `vup _daemon --config <path>`.
 /// 3. Poll `connect()` with backoff until success or timeout.
 pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
-    // Fast path: already running
-    if let Some(client) = connect::connect().await? {
-        return Ok(client);
+    // Check lock file first for version comparison
+    if let Some(lock) = connect::read_lock()? {
+        let version_matches = lock
+            .version
+            .as_deref()
+            .is_some_and(|v| v == s5_node_api::VERSION);
+
+        if version_matches {
+            // Same version — try to connect
+            if let Ok(client) = connect::connect_with_lock(&lock).await {
+                return Ok(client);
+            }
+            // Connection failed despite lock existing — fall through to respawn
+        } else {
+            // Version mismatch (or old lock without version) — shut down stale daemon
+            let old_version = lock.version.as_deref().unwrap_or("unknown");
+            tracing::info!(
+                old = old_version,
+                new = s5_node_api::VERSION,
+                "daemon version mismatch, restarting"
+            );
+
+            let mut shutdown_ok = false;
+
+            // Try graceful shutdown via RPC
+            if let Ok(client) = connect::connect_with_lock(&lock).await {
+                if client.shutdown().await.is_ok() {
+                    shutdown_ok = true;
+                    // Give it a moment to clean up
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                client.close().await;
+            }
+
+            // Fallback: kill by PID if RPC failed (e.g. protocol mismatch)
+            if !shutdown_ok {
+                if let Some(pid) = lock.pid {
+                    tracing::info!(pid, "shutdown RPC failed, killing stale daemon by PID");
+                    #[cfg(unix)]
+                    {
+                        use std::process::Command;
+                        let _ = Command::new("kill").arg(pid.to_string()).output();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::process::Command;
+                        let _ = Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/F"])
+                            .output();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                } else {
+                    tracing::warn!("no PID in lock file and shutdown RPC failed — old daemon may still be running");
+                }
+            }
+
+            // Remove stale lock file in case shutdown didn't clean up
+            connect::remove_lock();
+        }
     }
 
     // Verify config exists before attempting to spawn
