@@ -91,6 +91,22 @@ fn stored_blocks(len: usize, block_size: u32) -> u64 {
     len.div_ceil(bs)
 }
 
+/// Returns the byte length after padding to `block_size` boundary.
+///
+/// If `block_size <= 1`, returns `len` unchanged.
+fn padded_len(len: usize, block_size: u32) -> usize {
+    let bs = block_size as usize;
+    if bs <= 1 {
+        return len;
+    }
+    let remainder = len % bs;
+    if remainder == 0 {
+        len
+    } else {
+        len + (bs - remainder)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChaCha20 Encrypt / Decrypt (Pure Stream Cipher)
 // ---------------------------------------------------------------------------
@@ -117,6 +133,9 @@ pub(crate) struct PipelineEncodeResult {
     pub bytes: Bytes,
     /// Stored size in padding blocks (= exact byte count when block_size=1).
     pub stored_blocks: u64,
+    /// True when compression was skipped because the result exceeded the
+    /// compression-skip threshold (the blob was stored uncompressed).
+    pub compression_skipped: bool,
 }
 
 /// Encodes plaintext bytes through the blob pipeline: compress → pad → encrypt.
@@ -130,6 +149,13 @@ pub(crate) struct PipelineEncodeResult {
 ///
 /// `dictionary` is the raw decompressed content of the preceding D-chunk for
 /// `ZstdDictFromPrecedingEntry` compression (pass `None` for D-chunks and non-dict strategies).
+///
+/// `compression_skip_threshold` — when `Some(())`, compression is skipped if
+/// the compressed+padded size is not smaller than the uncompressed+padded size.
+/// This avoids wasting CPU on decompression when there are no storage savings
+/// (accounting for the fact that padding can nullify small compression gains).
+/// The blob is then stored uncompressed and `compression_skipped` is set in
+/// the result so the caller can record a per-entry override.
 pub(crate) fn pipeline_encode(
     plaintext: &[u8],
     pipeline: Option<&BlobPipeline>,
@@ -137,6 +163,7 @@ pub(crate) fn pipeline_encode(
     kdf_context: &str,
     keys: Option<&BTreeMap<u8, [u8; 32]>>,
     dictionary: Option<&[u8]>,
+    compression_skip_threshold: bool,
 ) -> anyhow::Result<PipelineEncodeResult> {
     let Some(pipeline) = pipeline else {
         // No pipeline = no transforms, pass through.
@@ -144,11 +171,29 @@ pub(crate) fn pipeline_encode(
         return Ok(PipelineEncodeResult {
             bytes: Bytes::copy_from_slice(plaintext),
             stored_blocks: len as u64,
+            compression_skipped: false,
         });
     };
 
-    // Stage 1: Compress
-    let compressed = compress_bytes(plaintext, &pipeline.compression, dictionary)?;
+    // Stage 1: Compress (with optional skip when unhelpful)
+    let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
+    let (compressed, compression_skipped) = {
+        let raw = compress_bytes(plaintext, &pipeline.compression, dictionary)?;
+        if compression_skip_threshold && !plaintext.is_empty() {
+            // Compare padded sizes: only keep compression if it actually
+            // reduces the stored (post-padding) size.
+            let padded_compressed_len = padded_len(raw.len(), block_size);
+            let padded_uncompressed_len = padded_len(plaintext.len(), block_size);
+            if padded_compressed_len >= padded_uncompressed_len {
+                // Compression unhelpful after padding — fall back to uncompressed.
+                (Bytes::copy_from_slice(plaintext), true)
+            } else {
+                (raw, false)
+            }
+        } else {
+            (raw, false)
+        }
+    };
 
     // Stage 2: Pad
     let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
@@ -173,6 +218,7 @@ pub(crate) fn pipeline_encode(
     Ok(PipelineEncodeResult {
         bytes: encrypted,
         stored_blocks: blocks,
+        compression_skipped,
     })
 }
 
@@ -234,15 +280,37 @@ pub(crate) fn pipeline_decode(
     // TODO: Consider storing compressed size if zstd can't handle trailing zeros.
 
     // Stage 3: Decompress
+    //
+    // Callers that don't know the plaintext size pass `plaintext_size == 0`
+    // as a sentinel (see Snapshot::load). In those cases we can't truncate
+    // padding here, so we return the decrypted bytes unchanged and let the
+    // caller handle any trailing zero padding (e.g. zstd ignores it; the
+    // plaintext hash check will catch mismatches).
     let decompressed = match &pipeline.compression {
+        Some(CompressionStrategy::Uncompressed) => {
+            if plaintext_size == 0 {
+                Bytes::from(decrypted)
+            } else {
+                let size = plaintext_size as usize;
+                if size < decrypted.len() {
+                    Bytes::from(decrypted[..size].to_vec())
+                } else {
+                    Bytes::from(decrypted)
+                }
+            }
+        }
         Some(compression) => decompress_bytes_raw(&decrypted, compression, dictionary)?,
         None => {
             // No compression — truncate to plaintext_size to remove padding.
-            let size = plaintext_size as usize;
-            if size < decrypted.len() {
-                Bytes::from(decrypted[..size].to_vec())
-            } else {
+            if plaintext_size == 0 {
                 Bytes::from(decrypted)
+            } else {
+                let size = plaintext_size as usize;
+                if size < decrypted.len() {
+                    Bytes::from(decrypted[..size].to_vec())
+                } else {
+                    Bytes::from(decrypted)
+                }
             }
         }
     };
@@ -351,6 +419,7 @@ mod tests {
             KDF_META,
             Some(&keys),
             None,
+            false,
         )
         .unwrap();
 
@@ -394,6 +463,7 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             None, // D-chunk: no dictionary
+            false,
         )
         .unwrap();
 
@@ -421,6 +491,7 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             Some(dict_data.as_slice()), // use D-chunk as dictionary
+            false,
         )
         .unwrap();
 
@@ -446,6 +517,7 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             None,
+            false,
         )
         .unwrap();
         // Both should round to same padding block, but compressed size should differ.
@@ -473,8 +545,16 @@ mod tests {
         let hash: [u8; 32] = *blake3::hash(&data).as_bytes();
 
         // Encode as D-chunk (no dictionary).
-        let result =
-            pipeline_encode(&data, Some(&pipeline), &hash, KDF_LEAF, Some(&keys), None).unwrap();
+        let result = pipeline_encode(
+            &data,
+            Some(&pipeline),
+            &hash,
+            KDF_LEAF,
+            Some(&keys),
+            None,
+            false,
+        )
+        .unwrap();
 
         // Decode as D-chunk (no dictionary).
         let decoded = pipeline_decode(

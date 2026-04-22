@@ -416,9 +416,18 @@ pub struct NodeEntry {
     #[n(1)]
     pub semantic: Option<SemanticMeta>,
 
-    /// Read context for children when this is a link.
-    /// Contains keys, encryption, and compression info needed to
-    /// read the target node. Only set when overriding the parent context.
+    /// Pipeline override for this entry's content.
+    ///
+    /// For **Link** entries: read context for the target subtree (keys,
+    /// encryption, compression needed to traverse children).
+    ///
+    /// For **Leaf** entries: per-blob pipeline override when this entry
+    /// was processed differently from the inherited pipeline. For example,
+    /// when compression was skipped for an incompressible blob, this carries
+    /// `leaf.compression = Some(Uncompressed)` so the decoder knows to
+    /// skip decompression.
+    ///
+    /// Only set when overriding the parent context. `None` = inherit.
     #[n(2)]
     pub child_context: Option<Box<TraversalContext>>,
 
@@ -785,6 +794,18 @@ pub struct BuildContext {
     /// a file becomes a single `Leaf` or a `Link` to a chunk tree.
     #[n(1)]
     pub file_chunking: Option<FileChunkingStrategy>,
+
+    /// Skip compression when compressed size exceeds this percentage of plaintext.
+    ///
+    /// When set, blobs where `compressed_len * 100 / plaintext_len > threshold`
+    /// are stored uncompressed (with a per-entry `CompressionStrategy::Uncompressed`
+    /// override). This avoids wasting CPU on incompressible data (e.g. already-
+    /// compressed media, encrypted blobs) and prevents zstd inflation.
+    ///
+    /// Range: 0–100. Typical value: 95 (skip if compression saves < 5%).
+    /// `None` = always compress (no skip).
+    #[n(2)]
+    pub compression_skip_threshold: Option<u8>,
 }
 
 /// Encryption strategy for data storage.

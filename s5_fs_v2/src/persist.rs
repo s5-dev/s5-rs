@@ -252,6 +252,7 @@ impl Snapshot {
             KDF_META,
             self.context().keys.as_ref(),
             None, // nodes never use dictionary compression
+            false, // no compression skip for metadata nodes
         )?;
 
         // Compute what the CAS hash would be.

@@ -58,6 +58,10 @@ pub struct Snapshot {
     store: Arc<dyn BlobsRead>,
     /// On-wire context: keys and blob processing pipelines.
     ctx: TraversalContext,
+    /// When true, compression is skipped for blobs where the padded compressed
+    /// size is not smaller than the padded uncompressed size (i.e. compression
+    /// yields no storage savings after accounting for block padding).
+    skip_unhelpful_compression: bool,
     /// Decoded node cache — avoids repeated blob_download + decrypt +
     /// decompress + CBOR parse for the same prolly tree node. Shared
     /// across clones so concurrent `is_changed()` calls benefit.
@@ -87,6 +91,7 @@ impl Snapshot {
             root_plaintext_hash,
             store,
             ctx,
+            skip_unhelpful_compression: false,
             node_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -106,6 +111,7 @@ impl Snapshot {
             root_plaintext_hash: None,
             store,
             ctx,
+            skip_unhelpful_compression: false,
             node_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -119,8 +125,11 @@ impl Snapshot {
     ///
     /// Both leaf and node pipelines use Zstd compression, 4KiB padding,
     /// and DeterministicChaCha20 encryption with the given master secret.
+    /// Compression is automatically skipped for blobs where it yields no
+    /// storage savings after padding.
     pub fn empty_encrypted(store: Arc<dyn BlobsRead>, master_secret: [u8; 32]) -> Self {
         Self::empty(store, encrypted_context(master_secret))
+            .with_skip_unhelpful_compression(true)
     }
 
     /// Creates an empty, encrypted snapshot with separate leaf and node keys.
@@ -128,6 +137,8 @@ impl Snapshot {
     /// Both pipelines use Zstd compression, 4 KiB padding, and
     /// DeterministicChaCha20 encryption — but with independent keys so
     /// that metadata and content are cryptographically separated.
+    /// Compression is automatically skipped for blobs where it yields no
+    /// storage savings after padding.
     ///
     /// The caller is responsible for generating the keys securely
     /// (e.g. `rand::rngs::OsRng`).
@@ -137,6 +148,7 @@ impl Snapshot {
         node_key: [u8; 32],
     ) -> Self {
         Self::empty(store, encrypted_split_context(leaf_key, node_key))
+            .with_skip_unhelpful_compression(true)
     }
 
     /// Creates an encrypted snapshot with default pipelines.
@@ -194,6 +206,16 @@ impl Snapshot {
             .and_then(|keys| keys.get(&KEY_SLOT_MASTER))
     }
 
+    /// Enables skipping compression when unhelpful (builder style).
+    ///
+    /// When enabled, leaf blobs where padded compressed size >= padded
+    /// uncompressed size are stored uncompressed with a per-entry
+    /// `child_context` override.
+    pub fn with_skip_unhelpful_compression(mut self, skip: bool) -> Self {
+        self.skip_unhelpful_compression = skip;
+        self
+    }
+
     /// Returns the leaf blob pipeline.
     pub fn leaf_pipeline(&self) -> Option<&BlobPipeline> {
         self.ctx.leaf.as_ref()
@@ -231,6 +253,7 @@ impl Snapshot {
             root_plaintext_hash: content.plaintext_hash,
             store: self.store.clone(),
             ctx: child_ctx,
+            skip_unhelpful_compression: self.skip_unhelpful_compression,
             node_cache: self.node_cache.clone(),
         }
     }
@@ -342,6 +365,7 @@ impl Snapshot {
             KDF_META,
             self.ctx.keys.as_ref(),
             None, // nodes never use dictionary compression
+            false, // no compression skip for metadata nodes
         )?;
 
         let blob_id = store
@@ -495,6 +519,7 @@ impl Snapshot {
             KDF_LEAF,
             self.ctx.keys.as_ref(),
             dictionary,
+            self.skip_unhelpful_compression,
         )?;
 
         let blob_id = store
@@ -510,6 +535,23 @@ impl Snapshot {
             (None, None)
         };
 
+        // When compression was skipped, record a per-entry override so the
+        // decoder knows this blob is stored uncompressed despite the default
+        // pipeline specifying Zstd.
+        let child_context = if result.compression_skipped {
+            Some(Box::new(TraversalContext {
+                keys: None,
+                leaf: Some(BlobPipeline {
+                    compression: Some(CompressionStrategy::Uncompressed),
+                    padding: None,
+                    encryption: None,
+                }),
+                node: None,
+            }))
+        } else {
+            None
+        };
+
         Ok(NodeEntry {
             content: Some(ContentRef {
                 structural: Structural::Leaf,
@@ -519,7 +561,7 @@ impl Snapshot {
                 stored_blocks: blocks,
             }),
             semantic,
-            child_context: None,
+            child_context,
             tombstone: None,
         })
     }
@@ -603,6 +645,10 @@ impl Snapshot {
     ///
     /// `dictionary` is the decompressed D-chunk content for dictionary-based
     /// decompression (pass `None` for D-chunks or non-dict strategies).
+    ///
+    /// If the entry carries a `child_context` with a leaf pipeline override
+    /// (e.g. `Uncompressed` for blobs that skipped compression), that override
+    /// is merged into the snapshot's context before decoding.
     async fn export_leaf(
         &self,
         entry: &NodeEntry,
@@ -619,13 +665,19 @@ impl Snapshot {
             .await
             .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
 
+        // Merge per-entry leaf pipeline override (e.g. Uncompressed) if present.
+        let effective_ctx = match entry.child_context.as_ref() {
+            Some(child_tcx) => merge_contexts(&self.ctx, child_tcx),
+            None => self.ctx.clone(),
+        };
+
         let plaintext = context::pipeline_decode(
             ciphertext,
-            self.ctx.leaf.as_ref(),
+            effective_ctx.leaf.as_ref(),
             content.plaintext_hash.as_ref(),
             content.size,
             KDF_LEAF,
-            self.ctx.keys.as_ref(),
+            effective_ctx.keys.as_ref(),
             dictionary,
         )?;
 
@@ -686,9 +738,14 @@ impl Snapshot {
     }
 
     /// Recursively walk the snapshot tree, yielding `(path, NodeEntry)` for
-    /// every leaf entry (file content).
+    /// every user-visible entry (files, directories, symlinks).
     ///
-    /// Follows Links into subdirectories, skips tombstones.
+    /// Descends through Transparent roots and internal prolly tree levels,
+    /// yielding only leaf-level Namespace entries. ByteStream (chunked file)
+    /// trees are NOT descended — they are yielded as Link entries for the
+    /// consumer to handle via `export_bytes`.
+    ///
+    /// Tombstones are skipped.
     /// Paths are built by joining namespace segments with `/`.
     pub fn walk(&self) -> BoxStream<'_, anyhow::Result<(String, NodeEntry)>> {
         self.walk_inner(self.root, self.root_plaintext_hash, String::new())
@@ -718,6 +775,8 @@ impl Snapshot {
                         while let Some(item) = s.next().await {
                             yield item?;
                         }
+                    } else {
+                        // Transparent node without a link entry — skip.
                     }
                 }
                 NodeKind::Namespace => {
@@ -750,22 +809,11 @@ impl Snapshot {
                                 format!("{prefix}/{name}")
                             };
 
-                            if entry.is_link() {
-                                // Link entry — recurse into child snapshot.
-                                let content = entry.content.as_ref().expect("is_link implies content");
-                                let child = self.child(entry);
-                                let mut s = std::pin::pin!(child.walk_inner(
-                                    content.hash(),
-                                    content.plaintext_hash,
-                                    path,
-                                ));
-                                while let Some(item) = s.next().await {
-                                    yield item?;
-                                }
-                            } else {
-                                // Leaf entry or metadata-only entry (e.g. directory).
-                                yield (path, entry.clone());
-                            }
+                            // Leaf-level namespace entries are always yielded
+                            // (files, dirs, symlinks, chunked files). The consumer
+                            // calls `export_bytes` which handles Link→ByteStream
+                            // trees internally.
+                            yield (path, entry.clone());
                         }
                     }
                 }
@@ -853,6 +901,7 @@ impl Clone for Snapshot {
             root_plaintext_hash: self.root_plaintext_hash,
             store: self.store.clone(),
             ctx: self.ctx.clone(),
+            skip_unhelpful_compression: self.skip_unhelpful_compression,
             node_cache: self.node_cache.clone(),
         }
     }
@@ -920,25 +969,16 @@ impl ReadableLayer for Snapshot {
 // Context Construction
 // ---------------------------------------------------------------------------
 
-/// Default D-chunk mask: `plaintext_hash[0] & 0x07 == 0` ≈ 1 in 8 D-chunks.
-///
-/// With ~64KB average chunks, this means a D-chunk roughly every 512KB.
-/// Provides good dictionary locality while keeping overhead low.
-const DEFAULT_DICT_MASK: u8 = 0x07;
-
 /// Creates the default encrypted `TraversalContext`.
 ///
-/// Leaf pipeline uses Zstd dictionary compression (preceding-entry dictionary),
-/// node pipeline uses plain Zstd. Both use 1KiB padding and
-/// DeterministicChaCha20 encryption.
+/// Both leaf and node pipelines use plain Zstd compression, 1KiB padding,
+/// and DeterministicChaCha20 encryption.
 fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
     let mut keys = BTreeMap::new();
     keys.insert(KEY_SLOT_MASTER, master_secret);
 
     let leaf_pipeline = BlobPipeline {
-        compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry {
-            mask: DEFAULT_DICT_MASK,
-        }),
+        compression: Some(CompressionStrategy::Zstd), // plain Zstd, no dict
         padding: Some(PaddingStrategy {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
@@ -970,9 +1010,7 @@ fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalC
     keys.insert(KEY_SLOT_NODE, node_key);
 
     let leaf_pipeline = BlobPipeline {
-        compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry {
-            mask: DEFAULT_DICT_MASK,
-        }),
+        compression: Some(CompressionStrategy::Zstd),
         padding: Some(PaddingStrategy {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
@@ -1144,5 +1182,64 @@ mod tests {
         let restored = snap.export_bytes(&entry).await.unwrap();
         assert_eq!(restored.len(), data.len(), "restored length mismatch");
         assert_eq!(&restored[..], &data[..], "random-data round-trip mismatch");
+    }
+
+    /// Verify that incompressible data gets a child_context override (Uncompressed)
+    /// and round-trips correctly through import_bytes → export_bytes.
+    #[tokio::test]
+    async fn compression_skip_sets_child_context() {
+        let store = test_rw_store();
+        let master = [42u8; 32];
+        let snap = Snapshot::empty_encrypted(store.clone(), master);
+
+        // Random data that won't compress well.
+        let mut data = vec![0u8; 4096];
+        let mut state: u64 = 0xCAFEBABE;
+        for byte in data.iter_mut() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *byte = (state >> 33) as u8;
+        }
+
+        let entry = snap.import_bytes(&data, store.as_ref(), None, None).await.unwrap();
+
+        // Incompressible data should have a child_context override.
+        assert!(
+            entry.child_context.is_some(),
+            "expected child_context override for incompressible data"
+        );
+        let child_ctx = entry.child_context.as_ref().unwrap();
+        let leaf = child_ctx.leaf.as_ref().expect("expected leaf pipeline override");
+        assert_eq!(
+            leaf.compression,
+            Some(CompressionStrategy::Uncompressed),
+            "expected Uncompressed override"
+        );
+
+        // Round-trip: export should still produce the original data.
+        let restored = snap.export_bytes(&entry).await.unwrap();
+        assert_eq!(&restored[..], &data[..], "incompressible round-trip mismatch");
+    }
+
+    /// Verify that compressible data does NOT get a child_context override.
+    #[tokio::test]
+    async fn compression_skip_not_set_for_compressible() {
+        let store = test_rw_store();
+        let master = [42u8; 32];
+        let snap = Snapshot::empty_encrypted(store.clone(), master);
+
+        // Highly compressible data (all zeros).
+        let data = vec![0u8; 4096];
+
+        let entry = snap.import_bytes(&data, store.as_ref(), None, None).await.unwrap();
+
+        // Compressible data should NOT have a child_context override.
+        assert!(
+            entry.child_context.is_none(),
+            "expected no child_context for compressible data"
+        );
+
+        // Round-trip.
+        let restored = snap.export_bytes(&entry).await.unwrap();
+        assert_eq!(&restored[..], &data[..], "compressible round-trip mismatch");
     }
 }
