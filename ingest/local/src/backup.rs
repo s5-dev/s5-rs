@@ -550,18 +550,25 @@ async fn process_entry(
             return Ok(());
         }
 
-        // Regular file: read content, upload blob.
-        let content_opt = retry_io(path, "read", || tokio::fs::read(path)).await?;
-        let Some(content) = content_opt else {
+        // Regular file: stream content, chunk, upload blobs.
+        let semantic = build_semantic(path, &meta, FileType::Regular, config.backup);
+
+        let import_opt = retry_io(path, "import", || async {
+            let file = tokio::fs::File::open(path).await?;
+            let entry = prev_snapshot
+                .import_stream(file, blob_store, Some(semantic.clone()))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            
+            // Get the actual size imported (could differ slightly from meta if file changed)
+            let size = entry.content.as_ref().map(|c| c.size).unwrap_or(0);
+            Ok((entry, size))
+        }).await?;
+
+        let Some((node_entry, content_len)) = import_opt else {
             stats.files_errored.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
-        let content_len = content.len() as u64;
-
-        let semantic = build_semantic(path, &meta, FileType::Regular, config.backup);
-        let node_entry = prev_snapshot
-            .import_bytes(&content, blob_store, Some(semantic))
-            .await?;
 
         overlay.put(key, node_entry);
         stats.files_changed.fetch_add(1, Ordering::Relaxed);

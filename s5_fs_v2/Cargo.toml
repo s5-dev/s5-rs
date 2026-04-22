@@ -14,10 +14,12 @@ blake3.workspace = true
 bytes.workspace = true
 chacha20 = "0.10.0"
 futures.workspace = true
+gearhash = "0.1.3"
 minicbor.workspace = true
 s5_core.workspace = true
 serde.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1.18"
 zeroize.workspace = true
 zstd = "0.13"
 

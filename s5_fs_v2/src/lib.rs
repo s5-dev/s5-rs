@@ -23,3 +23,4 @@ pub(crate) mod context;
 pub mod merge;
 pub mod persist;
 pub mod snapshot;
+pub mod chunking;

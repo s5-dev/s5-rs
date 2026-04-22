@@ -322,6 +322,88 @@ impl Snapshot {
     // File Import
     // =====================================================================
 
+    /// Reads an async stream, applies CDC chunking for large streams, and uploads blobs.
+    ///
+    /// If the total stream is under 64KiB, it is uploaded as a single `Leaf`.
+    /// Otherwise, it is chunked using Content-Defined Chunking (CDC) into
+    /// a series of blobs, and a `ByteStream` prolly tree is created and
+    /// uploaded to `store`.
+    ///
+    /// Returns a `NodeEntry` pointing either to the single leaf blob or the
+    /// root of the `ByteStream` chunk tree.
+    pub async fn import_stream<R: tokio::io::AsyncRead + std::marker::Unpin>(
+        &self,
+        mut stream: R,
+        store: &dyn BlobsWrite,
+        semantic: Option<SemanticMeta>,
+    ) -> anyhow::Result<NodeEntry> {
+        let mut chunker = crate::chunking::XetChunker::new(stream);
+
+        // Peek first chunk to see if the file is tiny.
+        let first_chunk = match chunker.next_chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                // Empty file
+                return self.import_bytes(&[], store, semantic).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("cdc error: {e}")),
+        };
+
+        let second_chunk = chunker.next_chunk().await.map_err(|e| anyhow::anyhow!("cdc error: {e}"))?;
+
+        if second_chunk.is_none() {
+            // It's a single chunk! Just upload it as a Leaf.
+            return self.import_bytes(&first_chunk, store, semantic).await;
+        }
+
+        // It's a multi-chunk file! We need to collect the chunk entries.
+        let mut all_chunks = vec![first_chunk];
+        if let Some(c) = second_chunk {
+            all_chunks.push(c);
+        }
+
+        while let Some(chunk) = chunker.next_chunk().await.map_err(|e| anyhow::anyhow!("cdc error: {e}"))? {
+            all_chunks.push(chunk);
+        }
+
+        let mut entries = Vec::with_capacity(all_chunks.len());
+        let mut offset: u64 = 0;
+        let mut total_size: u64 = 0;
+
+        for chunk in all_chunks {
+            let chunk_entry = self.import_bytes(&chunk, store, None).await?;
+            // Pad the byte offset to ensure correct string-based sorting.
+            let key = format!("{:016x}", offset);
+            entries.push((key, chunk_entry));
+            offset += chunk.len() as u64;
+            total_size += chunk.len() as u64;
+        }
+
+        // We build a `NodeKind::ByteStream` tree from the chunks.
+        // We use a default mask of 0x3F (64 entries per node on average).
+        let mask = 0x3F;
+        let leaf_nodes = crate::persist::chunk_entries(&entries, mask, &crate::node::NodeKind::ByteStream, 0);
+
+        let mut stats = crate::persist::MergeStats::default();
+        let (root_hash, root_plaintext_hash) = self
+            .build_tree_dedup(leaf_nodes, store, &crate::node::NodeKind::ByteStream, &mut stats)
+            .await?;
+
+        // The returned NodeEntry points to the root of the ByteStream tree.
+        Ok(NodeEntry {
+            content: Some(ContentRef {
+                structural: Structural::Link,
+                hash: *root_hash.as_bytes(),
+                size: total_size,
+                plaintext_hash: Some(root_plaintext_hash),
+                stored_blocks: None, // Omit for Link, or we could aggregate from stats
+            }),
+            semantic,
+            child_context: None,
+            tombstone: None,
+        })
+    }
+
     /// Import in-memory bytes into the blob store as a leaf entry.
     ///
     /// Pipeline: hash plaintext → compress → pad → encrypt → upload → NodeEntry
@@ -377,47 +459,107 @@ impl Snapshot {
 
     /// Download, decrypt, decompress, and verify a leaf entry's content.
     ///
-    /// Returns the original plaintext bytes.
-    pub async fn export_bytes(&self, entry: &NodeEntry) -> anyhow::Result<Bytes> {
-        let content = entry
-            .content
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("cannot export tombstone entry"))?;
+    /// For chunked files (`Structural::Link`), this recursively fetches all
+    /// chunks and concatenates them into a single contiguous `Bytes`.
+    /// For very large files, a streaming export should be used instead.
+    pub fn export_bytes<'a>(&'a self, entry: &'a NodeEntry) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Bytes>> + Send + 'a>> {
+        Box::pin(async move {
+            let content = entry
+                .content
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("cannot export tombstone entry"))?;
 
-        let ciphertext = self
-            .store
-            .blob_download(content.hash())
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
+            if content.structural == Structural::Link {
+                // It's a chunk tree. Load the node.
+                let node = self.load(content.hash(), content.plaintext_hash.as_ref()).await?;
+                if node.header.kind != NodeKind::ByteStream {
+                    anyhow::bail!("cannot export structural link of kind {:?}", node.header.kind);
+                }
 
-        let plaintext = context::pipeline_decode(
-            ciphertext,
-            self.ctx.leaf.as_ref(),
-            content.plaintext_hash.as_ref(),
-            content.size,
-            KDF_LEAF,
-            self.ctx.keys.as_ref(),
-        )?;
-
-        // Verify plaintext hash if available.
-        if let Some(expected_hash) = &content.plaintext_hash {
-            let actual_hash = blake3::hash(&plaintext);
-            if actual_hash.as_bytes() != expected_hash {
-                anyhow::bail!(
-                    "plaintext hash mismatch for blob {}: expected {}, got {}",
-                    content.hash(),
-                    Hash::from(*expected_hash),
-                    actual_hash,
-                );
+                let child_snap = self.child(entry);
+                use futures::StreamExt;
+                let mut stream = child_snap.walk_byte_stream(content.hash(), content.plaintext_hash);
+                
+                let mut all_bytes = bytes::BytesMut::with_capacity(content.size as usize);
+                while let Some(res) = stream.next().await {
+                    let chunk_entry = res?;
+                    let chunk_bytes = child_snap.export_bytes(&chunk_entry).await?;
+                    all_bytes.extend_from_slice(&chunk_bytes);
+                }
+                return Ok(all_bytes.freeze());
             }
-        }
 
-        Ok(plaintext)
+            let ciphertext = self
+                .store
+                .blob_download(content.hash())
+                .await
+                .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
+
+            let plaintext = context::pipeline_decode(
+                ciphertext,
+                self.ctx.leaf.as_ref(),
+                content.plaintext_hash.as_ref(),
+                content.size,
+                KDF_LEAF,
+                self.ctx.keys.as_ref(),
+            )?;
+
+            // Verify plaintext hash if available.
+            if let Some(expected_hash) = &content.plaintext_hash {
+                let actual_hash = blake3::hash(&plaintext);
+                if actual_hash.as_bytes() != expected_hash {
+                    anyhow::bail!(
+                        "plaintext hash mismatch for blob {}: expected {}, got {}",
+                        content.hash(),
+                        Hash::from(*expected_hash),
+                        actual_hash,
+                    );
+                }
+            }
+
+            Ok(plaintext)
+        })
     }
 
     // =====================================================================
     // Recursive Walk
     // =====================================================================
+
+    fn walk_byte_stream<'a>(
+        &'a self,
+        hash: Hash,
+        plaintext_hash: Option<[u8; 32]>,
+    ) -> BoxStream<'a, anyhow::Result<NodeEntry>> {
+        Box::pin(async_stream::try_stream! {
+            let node = self.load(hash, plaintext_hash.as_ref()).await?;
+            if node.header.kind != NodeKind::ByteStream {
+                Err(anyhow::anyhow!("expected ByteStream node, found {:?}", node.header.kind))?;
+            }
+
+            if node.header.level > 0 {
+                // Internal node
+                for entry in node.entries.values() {
+                    if entry.is_link() {
+                        let content = entry.content.as_ref().unwrap();
+                        let child = self.child(entry);
+                        let mut s = std::pin::pin!(child.walk_byte_stream(
+                            content.hash(),
+                            content.plaintext_hash,
+                        ));
+                        while let Some(item) = s.next().await {
+                            let chunk_entry = item?;
+                            yield chunk_entry;
+                        }
+                    }
+                }
+            } else {
+                // Leaf node of chunks
+                for entry in node.entries.values() {
+                    yield entry.clone();
+                }
+            }
+        })
+    }
 
     /// Recursively walk the snapshot tree, yielding `(path, NodeEntry)` for
     /// every leaf entry (file content).

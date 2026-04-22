@@ -283,7 +283,7 @@ impl Snapshot {
     /// 1. Upload all nodes at the current level (skipping existing)
     /// 2. If only one node remains, it's the root — return its hash
     /// 3. Otherwise, create internal nodes pointing to them and recurse
-    async fn build_tree_dedup(
+    pub(crate) async fn build_tree_dedup(
         &self,
         nodes: Vec<Node>,
         store: &dyn BlobsWrite,
@@ -360,7 +360,7 @@ impl Snapshot {
 ///
 /// Boundary condition: `blake3(key)[0..4] as u32 & mask == 0`.
 /// Minimum node size is enforced to prevent degenerate single-entry nodes.
-fn chunk_entries(
+pub(crate) fn chunk_entries(
     entries: &[(String, NodeEntry)],
     mask: u32,
     kind: &NodeKind,
