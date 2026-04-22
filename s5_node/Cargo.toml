@@ -37,6 +37,7 @@ s5_store_local_links = { path = "../blob_stores/local_links" }
 s5_store_memory.workspace = true
 s5_store_s3.workspace = true
 s5_store_sia.workspace = true
+s5_store_fjall.workspace = true
 # s5_store_pixeldrain.workspace = true  # TODO: add to workspace
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"

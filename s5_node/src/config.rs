@@ -62,6 +62,17 @@ pub enum NodeConfigStore {
     Memory,
     /// Local links store (references files by hash without copying.)
     LocalLinks(LocalLinksStoreConfig),
+    /// Fjall LSM-tree blob store (packs small blobs into large SSTs).
+    Fjall(FjallStoreConfig),
+}
+
+/// Configuration for a fjall blob store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FjallStoreConfig {
+    /// Path to the fjall database directory.
+    pub path: String,
+    /// Block cache size in MiB (default: 256).
+    pub cache_mib: Option<u32>,
 }
 
 /// Configuration for a local links store.

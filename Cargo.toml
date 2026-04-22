@@ -17,6 +17,7 @@ members = [
   "blob_stores/memory",
   "blob_stores/s3",
   "blob_stores/sia",
+  "blob_stores/fjall",
   # Registries
   "registries/redb",
   "registries/store",
@@ -68,6 +69,7 @@ s5_store_local = { path = "blob_stores/local", version = "1.0.0-beta.1" }
 s5_store_memory = { path = "blob_stores/memory", version = "1.0.0-beta.1" }
 s5_store_s3 = { path = "blob_stores/s3", version = "1.0.0-beta.1" }
 s5_store_sia = { path = "blob_stores/sia", version = "1.0.0-beta.1" }
+s5_store_fjall = { path = "blob_stores/fjall", version = "1.0.0-beta.1" }
 s5_client = { path = "bindings/s5_client", version = "1.0.0-beta.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"

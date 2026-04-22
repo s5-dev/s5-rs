@@ -30,6 +30,7 @@ use s5_store_memory::MemoryStore;
 // use s5_store_pixeldrain::PixeldrainStore;  // TODO: add to workspace
 use s5_node_api::ALPN as S5_NODE_ALPN;
 use s5_node_api::connect::{ServiceLock, lock_path, remove_lock, write_lock};
+use s5_store_fjall::FjallStore;
 use s5_store_s3::S3Store;
 use s5_store_sia::SiaStore;
 use std::{collections::BTreeMap, collections::HashMap, path::Path, str::FromStr, sync::Arc};
@@ -112,8 +113,23 @@ impl S5Node {
         _config_dir: Option<&Path>,
         s5_server: Option<s5_server::S5NodeServer>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_stores(config, registry, endpoint, s5_server, None).await
+    }
+
+    /// Like `new_with_endpoint_and_config_dir` but accepts pre-built stores.
+    ///
+    /// When `pre_built_stores` is `Some`, those stores are used directly
+    /// instead of re-opening from config. This avoids double-opening stores
+    /// that use exclusive locks (e.g. fjall).
+    pub async fn new_with_stores(
+        config: S5NodeConfig,
+        registry: Option<Arc<dyn RegistryApi + Send + Sync>>,
+        endpoint: Endpoint,
+        s5_server: Option<s5_server::S5NodeServer>,
+        pre_built_stores: Option<HashMap<String, BlobStore>>,
+    ) -> anyhow::Result<Self> {
         // Build stores from config, separating full stores from link stores
-        let mut stores: HashMap<String, BlobStore> = HashMap::new();
+        let mut stores: HashMap<String, BlobStore> = pre_built_stores.unwrap_or_default();
         let mut link_stores: HashMap<String, Arc<LocalLinksStore>> = HashMap::new();
 
         for (name, store_config) in &config.store {
@@ -124,8 +140,11 @@ impl S5Node {
                     link_stores.insert(name.clone(), Arc::new(store));
                 }
                 other => {
-                    let store = create_store(other.clone()).await?;
-                    stores.insert(name.clone(), store);
+                    // Skip if already pre-built
+                    if !stores.contains_key(name) {
+                        let store = create_store(other.clone()).await?;
+                        stores.insert(name.clone(), store);
+                    }
                 }
             }
         }
@@ -205,6 +224,10 @@ pub async fn create_raw_store(
         NodeConfigStore::S3(config) => Box::new(S3Store::create(config)),
         // NodeConfigStore::Pixeldrain(config) => Box::new(PixeldrainStore::create(config)),  // TODO
         NodeConfigStore::Memory => Box::new(MemoryStore::new()),
+        NodeConfigStore::Fjall(config) => {
+            let cache_bytes = config.cache_mib.unwrap_or(256) as u64 * 1024 * 1024;
+            Box::new(FjallStore::open_with_cache(&config.path, cache_bytes)?)
+        }
         NodeConfigStore::LocalLinks(_) => {
             return Err(anyhow::anyhow!(
                 "LocalLinks stores should be accessed via S5Node.link_stores"
@@ -411,12 +434,12 @@ pub async fn run_node(
         shutdown_tx,
     );
 
-    let node = S5Node::new_with_endpoint_and_config_dir(
+    let node = S5Node::new_with_stores(
         config.read().await.clone(),
         registry,
         endpoint,
-        config_dir,
         Some(server),
+        Some(stores.clone()),
     )
     .await?;
 
