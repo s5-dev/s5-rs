@@ -135,8 +135,12 @@ pub enum ProgressType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ProgressState {
-    /// Human-readable label (e.g., "bytes", "files_added", "files_skipped").
+    /// Machine-readable key (e.g., "bytes", "files_added", "files_skipped").
     pub label: String,
+    /// Human-readable display label (e.g., "bytes uploaded", "files added").
+    /// Falls back to `label` if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     /// Whether this metric is in bytes or a plain count.
     #[serde(rename = "type")]
     pub progress_type: ProgressType,
@@ -152,6 +156,7 @@ impl ProgressState {
     pub fn new(label: String, progress_type: ProgressType, total: Option<u64>) -> Self {
         Self {
             label,
+            display_label: None,
             progress_type,
             total,
             progress: 0,
@@ -164,6 +169,16 @@ impl ProgressState {
         if let Some(total) = self.total {
             self.complete = self.progress >= total;
         }
+    }
+
+    /// Set a human-readable display label.
+    pub fn set_display_label(&mut self, display_label: &str) {
+        self.display_label = Some(display_label.into());
+    }
+
+    /// Return the display label, falling back to the key label.
+    pub fn display_label(&self) -> &str {
+        self.display_label.as_deref().unwrap_or(&self.label)
     }
 }
 
@@ -180,6 +195,7 @@ impl TaskProgressMap {
     pub fn bytes(&mut self, label: &str, progress: u64, total: Option<u64>) -> &mut ProgressState {
         self.0.push(ProgressState {
             label: label.into(),
+            display_label: None,
             progress_type: ProgressType::Bytes,
             total,
             progress,
@@ -192,6 +208,7 @@ impl TaskProgressMap {
     pub fn count(&mut self, label: &str, progress: u64, total: Option<u64>) -> &mut ProgressState {
         self.0.push(ProgressState {
             label: label.into(),
+            display_label: None,
             progress_type: ProgressType::Count,
             total,
             progress,

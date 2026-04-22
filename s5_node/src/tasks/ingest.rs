@@ -124,10 +124,10 @@ pub async fn run_ingest(
     // -- Initialize progress (shared across all sources) --
     {
         let mut states = TaskProgressMap::new();
-        states.bytes("bytes", 0, None);
-        states.count("files_added", 0, None);
-        states.count("files_skipped", 0, None);
-        states.count("files_errored", 0, None);
+        states.bytes("bytes", 0, None).set_display_label("uploaded");
+        states.count("files_added", 0, None).set_display_label("files added");
+        states.count("files_skipped", 0, None).set_display_label("unchanged");
+        states.count("files_errored", 0, None).set_display_label("errors");
         reporter.init_progress(states);
     }
 

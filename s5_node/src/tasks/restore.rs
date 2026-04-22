@@ -120,8 +120,8 @@ pub async fn run_restore(
     // Initialize progress
     {
         let mut states = TaskProgressMap::new();
-        states.count("files_restored", 0, None);
-        states.bytes("bytes", 0, None);
+        states.count("files_restored", 0, None).set_display_label("files restored");
+        states.bytes("bytes", 0, None).set_display_label("written");
         reporter.init_progress(states);
     }
 
@@ -296,8 +296,8 @@ pub async fn run_remote_restore(
     // Initialize progress
     {
         let mut states = TaskProgressMap::new();
-        states.count("files_restored", 0, None);
-        states.bytes("bytes", 0, None);
+        states.count("files_restored", 0, None).set_display_label("files restored");
+        states.bytes("bytes", 0, None).set_display_label("written");
         reporter.init_progress(states);
     }
 

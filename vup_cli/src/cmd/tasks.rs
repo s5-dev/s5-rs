@@ -2,9 +2,10 @@
 //!
 //! Each command receives an already-connected `S5NodeClient` from `ensure_node_running()`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use indicatif::HumanDuration;
 use s5_node_api::config::TaskSpec;
 use s5_node_api::{S5NodeClient, TaskProgressMap, TaskState};
 use tokio_util::sync::CancellationToken;
@@ -227,6 +228,8 @@ pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
 /// Uses a streaming RPC to receive status updates as they happen,
 /// avoiding tight polling loops.
 async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
+    let started = Instant::now();
+
     // Create a spinner for initial state
     let pb = new_progress_bar();
     pb.set_message("starting…");
@@ -286,10 +289,15 @@ async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
                         }
                     }
                     TaskState::Completed => {
-                        if let Some(ref progress) = resp.progress {
-                            update_progress_bar(&pb, progress);
+                        let elapsed = HumanDuration(started.elapsed());
+                        let summary = resp.progress.as_ref()
+                            .map(format_one_line)
+                            .unwrap_or_default();
+                        if summary.is_empty() {
+                            pb.finish_with_message(format!("✓ done ({elapsed})"));
+                        } else {
+                            pb.finish_with_message(format!("✓ {summary} ({elapsed})"));
                         }
-                        pb.finish_with_message(format!("✓ task {} completed", task_id));
                         return Ok(());
                     }
                     TaskState::Failed { error } => {
