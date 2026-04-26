@@ -99,10 +99,8 @@ impl Store for FjallStore {
     async fn exists(&self, path: &str) -> StoreResult<bool> {
         let blobs = self.blobs.clone();
         let path = path.to_string();
-        tokio::task::spawn_blocking(move || {
-            blobs.contains_key(path.as_bytes()).map_err(Into::into)
-        })
-        .await?
+        tokio::task::spawn_blocking(move || blobs.contains_key(path.as_bytes()).map_err(Into::into))
+            .await?
     }
 
     async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
@@ -186,9 +184,7 @@ impl Store for FjallStore {
         let keys: Vec<String> = tokio::task::spawn_blocking(move || {
             let mut keys = Vec::new();
             for entry in blobs.iter() {
-                let key = entry
-                    .key()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let key = entry.key().map_err(|e| io::Error::other(e.to_string()))?;
                 keys.push(String::from_utf8_lossy(&key).into_owned());
             }
             StoreResult::Ok(keys)
@@ -394,7 +390,10 @@ mod tests {
         assert_eq!(read, large);
 
         // Partial read of large value
-        let partial = store.open_read_bytes("large-blob", 4096, Some(1024)).await.unwrap();
+        let partial = store
+            .open_read_bytes("large-blob", 4096, Some(1024))
+            .await
+            .unwrap();
         assert_eq!(partial.len(), 1024);
         assert!(partial.iter().all(|&b| b == 42));
     }

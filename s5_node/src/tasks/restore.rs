@@ -28,7 +28,10 @@ use super::TaskReporter;
 
 use super::publish::{age_decrypt_with_secret_key, recovery_signing_key};
 use super::vault_persist::{load_vault_root, node_to_snapshot_parts, vault_root_path};
-use super::{TaskExecutorContext, resolve_store, resolve_vault, resolve_vault_key_info, vault_meta_store_path};
+use super::{
+    TaskExecutorContext, resolve_store, resolve_vault, resolve_vault_key_info,
+    vault_meta_store_path,
+};
 
 /// Run a restore task.
 ///
@@ -54,15 +57,14 @@ pub async fn run_restore(
 
     // -- Load vault root from Transparent Node --
     let current_path = vault_root_path(&vault.root_path);
-    let (root, root_plaintext_hash, context) =
-        load_vault_root(&current_path, &identity_files)
-            .context("reading vault root")?
-            .ok_or_else(|| {
-                anyhow!(
-                    "vault '{}' has no snapshot to restore (root file not found)",
-                    vault_name
-                )
-            })?;
+    let (root, root_plaintext_hash, context) = load_vault_root(&current_path, &identity_files)
+        .context("reading vault root")?
+        .ok_or_else(|| {
+            anyhow!(
+                "vault '{}' has no snapshot to restore (root file not found)",
+                vault_name
+            )
+        })?;
 
     tracing::info!(
         vault = vault_name,
@@ -122,7 +124,9 @@ pub async fn run_restore(
     // Initialize progress
     {
         let mut states = TaskProgressMap::new();
-        states.count("files_restored", 0, None).set_display_label("files restored");
+        states
+            .count("files_restored", 0, None)
+            .set_display_label("files restored");
         states.bytes("bytes", 0, None).set_display_label("written");
         reporter.init_progress(states);
     }
@@ -298,7 +302,9 @@ pub async fn run_remote_restore(
     // Initialize progress
     {
         let mut states = TaskProgressMap::new();
-        states.count("files_restored", 0, None).set_display_label("files restored");
+        states
+            .count("files_restored", 0, None)
+            .set_display_label("files restored");
         states.bytes("bytes", 0, None).set_display_label("written");
         reporter.init_progress(states);
     }

@@ -251,7 +251,7 @@ impl Snapshot {
             &plaintext_hash,
             KDF_META,
             self.context().keys.as_ref(),
-            None, // nodes never use dictionary compression
+            None,  // nodes never use dictionary compression
             false, // no compression skip for metadata nodes
         )?;
 

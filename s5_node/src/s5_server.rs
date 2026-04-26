@@ -309,8 +309,7 @@ impl S5NodeServer {
                 .and_then(|k| k.identity_file.clone())
                 .into_iter()
                 .collect();
-            if let Ok(Some(node)) =
-                crate::tasks::vault_persist::load_node(&root_path, &id_files)
+            if let Ok(Some(node)) = crate::tasks::vault_persist::load_node(&root_path, &id_files)
                 && let Some(entry) = node.transparent_entry()
                 && let Some(ref content) = entry.content
             {

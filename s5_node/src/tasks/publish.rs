@@ -27,10 +27,12 @@ use s5_core::{BlobsRead, BlobsWrite, Hash, RegistryApi, StreamKey, StreamMessage
 use s5_fs_v2::node::{ContentRef, Node, NodeEntry, Structural};
 
 use super::vault_persist::{
-    age_encrypt_for_recipients, age_decrypt_with_identity_files,
-    load_vault_root_cbor, vault_root_path,
+    age_decrypt_with_identity_files, age_encrypt_for_recipients, load_vault_root_cbor,
+    vault_root_path,
 };
-use super::{TaskExecutorContext, resolve_key, resolve_store, resolve_vault, resolve_vault_key_info};
+use super::{
+    TaskExecutorContext, resolve_key, resolve_store, resolve_vault, resolve_vault_key_info,
+};
 
 /// Derive the Ed25519 signing key for a vault's snapshot publishing.
 ///

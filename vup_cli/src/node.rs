@@ -78,7 +78,9 @@ pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 } else {
-                    tracing::warn!("no PID in lock file and shutdown RPC failed — old daemon may still be running");
+                    tracing::warn!(
+                        "no PID in lock file and shutdown RPC failed — old daemon may still be running"
+                    );
                 }
             }
 

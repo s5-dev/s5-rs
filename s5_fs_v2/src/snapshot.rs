@@ -128,8 +128,7 @@ impl Snapshot {
     /// Compression is automatically skipped for blobs where it yields no
     /// storage savings after padding.
     pub fn empty_encrypted(store: Arc<dyn BlobsRead>, master_secret: [u8; 32]) -> Self {
-        Self::empty(store, encrypted_context(master_secret))
-            .with_skip_unhelpful_compression(true)
+        Self::empty(store, encrypted_context(master_secret)).with_skip_unhelpful_compression(true)
     }
 
     /// Creates an empty, encrypted snapshot with separate leaf and node keys.
@@ -364,7 +363,7 @@ impl Snapshot {
             &plaintext_hash,
             KDF_META,
             self.ctx.keys.as_ref(),
-            None, // nodes never use dictionary compression
+            None,  // nodes never use dictionary compression
             false, // no compression skip for metadata nodes
         )?;
 
@@ -407,7 +406,10 @@ impl Snapshot {
             Err(e) => return Err(anyhow::anyhow!("cdc error: {e}")),
         };
 
-        let second_chunk = chunker.next_chunk().await.map_err(|e| anyhow::anyhow!("cdc error: {e}"))?;
+        let second_chunk = chunker
+            .next_chunk()
+            .await
+            .map_err(|e| anyhow::anyhow!("cdc error: {e}"))?;
 
         if second_chunk.is_none() {
             // Single-chunk file — no dictionary needed (always a D-chunk).
@@ -420,19 +422,19 @@ impl Snapshot {
             all_chunks.push(c);
         }
 
-        while let Some(chunk) = chunker.next_chunk().await.map_err(|e| anyhow::anyhow!("cdc error: {e}"))? {
+        while let Some(chunk) = chunker
+            .next_chunk()
+            .await
+            .map_err(|e| anyhow::anyhow!("cdc error: {e}"))?
+        {
             all_chunks.push(chunk);
         }
 
         // Extract D-chunk mask from the leaf compression strategy.
-        let dict_mask = self
-            .ctx
-            .leaf
-            .as_ref()
-            .and_then(|p| match &p.compression {
-                Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => Some(*mask),
-                _ => None,
-            });
+        let dict_mask = self.ctx.leaf.as_ref().and_then(|p| match &p.compression {
+            Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => Some(*mask),
+            _ => None,
+        });
 
         let mut entries = Vec::with_capacity(all_chunks.len());
         let mut offset: u64 = 0;
@@ -473,11 +475,17 @@ impl Snapshot {
         // We build a `NodeKind::ByteStream` tree from the chunks.
         // We use a default mask of 0x3F (64 entries per node on average).
         let mask = 0x3F;
-        let leaf_nodes = crate::persist::chunk_entries(&entries, mask, &crate::node::NodeKind::ByteStream, 0);
+        let leaf_nodes =
+            crate::persist::chunk_entries(&entries, mask, &crate::node::NodeKind::ByteStream, 0);
 
         let mut stats = crate::persist::MergeStats::default();
         let (root_hash, root_plaintext_hash) = self
-            .build_tree_dedup(leaf_nodes, store, &crate::node::NodeKind::ByteStream, &mut stats)
+            .build_tree_dedup(
+                leaf_nodes,
+                store,
+                &crate::node::NodeKind::ByteStream,
+                &mut stats,
+            )
             .await?;
 
         // The returned NodeEntry points to the root of the ByteStream tree.
@@ -575,7 +583,11 @@ impl Snapshot {
     /// For chunked files (`Structural::Link`), this recursively fetches all
     /// chunks and concatenates them into a single contiguous `Bytes`.
     /// For very large files, a streaming export should be used instead.
-    pub fn export_bytes<'a>(&'a self, entry: &'a NodeEntry) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Bytes>> + Send + 'a>> {
+    pub fn export_bytes<'a>(
+        &'a self,
+        entry: &'a NodeEntry,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Bytes>> + Send + 'a>>
+    {
         Box::pin(async move {
             let content = entry
                 .content
@@ -584,9 +596,14 @@ impl Snapshot {
 
             if content.structural == Structural::Link {
                 // It's a chunk tree. Load the node.
-                let node = self.load(content.hash(), content.plaintext_hash.as_ref()).await?;
+                let node = self
+                    .load(content.hash(), content.plaintext_hash.as_ref())
+                    .await?;
                 if node.header.kind != NodeKind::ByteStream {
-                    anyhow::bail!("cannot export structural link of kind {:?}", node.header.kind);
+                    anyhow::bail!(
+                        "cannot export structural link of kind {:?}",
+                        node.header.kind
+                    );
                 }
 
                 let child_snap = self.child(entry);
@@ -597,13 +614,16 @@ impl Snapshot {
                     .leaf
                     .as_ref()
                     .and_then(|p| match &p.compression {
-                        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => Some(*mask),
+                        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => {
+                            Some(*mask)
+                        }
                         _ => None,
                     });
 
                 use futures::StreamExt;
-                let mut stream = child_snap.walk_byte_stream(content.hash(), content.plaintext_hash);
-                
+                let mut stream =
+                    child_snap.walk_byte_stream(content.hash(), content.plaintext_hash);
+
                 let mut all_bytes = bytes::BytesMut::with_capacity(content.size as usize);
                 let mut dict_content: Option<Vec<u8>> = None;
                 let mut chunk_index: usize = 0;
@@ -612,7 +632,13 @@ impl Snapshot {
                     let chunk_entry = res?;
 
                     // Determine if this chunk is a D-chunk.
-                    let is_d_chunk = match (dict_mask, chunk_entry.content.as_ref().and_then(|c| c.plaintext_hash.as_ref())) {
+                    let is_d_chunk = match (
+                        dict_mask,
+                        chunk_entry
+                            .content
+                            .as_ref()
+                            .and_then(|c| c.plaintext_hash.as_ref()),
+                    ) {
                         (Some(mask), Some(ph)) => chunk_index == 0 || (ph[0] & mask) == 0,
                         _ => true, // no dict compression or no plaintext_hash → treat as independent
                     };
@@ -1124,7 +1150,10 @@ mod tests {
         let data = b"hello world! ".repeat(80);
         let reader = tokio::io::BufReader::new(&data[..]);
 
-        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+        let entry = snap
+            .import_stream(reader, store.as_ref(), None)
+            .await
+            .unwrap();
 
         // Should be a Leaf (single chunk, not a Link tree)
         let content = entry.content.as_ref().unwrap();
@@ -1146,11 +1175,18 @@ mod tests {
         let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
         let reader = tokio::io::BufReader::new(&data[..]);
 
-        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+        let entry = snap
+            .import_stream(reader, store.as_ref(), None)
+            .await
+            .unwrap();
 
         // Should be a Link (multi-chunk ByteStream tree)
         let content = entry.content.as_ref().unwrap();
-        assert_eq!(content.structural, Structural::Link, "expected multi-chunk Link");
+        assert_eq!(
+            content.structural,
+            Structural::Link,
+            "expected multi-chunk Link"
+        );
         assert_eq!(content.size, data.len() as u64);
 
         let restored = snap.export_bytes(&entry).await.unwrap();
@@ -1175,7 +1211,10 @@ mod tests {
         }
         let reader = tokio::io::BufReader::new(&data[..]);
 
-        let entry = snap.import_stream(reader, store.as_ref(), None).await.unwrap();
+        let entry = snap
+            .import_stream(reader, store.as_ref(), None)
+            .await
+            .unwrap();
         let content = entry.content.as_ref().unwrap();
         assert_eq!(content.size, data.len() as u64);
 
@@ -1200,7 +1239,10 @@ mod tests {
             *byte = (state >> 33) as u8;
         }
 
-        let entry = snap.import_bytes(&data, store.as_ref(), None, None).await.unwrap();
+        let entry = snap
+            .import_bytes(&data, store.as_ref(), None, None)
+            .await
+            .unwrap();
 
         // Incompressible data should have a child_context override.
         assert!(
@@ -1208,7 +1250,10 @@ mod tests {
             "expected child_context override for incompressible data"
         );
         let child_ctx = entry.child_context.as_ref().unwrap();
-        let leaf = child_ctx.leaf.as_ref().expect("expected leaf pipeline override");
+        let leaf = child_ctx
+            .leaf
+            .as_ref()
+            .expect("expected leaf pipeline override");
         assert_eq!(
             leaf.compression,
             Some(CompressionStrategy::Uncompressed),
@@ -1217,7 +1262,11 @@ mod tests {
 
         // Round-trip: export should still produce the original data.
         let restored = snap.export_bytes(&entry).await.unwrap();
-        assert_eq!(&restored[..], &data[..], "incompressible round-trip mismatch");
+        assert_eq!(
+            &restored[..],
+            &data[..],
+            "incompressible round-trip mismatch"
+        );
     }
 
     /// Verify that compressible data does NOT get a child_context override.
@@ -1230,7 +1279,10 @@ mod tests {
         // Highly compressible data (all zeros).
         let data = vec![0u8; 4096];
 
-        let entry = snap.import_bytes(&data, store.as_ref(), None, None).await.unwrap();
+        let entry = snap
+            .import_bytes(&data, store.as_ref(), None, None)
+            .await
+            .unwrap();
 
         // Compressible data should NOT have a child_context override.
         assert!(

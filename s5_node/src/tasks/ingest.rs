@@ -91,7 +91,11 @@ pub async fn run_ingest(
 
         let has_ip = inprogress_path.exists();
         let has_cur = current_path.exists();
-        tracing::debug!(inprogress_exists = has_ip, current_exists = has_cur, "resume check");
+        tracing::debug!(
+            inprogress_exists = has_ip,
+            current_exists = has_cur,
+            "resume check"
+        );
 
         // Load the previous vault root. We MUST propagate decrypt/parse errors
         // here: silently falling through to "no previous snapshot" would
@@ -99,12 +103,17 @@ pub async fn run_ingest(
         // destroying access to every existing blob. Only "file does not exist"
         // (i.e. `Ok(None)`) is a legitimate reason to start fresh.
         let vault_root = if has_ip {
-            load_vault_root(&inprogress_path, &identity_files)
-                .with_context(|| format!("loading inprogress vault root at {}", inprogress_path.display()))?
+            load_vault_root(&inprogress_path, &identity_files).with_context(|| {
+                format!(
+                    "loading inprogress vault root at {}",
+                    inprogress_path.display()
+                )
+            })?
         } else if has_cur {
             tracing::debug!("no inprogress snapshot, trying current path");
-            load_vault_root(&current_path, &identity_files)
-                .with_context(|| format!("loading current vault root at {}", current_path.display()))?
+            load_vault_root(&current_path, &identity_files).with_context(|| {
+                format!("loading current vault root at {}", current_path.display())
+            })?
         } else {
             None
         };
@@ -137,9 +146,15 @@ pub async fn run_ingest(
     {
         let mut states = TaskProgressMap::new();
         states.bytes("bytes", 0, None).set_display_label("uploaded");
-        states.count("files_added", 0, None).set_display_label("files added");
-        states.count("files_skipped", 0, None).set_display_label("unchanged");
-        states.count("files_errored", 0, None).set_display_label("errors");
+        states
+            .count("files_added", 0, None)
+            .set_display_label("files added");
+        states
+            .count("files_skipped", 0, None)
+            .set_display_label("unchanged");
+        states
+            .count("files_errored", 0, None)
+            .set_display_label("errors");
         reporter.init_progress(states);
     }
 
@@ -268,9 +283,8 @@ pub async fn run_ingest(
         // keeps overwriting the terminal state via the shared reporter.
         reporter_handle.abort();
 
-        let result = result.with_context(|| {
-            format!("backup failed for source path {}", source_path.display())
-        })?;
+        let result = result
+            .with_context(|| format!("backup failed for source path {}", source_path.display()))?;
 
         let changed = stats
             .files_changed
@@ -310,7 +324,10 @@ pub async fn run_ingest(
             }
         });
 
-        let BackupResult { snapshot, was_cancelled: source_cancelled } = result;
+        let BackupResult {
+            snapshot,
+            was_cancelled: source_cancelled,
+        } = result;
         if source_cancelled {
             was_cancelled = true;
             tracing::info!("source {} was cancelled, stopping", source_path_str);
@@ -323,9 +340,7 @@ pub async fn run_ingest(
             if !current_snapshot.is_empty() && (source_cancelled || source.paths.len() > 1) {
                 let ip_path = inprogress_root_path(&vault.root_path);
                 std::fs::create_dir_all(&vault.root_path).ok();
-                if let Err(e) =
-                    save_vault_root(&ip_path, &current_snapshot, &recipients)
-                {
+                if let Err(e) = save_vault_root(&ip_path, &current_snapshot, &recipients) {
                     tracing::warn!(error = %e, "failed to save inprogress checkpoint");
                 }
             }
@@ -347,12 +362,8 @@ pub async fn run_ingest(
         std::fs::create_dir_all(&vault.root_path)
             .with_context(|| format!("creating vault root at {}", vault.root_path))?;
 
-        save_vault_root(
-            &current_path,
-            &current_snapshot,
-            &recipients,
-        )
-        .context("saving vault root")?;
+        save_vault_root(&current_path, &current_snapshot, &recipients)
+            .context("saving vault root")?;
 
         // Clean up any in-progress file
         remove_inprogress(&vault.root_path).ok();

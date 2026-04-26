@@ -41,7 +41,7 @@ impl<R: AsyncRead + std::marker::Unpin> XetChunker<R> {
                 return Ok(Some(chunk.freeze()));
             }
 
-            // 3. We didn't find a boundary. 
+            // 3. We didn't find a boundary.
             // If we hit EOF, emit whatever is left (it's guaranteed to be < MAX_CHUNK_SIZE
             // because find_boundary would have forced a cut at MAX_CHUNK_SIZE).
             if self.eof {
@@ -78,9 +78,9 @@ impl<R: AsyncRead + std::marker::Unpin> XetChunker<R> {
         // We can safely skip the first (MIN_CHUNK_SIZE - 64) bytes without hashing.
         // We initialize the hash with the 64 bytes right before MIN_CHUNK_SIZE.
         let skip_len = MIN_CHUNK_SIZE.saturating_sub(64);
-        
+
         let mut i = skip_len;
-        
+
         // Ensure we prime the hash up to MIN_CHUNK_SIZE or EOF length
         let prime_end = std::cmp::min(MIN_CHUNK_SIZE.saturating_sub(1), len);
         while i < prime_end {
@@ -93,7 +93,7 @@ impl<R: AsyncRead + std::marker::Unpin> XetChunker<R> {
         while i < len {
             let b = self.buffer[i];
             self.hash = (self.hash << 1).wrapping_add(gearhash::DEFAULT_TABLE[b as usize]);
-            
+
             let size = i + 1;
 
             if size < MIN_CHUNK_SIZE {
@@ -104,7 +104,7 @@ impl<R: AsyncRead + std::marker::Unpin> XetChunker<R> {
             if size >= MAX_CHUNK_SIZE || (self.hash & MASK) == 0 {
                 return Some(size);
             }
-            
+
             i += 1;
         }
 

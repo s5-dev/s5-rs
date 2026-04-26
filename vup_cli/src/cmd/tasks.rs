@@ -10,7 +10,7 @@ use s5_node_api::config::TaskSpec;
 use s5_node_api::{S5NodeClient, TaskProgressMap, TaskState};
 use tokio_util::sync::CancellationToken;
 
-use crate::progress::{new_progress_bar, update_progress_bar, format_one_line};
+use crate::progress::{format_one_line, new_progress_bar, update_progress_bar};
 
 /// `vup run-task <name>` — run a named task from node config and poll progress.
 pub async fn run_task_by_name(client: &S5NodeClient, name: &str) -> Result<()> {

@@ -19,8 +19,8 @@ pub mod layer;
 pub mod node;
 pub mod overlay;
 
+pub mod chunking;
 pub(crate) mod context;
 pub mod merge;
 pub mod persist;
 pub mod snapshot;
-pub mod chunking;

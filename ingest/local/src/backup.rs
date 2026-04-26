@@ -484,7 +484,10 @@ async fn is_changed(
     let prev_semantic = match &prev_entry.semantic {
         Some(s) => s,
         None => {
-            tracing::debug!(key = key, "is_changed: no semantic metadata, treating as new");
+            tracing::debug!(
+                key = key,
+                "is_changed: no semantic metadata, treating as new"
+            );
             return Ok(true); // No metadata to compare.
         }
     };
@@ -651,11 +654,12 @@ async fn process_entry(
                 .import_stream(file, blob_store, Some(semantic.clone()))
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            
+
             // Get the actual size imported (could differ slightly from meta if file changed)
             let size = entry.content.as_ref().map(|c| c.size).unwrap_or(0);
             Ok((entry, size))
-        }).await?;
+        })
+        .await?;
 
         let Some((node_entry, content_len)) = import_opt else {
             stats.files_errored.fetch_add(1, Ordering::Relaxed);

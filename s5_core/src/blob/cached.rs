@@ -122,9 +122,7 @@ impl BlobsRead for CachedBlobsRead {
             }
         }
 
-        self.inner
-            .blob_download_slice(hash, offset, max_len)
-            .await
+        self.inner.blob_download_slice(hash, offset, max_len).await
     }
 
     async fn blob_read(

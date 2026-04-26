@@ -387,11 +387,7 @@ pub(crate) fn resolve_vault_key_info(
         .with_context(|| format!("resolving key for vault '{vault_name}'"))?;
 
     let recipients = vec![key_config.public_key.clone()];
-    let identity_files = key_config
-        .identity_file
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let identity_files = key_config.identity_file.iter().cloned().collect::<Vec<_>>();
 
     Ok((recipients, identity_files))
 }
