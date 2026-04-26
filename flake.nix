@@ -54,7 +54,11 @@
             ];
 
             env = {
-              RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=mold";
+              # RUSTFLAGS in mkShell shadows the parent shell's value, so any
+              # RUSTFLAGS set at the GitHub Actions workflow level would be
+              # overwritten the moment we enter `nix develop`. Keep all rustc
+              # flags here so dev and CI see exactly the same set.
+              RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=mold -D warnings";
               RUSTC_WRAPPER = "sccache";
             };
           };
