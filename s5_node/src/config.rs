@@ -260,6 +260,10 @@ impl S5NodeConfig {
     }
 
     /// Recursively validate a registry config entry.
+    // Clippy's `collapsible_match` suggestion would convert the inner `if` into
+    // a match guard, but that breaks exhaustiveness here — there's no
+    // fall-through arm for Store/Remote when the guard fails.
+    #[allow(clippy::collapsible_match)]
     fn validate_registry(&self, name: &str, reg: &NodeConfigRegistry, errors: &mut Vec<String>) {
         match reg {
             NodeConfigRegistry::Store { store, .. } => {

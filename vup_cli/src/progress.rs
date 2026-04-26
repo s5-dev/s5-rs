@@ -60,11 +60,7 @@ fn format_state(s: &ProgressState) -> String {
                 ProgressType::Bytes => HumanBytes(total).to_string(),
                 ProgressType::Count => HumanCount(total).to_string(),
             };
-            let pct = if total > 0 {
-                s.progress * 100 / total
-            } else {
-                0
-            };
+            let pct = (s.progress * 100).checked_div(total).unwrap_or(0);
             format!("{} / {} ({}%) {}", val, total_str, pct, label)
         }
         None => format!("{} {}", val, label),
