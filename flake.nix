@@ -41,6 +41,7 @@
           default = pkgs.mkShell {
             buildInputs = [
               rustToolchain
+              pkgs.cargo-nextest
               pkgs.pkg-config
               pkgs.clang
               pkgs.mold
