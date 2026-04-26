@@ -42,6 +42,7 @@
             buildInputs = [
               rustToolchain
               pkgs.cargo-nextest
+              pkgs.sccache
               pkgs.pkg-config
               pkgs.clang
               pkgs.mold
@@ -54,6 +55,7 @@
 
             env = {
               RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=mold";
+              RUSTC_WRAPPER = "sccache";
             };
           };
         }
