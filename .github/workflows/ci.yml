@@ -17,7 +17,6 @@ env:
   # the moment a step runs `nix develop --command`. RUSTDOCFLAGS is fine here
   # because the flake doesn't override it.
   RUSTDOCFLAGS: -Dwarnings
-  SCCACHE_GHA_ENABLED: "on"
   SCCACHE_CACHE_SIZE: "10G"
 
 jobs:
@@ -34,6 +33,17 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
       - uses: DeterminateSystems/flakehub-cache-action@main
       - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache backend
+        shell: bash
+        run: |
+          # On real GHA, ACTIONS_CACHE_URL is exported by sccache-action above
+          # and we want sccache to use it. Under nektos/act, that URL doesn't
+          # exist, so leave SCCACHE_GHA_ENABLED unset and sccache falls back
+          # to its default local-disk cache.
+          if [ -z "${ACT:-}" ]; then
+            echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          fi
 
       - name: Check formatting
         run: nix develop --command cargo fmt --all -- --check
@@ -64,4 +74,7 @@ jobs:
       - uses: DeterminateSystems/flakehub-cache-action@main
 
       - name: cargo deny check
-        run: nix develop --command cargo deny --workspace check
+        # cargo deny doesn't compile anything; bypass sccache entirely so it
+        # doesn't try to spin up a backend (and so this job stays fast under
+        # act, where the GHA cache backend isn't reachable).
+        run: nix develop --command env -u RUSTC_WRAPPER cargo deny --workspace check
