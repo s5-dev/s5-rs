@@ -1,0 +1,21 @@
+[package]
+name = "s5_node_api"
+version.workspace = true
+edition = "2024"
+description = "S5 node API — RPC protocol, config types, and client for communicating with an S5 node"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+irpc.workspace = true
+json-patch.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+# Native-only deps for service discovery (lock file + iroh connect)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+directories = "6.0.0"
+iroh.workspace = true
+irpc-iroh.workspace = true
+tokio = { workspace = true, features = ["rt"] }

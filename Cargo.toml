@@ -6,20 +6,30 @@ members = [
   "s5_cli",
   "s5_core",
   "s5_fs",
+  "s5_fs_v2",
   "s5_fuse",
   "s5_node",
+  "s5_node_api",
   "s5_registry",
   # Blob stores
   "blob_stores/local",
+  "blob_stores/local_links",
   "blob_stores/memory",
   "blob_stores/s3",
   "blob_stores/sia",
+  "blob_stores/fjall",
   # Registries
   "registries/redb",
   "registries/store",
   # Importers
   "importers/http",
   "importers/local",
+  # Ingest
+  "ingest/local",
+  # Compression
+  "s5_compression",
+  # CLI tools
+  "vup_cli",
   # Bindings
   "bindings/s5_client",
   "bindings/s5_wasm",
@@ -35,10 +45,10 @@ blake3 = { version = "1.8.2", features = [
 ] }
 bytes = { version = "1.10.1" }
 futures = "0.3.31"
-iroh = { version = "0.94.0" }
-iroh-blobs = { version = "0.96.0" }
-irpc = "0.10.0"
-irpc-iroh = "0.10.0"
+iroh = { version = "0.97.0" }
+irpc = "0.13.0"
+irpc-iroh = "0.13.0"
+json-patch = "4.1"
 log = "0.4.28"
 minicbor = { version = "2.1.1", features = ["alloc", "derive", "half"] }
 postcard = "1.1.3"
@@ -46,10 +56,12 @@ redb = "3.1.0"
 s5_blobs = { path = "s5_blobs", version = "1.0.0-beta.1", default-features = false }
 s5_core = { path = "s5_core", version = "1.0.0-beta.1" }
 s5_fs = { path = "s5_fs", version = "1.0.0-beta.1" }
+s5_fs_v2 = { path = "s5_fs_v2", version = "1.0.0-beta.1" }
 s5_fuse = { path = "s5_fuse", version = "1.0.0-beta.1" }
 s5_importer_http = { path = "importers/http", version = "1.0.0-beta.1" }
 s5_importer_local = { path = "importers/local", version = "1.0.0-beta.1" }
 s5_node = { path = "s5_node", version = "1.0.0-beta.1" }
+s5_node_api = { path = "s5_node_api", version = "1.0.0-beta.1" }
 s5_registry = { path = "s5_registry", version = "1.0.0-beta.1" }
 s5_registry_redb = { path = "registries/redb", version = "1.0.0-beta.1" }
 s5_registry_store = { path = "registries/store", version = "1.0.0-beta.1" }
@@ -57,13 +69,18 @@ s5_store_local = { path = "blob_stores/local", version = "1.0.0-beta.1" }
 s5_store_memory = { path = "blob_stores/memory", version = "1.0.0-beta.1" }
 s5_store_s3 = { path = "blob_stores/s3", version = "1.0.0-beta.1" }
 s5_store_sia = { path = "blob_stores/sia", version = "1.0.0-beta.1" }
+s5_store_fjall = { path = "blob_stores/fjall", version = "1.0.0-beta.1" }
 s5_client = { path = "bindings/s5_client", version = "1.0.0-beta.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
 thiserror = "2.0.17"
 # WASM-compatible tokio features: sync, macros, io-util, rt, time
 # Native crates that need more features should add them explicitly
 tokio = { version = "1.48.0", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tracing = "0.1.41"
+zeroize = "1.8"
 criterion = { version = "0.5.1", features = ["async_tokio"], default-features = false }
 
+[workspace.package]
+version = "1.0.0-beta.1"

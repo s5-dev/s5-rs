@@ -1,0 +1,20 @@
+[package]
+name = "s5_store_local_links"
+version = "1.0.0-beta.1"
+edition = "2024"
+description = "Reference local files by hash without copying to blob store"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+redb = { workspace = true }
+s5_core = { workspace = true }
+tokio = { workspace = true, features = ["fs", "rt"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

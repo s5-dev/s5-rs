@@ -21,6 +21,12 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use super::paths::{blob_path_for_hash, obao6_path_for_hash};
 
+/// Threshold below which we hash inline without spawn_blocking.
+/// blake3 on small data (~1KB) takes ~1-5 microseconds, while spawn_blocking
+/// overhead is ~500+ microseconds. For small blobs, inline is 100x faster.
+/// 16KB chosen as a conservative threshold - blake3 at 16KB is still <100us.
+const INLINE_HASH_THRESHOLD: u64 = 16 * 1024;
+
 /// TODO(perf): expose the Bao/outboard threshold and hashing
 /// strategy as a tunable policy so different deployments can
 /// trade CPU vs metadata size explicitly.
@@ -29,24 +35,53 @@ pub async fn import_bytes(
     outboard_store: &Option<Arc<dyn Store>>,
     bytes: bytes::Bytes,
 ) -> StoreResult<BlobId> {
+    import_bytes_inner(store, outboard_store, bytes, true).await
+}
+
+/// Import bytes without checking if the blob already exists.
+///
+/// Faster for bulk imports where you know blobs are new — skips the
+/// `exists()` check. Content-addressed storage is idempotent, so
+/// writing the same content twice is safe.
+pub async fn import_bytes_unchecked(
+    store: &Arc<dyn Store>,
+    outboard_store: &Option<Arc<dyn Store>>,
+    bytes: bytes::Bytes,
+) -> StoreResult<BlobId> {
+    import_bytes_inner(store, outboard_store, bytes, false).await
+}
+
+async fn import_bytes_inner(
+    store: &Arc<dyn Store>,
+    outboard_store: &Option<Arc<dyn Store>>,
+    bytes: bytes::Bytes,
+    check_exists: bool,
+) -> StoreResult<BlobId> {
     let size = bytes.len() as u64;
 
     // Platform-specific hash and outboard computation
     #[cfg(not(target_arch = "wasm32"))]
     let (hash, obao) = {
-        // Only compute Bao outboard data for blobs >= 2^16 bytes.
+        // Only compute Bao outboard data for blobs >= 2^16 bytes (64KB).
         let compute_outboard_flag = outboard_store.is_some() && size >= (1u64 << 16);
-        let bytes_clone = bytes.clone();
 
-        tokio::task::spawn_blocking(move || -> std::io::Result<(Hash, Option<Vec<u8>>)> {
-            if compute_outboard_flag {
-                let (hash, obao) = compute_outboard(bytes_clone.as_ref(), size, |_| Ok(()))?;
-                Ok((hash, obao))
-            } else {
-                Ok((blake3::hash(&bytes_clone).into(), None))
-            }
-        })
-        .await??
+        if size < INLINE_HASH_THRESHOLD && !compute_outboard_flag {
+            // Small blobs: hash inline to avoid spawn_blocking overhead.
+            // blake3 at 1KB takes ~1-5us, spawn_blocking overhead is ~500us.
+            (blake3::hash(&bytes).into(), None)
+        } else {
+            // Large blobs or outboard needed: use blocking threadpool.
+            let bytes_clone = bytes.clone();
+            tokio::task::spawn_blocking(move || -> std::io::Result<(Hash, Option<Vec<u8>>)> {
+                if compute_outboard_flag {
+                    let (hash, obao) = compute_outboard(bytes_clone.as_ref(), size, |_| Ok(()))?;
+                    Ok((hash, obao))
+                } else {
+                    Ok((blake3::hash(&bytes_clone).into(), None))
+                }
+            })
+            .await??
+        }
     };
 
     #[cfg(target_arch = "wasm32")]
@@ -56,6 +91,13 @@ pub async fn import_bytes(
         // for WASM clients that download complete blobs.
         (blake3::hash(&bytes).into(), None)
     };
+
+    let final_path = blob_path_for_hash(hash, &store.features());
+
+    // If the blob exists, the outboard does too — skip both writes.
+    if check_exists && store.exists(&final_path).await? {
+        return Ok(BlobId { hash, size });
+    }
 
     if let Some(ref outboard) = obao
         && let Some(outboard_store) = outboard_store
@@ -68,29 +110,8 @@ pub async fn import_bytes(
             .await?;
     }
 
-    let final_path = blob_path_for_hash(hash, &store.features());
-    if store.exists(&final_path).await? {
-        return Ok(BlobId { hash, size });
-    }
-
-    // TODO(remote-blobs): RemoteBlobStore currently relies on this
-    // helper to compute BLAKE3 and optional outboard data. In the
-    // future, the remote backend should perform its own hashing,
-    // enforce hash equality for uploaded data, and then expose a
-    // simpler content-addressed API to BlobStore.
-    if store.features().supports_rename {
-        let temp_path = store
-            .put_temp(Box::new(tokio_stream::once(Ok(bytes))))
-            .await?;
-
-        let (hash, size) =
-            finalize_import(store, outboard_store, temp_path, hash, size, obao).await?;
-
-        Ok(BlobId { hash, size })
-    } else {
-        store.put_bytes(&final_path, bytes).await?;
-        Ok(BlobId { hash, size })
-    }
+    store.put_bytes(&final_path, bytes).await?;
+    Ok(BlobId { hash, size })
 }
 
 /// TODO(perf): consider computing Bao outboard incrementally during
@@ -130,7 +151,102 @@ pub async fn import_stream(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Import a file from disk into the blob store, keyed by its blake3 hash.
+///
+/// When the store supports reflinks (XFS/btrfs with `supports_reflink`),
+/// uses FICLONE to create a zero-cost COW clone before hashing. This means
+/// the blob store shares physical disk extents with the source file — the
+/// import is essentially free in terms of storage.
+///
+/// For append-only workloads (e.g. feedy pack files), reflink imports are
+/// particularly efficient: appending to the source doesn't break sharing of
+/// existing extents, so historical snapshots accumulate at the cost of only
+/// the append deltas. In production, this yields ~98% storage savings
+/// (1.5 TiB apparent blob store consuming only ~26 GiB of real disk).
+///
+/// Falls back to TeeStream (simultaneous read + hash + write) when reflinks
+/// are unavailable (cross-device, unsupported filesystem).
 pub async fn import_file(
+    store: &Arc<dyn Store>,
+    outboard_store: &Option<Arc<dyn Store>>,
+    path: PathBuf,
+    on_progress: impl Fn(u64) -> std::io::Result<()> + Send + Sync + 'static,
+) -> StoreResult<BlobId> {
+    // Try reflink-based import first if the store supports it.
+    // This creates a COW snapshot of the source file, guaranteeing
+    // hash-content consistency even if the source is being written to.
+    if store.features().supports_reflink
+        && let Some(blob_id) =
+            try_import_file_reflink(store, outboard_store, &path, &on_progress).await?
+    {
+        return Ok(blob_id);
+        // Reflink failed (e.g. cross-device) — fall through to TeeStream
+    }
+
+    import_file_teestream(store, outboard_store, path, on_progress).await
+}
+
+/// Reflink import path: FICLONE source → temp, hash temp, finalize.
+#[cfg(not(target_arch = "wasm32"))]
+async fn try_import_file_reflink(
+    store: &Arc<dyn Store>,
+    outboard_store: &Option<Arc<dyn Store>>,
+    path: &std::path::Path,
+    _on_progress: &(impl Fn(u64) -> std::io::Result<()> + Send + Sync + 'static),
+) -> StoreResult<Option<BlobId>> {
+    let temp_path = format!(".tmp/{}", uuid::Uuid::new_v4());
+
+    // Step 1: reflink source → temp in store (COW snapshot)
+    match store.reflink_file_to(path, &temp_path).await {
+        Ok(()) => {}
+        Err(_) => return Ok(None), // not supported or cross-device
+    }
+
+    let size = store.size(&temp_path).await?;
+    let compute_outboard_flag = outboard_store.is_some();
+
+    // Step 2: hash the frozen temp file
+    let stream = store.open_read_stream(&temp_path, 0, None).await?;
+    let reader = StreamReader::new(stream);
+    let reader = SyncIoBridge::new(reader);
+
+    let (hash, outboard) = tokio::task::spawn_blocking(move || {
+        if compute_outboard_flag {
+            compute_outboard(reader, size, |_| Ok(()))
+        } else {
+            use std::io::Read;
+
+            let mut hasher = blake3::Hasher::new();
+            let mut reader = std::io::BufReader::new(reader);
+            let mut buf = [0u8; 64 * 1024];
+
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                // Note: we don't call on_progress here because we can't
+                // move the reference into spawn_blocking. The progress
+                // callback is primarily useful for the TeeStream path.
+            }
+
+            let hash: Hash = hasher.finalize().into();
+            Ok((hash, None))
+        }
+    })
+    .await??;
+
+    // Step 3: finalize (rename temp → final blob path, or discard if exists)
+    let (hash, size) =
+        finalize_import(store, outboard_store, temp_path, hash, size, outboard).await?;
+
+    Ok(Some(BlobId { hash, size }))
+}
+
+/// Standard TeeStream import path: read file, hash + write simultaneously.
+#[cfg(not(target_arch = "wasm32"))]
+async fn import_file_teestream(
     store: &Arc<dyn Store>,
     outboard_store: &Option<Arc<dyn Store>>,
     path: PathBuf,

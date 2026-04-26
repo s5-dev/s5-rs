@@ -35,24 +35,25 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::Endpoint;
-use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, RemoteBlobStore};
-use s5_core::{BlobStore, RegistryApi};
+use iroh::{Endpoint, endpoint::presets};
+use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
+use s5_core::RegistryApi;
+use s5_core::blob::BlobsRead;
 use s5_fs::dir::FileRef;
 use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
 };
-use s5_store_local::LocalStore;
 use s5_registry_redb::RedbRegistry;
+use s5_store_local::LocalStore;
 use tempfile::tempdir;
 
 #[tokio::test]
 async fn fs_sync_complete() -> Result<()> {
     // Create endpoints for cloud, laptop, and desktop nodes.
-    let cloud_endpoint = Endpoint::builder().bind().await?;
-    let laptop_endpoint = Endpoint::builder().bind().await?;
-    let desktop_endpoint = Endpoint::builder().bind().await?;
+    let cloud_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let laptop_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let desktop_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     let cloud_addr = cloud_endpoint.addr();
 
@@ -68,6 +69,7 @@ async fn fs_sync_complete() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["meta".to_string()],
         store_uploads_in: Some("meta".to_string()),
+        ..Default::default()
     };
     // Use the EndpointId display string for ACL keys, matching the
     // production server behaviour and config expectations.
@@ -136,7 +138,7 @@ async fn fs_sync_complete() -> Result<()> {
             FileRef::new_inline_blob(Bytes::from_static(b"Root file content")),
         )
         .await?;
-    laptop_plain.save().await?;
+    laptop_plain.flush().await?;
 
     // Push laptop plaintext state into the encrypted FS (publishes to cloud).
     push_snapshot(&laptop_plain, &laptop_encrypted).await?;
@@ -194,9 +196,8 @@ async fn fs_sync_complete() -> Result<()> {
         "blob should be pinned on the cloud node"
     );
 
-    let remote_blob_store = BlobStore::new(RemoteBlobStore::new(desktop_blob_client.clone()));
-    let encrypted_bytes = remote_blob_store
-        .read_as_bytes(registry_entry.hash, 0, None)
+    let encrypted_bytes = desktop_blob_client
+        .blob_download(registry_entry.hash)
         .await?;
     let plaintext_bytes = laptop_snapshot.to_bytes()?;
     assert_ne!(encrypted_bytes, plaintext_bytes);

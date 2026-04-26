@@ -6,6 +6,9 @@ description = "S5 Flutter bindings via flutter_rust_bridge - encrypted storage o
 repository = "https://github.com/s5-dev/s5-rs"
 license = "MIT OR Apache-2.0"
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(frb_expand)'] }
+
 [lib]
 crate-type = ["cdylib", "staticlib"]
 

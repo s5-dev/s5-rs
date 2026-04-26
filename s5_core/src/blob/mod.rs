@@ -1,9 +1,12 @@
+pub mod cached;
+pub mod fallback;
 pub mod identifier;
 pub mod import;
 pub mod location;
 pub mod paths;
 pub mod read;
 pub mod store;
+pub mod tee;
 
 pub use identifier::BlobId;
 pub use location::BlobLocation;
@@ -53,6 +56,8 @@ pub trait BlobsWrite: Sync + Send {
     async fn blob_upload_bytes(&self, bytes: Bytes) -> BlobResult<BlobId>;
 
     /// Upload a blob from a reader.
+    ///
+    /// Not available through `dyn BlobsWrite` (requires `Self: Sized`).
     async fn blob_upload_reader<R, F>(
         &self,
         hash: Hash,
@@ -61,15 +66,37 @@ pub trait BlobsWrite: Sync + Send {
         on_progress: F,
     ) -> BlobResult<BlobId>
     where
+        Self: Sized,
         R: AsyncRead + Send + Unpin + 'static,
         F: Fn(u64) -> io::Result<()> + Send + Sync + 'static;
 
     /// Upload a blob from a streaming source of bytes.
+    ///
+    /// Not available through `dyn BlobsWrite` (requires `Self: Sized`).
     async fn blob_upload_stream<S>(&self, stream: S) -> BlobResult<BlobId>
     where
+        Self: Sized,
         S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static;
 
     /// Upload a local file as a blob.
     #[cfg(not(target_arch = "wasm32"))]
     async fn blob_upload_file(&self, path: PathBuf) -> BlobResult<BlobId>;
+
+    /// Flush pending writes to durable storage.
+    ///
+    /// The default implementation is a no-op. Backends that buffer writes
+    /// (e.g. local-disk stores) should override this.
+    async fn blob_sync(&self) -> BlobResult<()> {
+        Ok(())
+    }
 }
+
+/// Combined read + write interface for content-addressed blobs.
+///
+/// This is the primary trait for code that needs to both read and write
+/// blobs by hash without caring about storage layout (paths, directories,
+/// etc.).  Any type that implements both `BlobsRead` and `BlobsWrite`
+/// automatically implements `BlobsReadWrite`.
+pub trait BlobsReadWrite: BlobsRead + BlobsWrite {}
+
+impl<T: BlobsRead + BlobsWrite> BlobsReadWrite for T {}

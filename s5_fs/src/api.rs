@@ -112,6 +112,11 @@ impl FS5 {
         Ok(())
     }
 
+    /// Alias for [`save`](Self::save) for compatibility.
+    pub async fn flush(&self) -> FSResult<()> {
+        self.save().await
+    }
+
     /// Exports the current directory state as an immutable snapshot.
     pub async fn export_snapshot(&self) -> FSResult<DirV1> {
         let (responder, receiver) = oneshot::channel();

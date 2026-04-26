@@ -1,9 +1,30 @@
 use anyhow::{Context, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use ignore::{DirEntry, WalkBuilder};
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::{FS5, FileRef};
+use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{os::unix::fs::MetadataExt, path::PathBuf};
+
+/// Progress counters for import operations.
+#[derive(Default)]
+pub struct ImportProgress {
+    /// Number of files processed so far
+    pub files_processed: AtomicU64,
+    /// Number of bytes processed so far
+    pub bytes_processed: AtomicU64,
+}
+
+/// Import mode determines how files are stored.
+#[derive(Clone)]
+pub enum ImportMode {
+    /// Store file content in blob store (default)
+    BlobStore(BlobStore),
+    /// Only hash and index files, don't store content
+    IndexOnly,
+}
 
 /// Imports files and directories from the local file system into an FS5 directory.
 pub struct LocalFileSystemImporter {
@@ -11,8 +32,8 @@ pub struct LocalFileSystemImporter {
     // rate_limiter: Arc<Semaphore>,
     /// The FS5 directory state where file references will be stored.
     fs: FS5,
-    /// The blob store where file content will be stored.
-    blob_store: BlobStore,
+    /// Import mode: blob store or index-only
+    mode: ImportMode,
     max_concurrent_ops: usize,
     /// When true, keys are relative to the imported base path.
     /// When false, keys use the full absolute path (minus leading slash).
@@ -25,6 +46,8 @@ pub struct LocalFileSystemImporter {
     /// knows the target tree is fresh and wants to avoid a `file_get`
     /// round-trip per file.
     always_import: bool,
+    /// Optional progress tracking
+    progress: Option<Arc<ImportProgress>>,
 }
 
 impl LocalFileSystemImporter {
@@ -59,13 +82,44 @@ impl LocalFileSystemImporter {
         Ok(Self {
             max_concurrent_ops,
             fs,
-            blob_store,
+            mode: ImportMode::BlobStore(blob_store),
             use_base_relative_keys,
             ignore,
             ignore_vcs,
             check_cachedir_tag,
             always_import: false,
+            progress: None,
         })
+    }
+
+    /// Creates a new `LocalImporter` in index-only mode.
+    ///
+    /// Files are hashed and indexed in FS5, but not copied to any blob store.
+    /// Useful for cataloging files or finding duplicates without storage overhead.
+    pub fn create_index_only(
+        fs: FS5,
+        max_concurrent_ops: usize,
+        use_base_relative_keys: bool,
+        ignore: bool,
+        ignore_vcs: bool,
+        check_cachedir_tag: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            max_concurrent_ops,
+            fs,
+            mode: ImportMode::IndexOnly,
+            use_base_relative_keys,
+            ignore,
+            ignore_vcs,
+            check_cachedir_tag,
+            always_import: false,
+            progress: None,
+        })
+    }
+
+    /// Sets a progress tracker for this importer.
+    pub fn set_progress(&mut self, progress: Arc<ImportProgress>) {
+        self.progress = Some(progress);
     }
 
     /// Recursively imports files from the configured `base_path`.
@@ -208,23 +262,78 @@ impl LocalFileSystemImporter {
 
         log::info!("Importing file: {}", key);
 
-        let blob_id = self
-            .blob_store
-            .import_file(path.to_path_buf(), |_processed| Ok(()))
-            .await
-            .with_context(|| format!("Failed to import file into blob store: {:?}", path))?;
+        let file_ref = match &self.mode {
+            ImportMode::BlobStore(blob_store) => {
+                // Normal mode: import file into blob store
+                let blob_id = blob_store
+                    .import_file(path.to_path_buf(), |_processed| Ok(()))
+                    .await
+                    .with_context(|| {
+                        format!("Failed to import file into blob store: {:?}", path)
+                    })?;
 
-        let mut file_ref: FileRef = blob_id.into();
+                let mut file_ref: FileRef = blob_id.into();
+                file_ref.timestamp = Some(meta.mtime().try_into()?);
+                file_ref.timestamp_subsec_nanos = Some(meta.mtime_nsec().try_into()?);
+                file_ref
+            }
+            ImportMode::IndexOnly => {
+                // Index-only mode: hash file without copying to blob store
+                let hash = hash_file(path).await?;
 
-        // TODO if hash changed, update prev field
-        file_ref.timestamp = Some(meta.mtime().try_into()?);
-        file_ref.timestamp_subsec_nanos = Some(meta.mtime_nsec().try_into()?);
+                FileRef {
+                    ref_type: None,
+                    hash,
+                    size: meta.len(),
+                    timestamp: Some(meta.mtime().try_into()?),
+                    timestamp_subsec_nanos: Some(meta.mtime_nsec().try_into()?),
+                    locations: None,
+                    media_type: None,
+                    extra: None,
+                    prev: None,
+                    version_count: None,
+                    warc: None,
+                    first_version: None,
+                }
+            }
+        };
 
-        self.fs.file_put(&key, file_ref).await?;
+        self.fs.file_put(&key, file_ref.clone()).await?;
+
+        // Update progress
+        if let Some(ref progress) = self.progress {
+            progress.files_processed.fetch_add(1, Ordering::Relaxed);
+            progress
+                .bytes_processed
+                .fetch_add(file_ref.size, Ordering::Relaxed);
+        }
 
         log::info!("Successfully imported file: {}", key);
         Ok(())
     }
+}
+
+/// Hash a file using BLAKE3.
+async fn hash_file(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<[u8; 32]> {
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("Failed to open file: {:?}", path))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 8192];
+
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+
+        Ok(hasher.finalize().into())
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -353,5 +462,48 @@ mod tests {
             .unwrap()
             .trim_start_matches('/');
         assert!(!fs.file_exists(cache_file_key).await);
+    }
+
+    #[tokio::test]
+    async fn test_index_only_import() {
+        // 1. Setup source directory with a file
+        let source_dir = tempdir().unwrap();
+        let file1_path = source_dir.path().join("hello.txt");
+        let mut file1 = File::create(&file1_path).unwrap();
+        writeln!(file1, "hello world").unwrap();
+
+        // 2. Setup FS5 (no blob store needed for index-only)
+        let fs_dir = tempdir().unwrap();
+        let ctx = DirContext::open_local_root(fs_dir.path()).unwrap();
+        let fs = FS5::open(ctx).with_autosave(50).await.unwrap();
+
+        // 3. Run Importer in index-only mode with progress tracking
+        let progress = Arc::new(ImportProgress::default());
+        let mut importer = LocalFileSystemImporter::create_index_only(
+            fs.clone(),
+            4,
+            true, // base-relative keys
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        importer.set_progress(progress.clone());
+        importer
+            .import_path(source_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // 4. Verify FS5 state — file is indexed with correct hash and size
+        fs.save().await.unwrap();
+
+        let file_ref = fs.file_get("hello.txt").await.unwrap();
+        assert_eq!(file_ref.size, 12); // "hello world\n"
+        assert_ne!(file_ref.hash, [0u8; 32]); // hash is populated
+        assert!(file_ref.timestamp.is_some());
+
+        // 5. Verify progress counters
+        assert_eq!(progress.files_processed.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.bytes_processed.load(Ordering::Relaxed), 12);
     }
 }

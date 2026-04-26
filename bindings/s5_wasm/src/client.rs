@@ -25,11 +25,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
 use s5_blobs::RemoteBlobStore;
 use s5_client::DerivedKeys;
-use s5_core::{BlobStore, Hash, StreamKey, blob::location::BlobLocation};
-use s5_fs::{CursorKind, DirContext, FS5, FileRef, SigningKey};
+use s5_core::{Hash, StreamKey, blob::BlobStore, blob::location::BlobLocation};
+use s5_fs::{CursorKind, DirActorContext, FS5, FileRef, SigningKey};
 use s5_registry::RemoteRegistry;
 use wasm_bindgen::prelude::*;
 
@@ -198,10 +198,9 @@ impl S5Client {
         );
 
         // Build the endpoint with our secret key and default relays
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![s5_blobs::ALPN.to_vec(), s5_registry::ALPN.to_vec()])
-            .relay_mode(RelayMode::Default)
             .bind()
             .await
             .map_err(|e| JsError::new(&format!("Failed to bind endpoint: {}", e)))?;
@@ -243,7 +242,7 @@ impl S5Client {
         let signing_key = SigningKey::new(self.keys.sync_keys.signing_key_bytes);
 
         // Create encrypted context backed by remote stores
-        let ctx = DirContext::new_encrypted_registry(
+        let ctx = DirActorContext::new_encrypted_registry(
             stream_key,
             signing_key,
             self.keys.sync_keys.encryption_key,
@@ -413,7 +412,7 @@ impl S5Client {
 
         console_log!("Directory created locally, now saving to remote...");
         // Save changes to remote
-        fs.save()
+        fs.flush()
             .await
             .map_err(|e| JsError::new(&format!("Failed to save: {}", e)))?;
 
@@ -484,7 +483,7 @@ impl S5Client {
             .map_err(|e| JsError::new(&format!("Failed to put file: {}", e)))?;
 
         // Save changes to remote
-        fs.save()
+        fs.flush()
             .await
             .map_err(|e| JsError::new(&format!("Failed to save: {}", e)))?;
 
@@ -780,7 +779,7 @@ impl S5Client {
             .map_err(|e| JsError::new(&format!("Failed to delete file: {}", e)))?;
 
         // Save changes to remote
-        fs.save()
+        fs.flush()
             .await
             .map_err(|e| JsError::new(&format!("Failed to save: {}", e)))?;
 
@@ -805,7 +804,7 @@ impl S5Client {
 
         // Save any pending changes before disconnecting
         if let Some(fs) = &self.fs {
-            let _ = fs.save().await;
+            let _ = fs.flush().await;
         }
 
         // Drop FS5

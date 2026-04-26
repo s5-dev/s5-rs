@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+libc = "0.2"
 s5_core.workspace = true
 serde.workspace = true
 # Local store needs tokio fs (native-only crate)

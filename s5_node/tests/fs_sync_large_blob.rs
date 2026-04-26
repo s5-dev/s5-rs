@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::Endpoint;
+use iroh::{Endpoint, endpoint::presets};
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
 use s5_core::BlobsWrite;
 use s5_fs::dir::FileRef;
@@ -19,16 +19,16 @@ use s5_node::{
     REGISTRY_ALPN, RegistryServer, RemoteRegistry, derive_sync_keys,
     sync::{open_encrypted_fs, open_plaintext_fs, pull_snapshot, push_snapshot},
 };
-use s5_store_local::LocalStore;
 use s5_registry_redb::RedbRegistry;
+use s5_store_local::LocalStore;
 use tempfile::tempdir;
 
 #[tokio::test]
 async fn fs_sync_large_blob() -> Result<()> {
     // Create endpoints for cloud, laptop, and desktop nodes.
-    let cloud_endpoint = Endpoint::builder().bind().await?;
-    let laptop_endpoint = Endpoint::builder().bind().await?;
-    let desktop_endpoint = Endpoint::builder().bind().await?;
+    let cloud_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let laptop_endpoint = Endpoint::builder(presets::N0).bind().await?;
+    let desktop_endpoint = Endpoint::builder(presets::N0).bind().await?;
 
     let cloud_addr = cloud_endpoint.addr();
 
@@ -43,6 +43,7 @@ async fn fs_sync_large_blob() -> Result<()> {
     let acl = PeerConfigBlobs {
         readable_stores: vec!["meta".to_string()],
         store_uploads_in: Some("meta".to_string()),
+        ..Default::default()
     };
     peer_cfg.insert(laptop_endpoint.id().to_string(), acl.clone());
     peer_cfg.insert(desktop_endpoint.id().to_string(), acl);

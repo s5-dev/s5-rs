@@ -105,12 +105,11 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryPinner<R> {
     }
 
     /// Removes a user. Returns `true` if the blob is now orphaned (0 pinners).
-    pub async fn unpin(&self, hash: [u8; 32], user_id: PinContext) -> Result<bool> {
-        let hash_obj = crate::Hash::from(hash);
-        let lock = self.lock_for_hash(hash_obj);
+    pub async fn unpin(&self, hash: crate::Hash, user_id: PinContext) -> Result<bool> {
+        let lock = self.lock_for_hash(hash);
         let _guard = lock.lock().await;
 
-        let key = self.hash_to_key(hash_obj);
+        let key = self.hash_to_key(hash);
         let (mut pinners, revision) = self.get_internal(&key).await?;
 
         // If user wasn't in the list, we don't change anything.
@@ -126,8 +125,8 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryPinner<R> {
     }
 
     /// Read-only view of pinners (does not require write lock).
-    pub async fn get_pinners(&self, hash: [u8; 32]) -> Result<HashSet<PinContext>> {
-        let key = self.hash_to_key(hash.into());
+    pub async fn get_pinners(&self, hash: crate::Hash) -> Result<HashSet<PinContext>> {
+        let key = self.hash_to_key(hash);
         let (pinners, _) = self.get_internal(&key).await?;
         Ok(pinners)
     }

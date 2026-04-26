@@ -3,23 +3,24 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 use iroh::Endpoint;
 use irpc::Client as IrpcClient;
-use irpc_iroh::IrohRemoteConnection;
+use irpc_iroh::IrohLazyRemoteConnection;
 use s5_core::Hash;
 
 use crate::rpc::{DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse, RpcProto, UploadBlob};
 
-#[cfg(feature = "server")]
 use {
     anyhow::anyhow,
     async_trait::async_trait,
-    futures::Stream,
-    futures_util::StreamExt,
     s5_core::BlobId,
     s5_core::blob::{BlobResult, BlobsRead, BlobsWrite},
     std::io::Cursor,
     std::path::PathBuf,
-    tokio::io::{AsyncRead, AsyncReadExt},
+    tokio::io::AsyncRead,
+    tokio::io::AsyncReadExt,
 };
+
+#[cfg(feature = "server")]
+use {futures::Stream, futures_util::StreamExt};
 
 #[derive(Clone)]
 // TODO: Support multi-peer connections (pool of remote peers) with per-peer trust/health scores and reuse connections.
@@ -32,7 +33,7 @@ impl Client {
     pub const ALPN: &'static [u8] = crate::rpc::ALPN;
 
     pub fn connect(endpoint: Endpoint, addr: impl Into<iroh::EndpointAddr>) -> Self {
-        let conn = IrohRemoteConnection::new(endpoint, addr.into(), Self::ALPN.to_vec());
+        let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), Self::ALPN.to_vec());
         Client {
             inner: IrpcClient::boxed(conn),
         }
@@ -194,7 +195,6 @@ impl Client {
     }
 }
 
-#[cfg(feature = "server")]
 #[async_trait]
 impl BlobsRead for Client {
     async fn blob_contains(&self, hash: Hash) -> BlobResult<bool> {

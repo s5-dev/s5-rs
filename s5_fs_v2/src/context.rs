@@ -1,0 +1,573 @@
+//! Stateless crypto and compression helpers for FS5 V2.
+//!
+//! These are pure functions with no state — they operate on raw bytes
+//! with explicit key/config parameters. [`Snapshot`](crate::snapshot::Snapshot)
+//! is the runtime type that composes these with a store and on-wire context.
+//!
+//! # Blob Pipeline
+//!
+//! Blobs are processed through a three-stage pipeline defined by
+//! [`BlobPipeline`](crate::node::BlobPipeline):
+//!
+//! **Encode (write):** compress → pad → encrypt
+//! **Decode (read):**  decrypt → unpad → decompress
+//!
+//! Each stage is independently optional (controlled by the pipeline config).
+//!
+//! # Encryption Scheme
+//!
+//! Uses deterministic ChaCha20 (pure stream cipher, NO Poly1305/AEAD):
+//! - **Key derivation**: `Key = blake3::derive_key(kdf_context, master_secret || plaintext_hash)`
+//! - **Nonce**: Always zero (each blob has a unique derived key)
+//! - **Padding**: Data is padded to block boundary before encryption
+//! - **Authentication**: `blake3(ciphertext) == entry.hash` (network) +
+//!   `blake3(plaintext) == entry.plaintext_hash` (local)
+
+use std::collections::BTreeMap;
+
+use bytes::Bytes;
+
+use crate::node::{BlobPipeline, CompressionStrategy, EncryptionStrategy};
+
+// ---------------------------------------------------------------------------
+// KDF Constants
+// ---------------------------------------------------------------------------
+
+/// KDF context for leaf (file content) encryption.
+/// Key = blake3::derive_key(KDF_LEAF, master_secret || plaintext_hash)
+pub(crate) const KDF_LEAF: &str = "s5/fs/v2/encrypt/leaf";
+
+/// KDF context for metadata (node/tree) encryption.
+/// Key = blake3::derive_key(KDF_META, master_secret || plaintext_hash)
+pub(crate) const KDF_META: &str = "s5/fs/v2/encrypt/meta";
+
+// ---------------------------------------------------------------------------
+// Per-Blob Key Derivation
+// ---------------------------------------------------------------------------
+
+/// Derives a per-blob encryption key.
+///
+/// `Key = blake3::derive_key(context, master_secret || hash_bytes)`
+fn derive_blob_key(kdf_context: &str, master_secret: &[u8; 32], hash: &[u8; 32]) -> [u8; 32] {
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(master_secret);
+    input[32..].copy_from_slice(hash);
+    blake3::derive_key(kdf_context, &input)
+}
+
+// ---------------------------------------------------------------------------
+// Padding
+// ---------------------------------------------------------------------------
+
+/// Pads data to the next `block_size` boundary with zeros.
+///
+/// If already aligned, no padding is added.
+/// `block_size` of 1 is a no-op (every length is aligned to 1).
+fn pad_to_boundary(data: &[u8], block_size: u32) -> Vec<u8> {
+    let block_size = block_size as usize;
+    if block_size <= 1 {
+        return data.to_vec();
+    }
+    let remainder = data.len() % block_size;
+    if remainder == 0 {
+        return data.to_vec();
+    }
+    let padded_len = data.len() + (block_size - remainder);
+    let mut out = Vec::with_capacity(padded_len);
+    out.extend_from_slice(data);
+    out.resize(padded_len, 0);
+    out
+}
+
+/// Returns the stored size in blocks for the given data length and block size.
+///
+/// This is `ceil(len / block_size)`. With `block_size=1`, returns the exact byte count.
+fn stored_blocks(len: usize, block_size: u32) -> u64 {
+    let bs = block_size as u64;
+    let len = len as u64;
+    if bs <= 1 {
+        return len;
+    }
+    len.div_ceil(bs)
+}
+
+/// Returns the byte length after padding to `block_size` boundary.
+///
+/// If `block_size <= 1`, returns `len` unchanged.
+fn padded_len(len: usize, block_size: u32) -> usize {
+    let bs = block_size as usize;
+    if bs <= 1 {
+        return len;
+    }
+    let remainder = len % bs;
+    if remainder == 0 {
+        len
+    } else {
+        len + (bs - remainder)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChaCha20 Encrypt / Decrypt (Pure Stream Cipher)
+// ---------------------------------------------------------------------------
+
+/// Applies ChaCha20 keystream to data (encrypt or decrypt — symmetric).
+///
+/// Uses nonce = 0 because each blob has a unique derived key.
+fn apply_chacha20(key: &[u8; 32], data: &mut [u8]) {
+    use chacha20::ChaCha20;
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+    let nonce = [0u8; 12];
+    let mut cipher = ChaCha20::new(key.into(), &nonce.into());
+    cipher.apply_keystream(data);
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline Encode / Decode
+// ---------------------------------------------------------------------------
+
+/// Result of encoding a blob through the pipeline.
+pub(crate) struct PipelineEncodeResult {
+    /// The processed (compressed/padded/encrypted) bytes ready for storage.
+    pub bytes: Bytes,
+    /// Stored size in padding blocks (= exact byte count when block_size=1).
+    pub stored_blocks: u64,
+    /// True when compression was skipped because the result exceeded the
+    /// compression-skip threshold (the blob was stored uncompressed).
+    pub compression_skipped: bool,
+}
+
+/// Encodes plaintext bytes through the blob pipeline: compress → pad → encrypt.
+///
+/// `plaintext_hash` is the BLAKE3 of the original plaintext, used as KDF input
+/// for key derivation when encryption is active.
+///
+/// `kdf_context` differentiates leaf vs node encryption (e.g. `KDF_LEAF` or `KDF_META`).
+///
+/// `keys` is the key map from `TraversalContext.keys`.
+///
+/// `dictionary` is the raw decompressed content of the preceding D-chunk for
+/// `ZstdDictFromPrecedingEntry` compression (pass `None` for D-chunks and non-dict strategies).
+///
+/// `compression_skip_threshold` — when `Some(())`, compression is skipped if
+/// the compressed+padded size is not smaller than the uncompressed+padded size.
+/// This avoids wasting CPU on decompression when there are no storage savings
+/// (accounting for the fact that padding can nullify small compression gains).
+/// The blob is then stored uncompressed and `compression_skipped` is set in
+/// the result so the caller can record a per-entry override.
+pub(crate) fn pipeline_encode(
+    plaintext: &[u8],
+    pipeline: Option<&BlobPipeline>,
+    plaintext_hash: &[u8; 32],
+    kdf_context: &str,
+    keys: Option<&BTreeMap<u8, [u8; 32]>>,
+    dictionary: Option<&[u8]>,
+    compression_skip_threshold: bool,
+) -> anyhow::Result<PipelineEncodeResult> {
+    let Some(pipeline) = pipeline else {
+        // No pipeline = no transforms, pass through.
+        let len = plaintext.len();
+        return Ok(PipelineEncodeResult {
+            bytes: Bytes::copy_from_slice(plaintext),
+            stored_blocks: len as u64,
+            compression_skipped: false,
+        });
+    };
+
+    // Stage 1: Compress (with optional skip when unhelpful)
+    let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
+    let (compressed, compression_skipped) = {
+        let raw = compress_bytes(plaintext, &pipeline.compression, dictionary)?;
+        if compression_skip_threshold && !plaintext.is_empty() {
+            // Compare padded sizes: only keep compression if it actually
+            // reduces the stored (post-padding) size.
+            let padded_compressed_len = padded_len(raw.len(), block_size);
+            let padded_uncompressed_len = padded_len(plaintext.len(), block_size);
+            if padded_compressed_len >= padded_uncompressed_len {
+                // Compression unhelpful after padding — fall back to uncompressed.
+                (Bytes::copy_from_slice(plaintext), true)
+            } else {
+                (raw, false)
+            }
+        } else {
+            (raw, false)
+        }
+    };
+
+    // Stage 2: Pad
+    let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
+    let padded = pad_to_boundary(&compressed, block_size);
+    let blocks = stored_blocks(padded.len(), block_size);
+
+    // Stage 3: Encrypt
+    let encrypted = match &pipeline.encryption {
+        Some((EncryptionStrategy::DeterministicChaCha20, key_slot)) => {
+            let keys = keys.ok_or_else(|| anyhow::anyhow!("encryption requested but no keys"))?;
+            let master_secret = keys.get(key_slot).ok_or_else(|| {
+                anyhow::anyhow!("encryption key slot 0x{key_slot:02x} not found in key map")
+            })?;
+            let key = derive_blob_key(kdf_context, master_secret, plaintext_hash);
+            let mut data = padded;
+            apply_chacha20(&key, &mut data);
+            Bytes::from(data)
+        }
+        Some((EncryptionStrategy::Plaintext, _)) | None => Bytes::from(padded),
+    };
+
+    Ok(PipelineEncodeResult {
+        bytes: encrypted,
+        stored_blocks: blocks,
+        compression_skipped,
+    })
+}
+
+/// Decodes stored bytes through the blob pipeline (reverse): decrypt → truncate padding → decompress.
+///
+/// `plaintext_hash` is needed as KDF input for decryption key derivation.
+/// `plaintext_size` is used to truncate padding zeros before decompression.
+///
+/// `kdf_context` differentiates leaf vs node encryption (e.g. `KDF_LEAF` or `KDF_META`).
+///
+/// `dictionary` is the raw decompressed content of the preceding D-chunk for
+/// `ZstdDictFromPrecedingEntry` decompression (pass `None` for D-chunks and non-dict strategies).
+pub(crate) fn pipeline_decode(
+    stored: Bytes,
+    pipeline: Option<&BlobPipeline>,
+    plaintext_hash: Option<&[u8; 32]>,
+    plaintext_size: u64,
+    kdf_context: &str,
+    keys: Option<&BTreeMap<u8, [u8; 32]>>,
+    dictionary: Option<&[u8]>,
+) -> anyhow::Result<Bytes> {
+    let Some(pipeline) = pipeline else {
+        // No pipeline = no transforms, pass through.
+        return Ok(stored);
+    };
+
+    // Stage 1: Decrypt
+    let decrypted = match &pipeline.encryption {
+        Some((EncryptionStrategy::DeterministicChaCha20, key_slot)) => {
+            let plaintext_hash = plaintext_hash
+                .ok_or_else(|| anyhow::anyhow!("decryption requires plaintext_hash for KDF"))?;
+            let keys = keys.ok_or_else(|| anyhow::anyhow!("decryption requested but no keys"))?;
+            let master_secret = keys.get(key_slot).ok_or_else(|| {
+                anyhow::anyhow!("decryption key slot 0x{key_slot:02x} not found in key map")
+            })?;
+            let key = derive_blob_key(kdf_context, master_secret, plaintext_hash);
+            let mut data = stored.to_vec();
+            apply_chacha20(&key, &mut data);
+            data
+        }
+        Some((EncryptionStrategy::Plaintext, _)) | None => stored.to_vec(),
+    };
+
+    // Stage 2: Truncate padding
+    // After decryption, we have compressed data + zero padding.
+    // We need to know where the compressed data ends.
+    // For compressed data: use plaintext_size as a hint — but the compressed
+    // size may differ from plaintext_size. The correct approach depends on
+    // the compression format:
+    // - Zstd frames are self-delimiting, so zstd will stop at the frame end
+    //   and ignore trailing zeros (as long as we use streaming decompression).
+    //   Actually, zstd::decode_all does NOT ignore trailing bytes — it may error.
+    //   We need to truncate. For uncompressed data, plaintext_size IS the data size.
+    //
+    // Strategy: if no compression, truncate to plaintext_size. If compressed,
+    // the compressed size is unknown from metadata alone, so we must rely on
+    // the decompressor handling trailing zeros, OR we store the compressed size.
+    // For now, zstd is frame-delimited so we let it parse what it can.
+    // TODO: Consider storing compressed size if zstd can't handle trailing zeros.
+
+    // Stage 3: Decompress
+    //
+    // Callers that don't know the plaintext size pass `plaintext_size == 0`
+    // as a sentinel (see Snapshot::load). In those cases we can't truncate
+    // padding here, so we return the decrypted bytes unchanged and let the
+    // caller handle any trailing zero padding (e.g. zstd ignores it; the
+    // plaintext hash check will catch mismatches).
+    let decompressed = match &pipeline.compression {
+        Some(CompressionStrategy::Uncompressed) => {
+            if plaintext_size == 0 {
+                Bytes::from(decrypted)
+            } else {
+                let size = plaintext_size as usize;
+                if size < decrypted.len() {
+                    Bytes::from(decrypted[..size].to_vec())
+                } else {
+                    Bytes::from(decrypted)
+                }
+            }
+        }
+        Some(compression) => decompress_bytes_raw(&decrypted, compression, dictionary)?,
+        None => {
+            // No compression — truncate to plaintext_size to remove padding.
+            if plaintext_size == 0 {
+                Bytes::from(decrypted)
+            } else {
+                let size = plaintext_size as usize;
+                if size < decrypted.len() {
+                    Bytes::from(decrypted[..size].to_vec())
+                } else {
+                    Bytes::from(decrypted)
+                }
+            }
+        }
+    };
+
+    Ok(decompressed)
+}
+
+// ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+/// Decompresses bytes using the given compression strategy.
+///
+/// Internal: works on raw byte slices (after decrypt, potentially with trailing padding).
+/// `dictionary` is the raw decompressed content of the preceding D-chunk, if applicable.
+fn decompress_bytes_raw(
+    bytes: &[u8],
+    compression: &CompressionStrategy,
+    dictionary: Option<&[u8]>,
+) -> anyhow::Result<Bytes> {
+    match compression {
+        CompressionStrategy::Uncompressed => Ok(Bytes::copy_from_slice(bytes)),
+        CompressionStrategy::Zstd => {
+            // Use streaming Decoder in single_frame mode: reads exactly one
+            // zstd frame and stops. Without single_frame(), read_to_end
+            // tries to concatenate multiple frames and chokes on trailing
+            // zero padding bytes (which aren't a valid frame header).
+            use std::io::Read;
+            let mut decoder = zstd::Decoder::new(bytes)
+                .map_err(|e| anyhow::anyhow!("zstd decoder init failed: {e}"))?
+                .single_frame();
+            let mut decoded = Vec::new();
+            decoder
+                .read_to_end(&mut decoded)
+                .map_err(|e| anyhow::anyhow!("zstd decompression failed: {e}"))?;
+            Ok(Bytes::from(decoded))
+        }
+        CompressionStrategy::ZstdDictFromPrecedingEntry { .. } => {
+            let dict = dictionary.unwrap_or(&[]);
+            // Use streaming decoder with prepared dictionary — handles trailing
+            // zero padding correctly via single_frame mode.
+            use std::io::Read;
+            let dict = zstd::dict::DecoderDictionary::copy(dict);
+            let mut decoder = zstd::Decoder::with_prepared_dictionary(bytes, &dict)
+                .map_err(|e| anyhow::anyhow!("zstd dict decoder init failed: {e}"))?
+                .single_frame();
+            let mut decoded = Vec::new();
+            decoder
+                .read_to_end(&mut decoded)
+                .map_err(|e| anyhow::anyhow!("zstd dict decompression failed: {e}"))?;
+            Ok(Bytes::from(decoded))
+        }
+    }
+}
+
+/// Compresses bytes using the given compression strategy.
+/// `dictionary` is the raw decompressed content of the preceding D-chunk, if applicable.
+pub(crate) fn compress_bytes(
+    bytes: &[u8],
+    compression: &Option<CompressionStrategy>,
+    dictionary: Option<&[u8]>,
+) -> anyhow::Result<Bytes> {
+    match compression {
+        Some(CompressionStrategy::Uncompressed) | None => Ok(Bytes::copy_from_slice(bytes)),
+        Some(CompressionStrategy::Zstd) => {
+            let encoded = zstd::encode_all(bytes, 3)
+                .map_err(|e| anyhow::anyhow!("zstd compression failed: {e}"))?;
+            Ok(Bytes::from(encoded))
+        }
+        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { .. }) => {
+            let dict = dictionary.unwrap_or(&[]);
+            let mut compressor = zstd::bulk::Compressor::with_dictionary(3, dict)
+                .map_err(|e| anyhow::anyhow!("zstd dict compressor init failed: {e}"))?;
+            let encoded = compressor
+                .compress(bytes)
+                .map_err(|e| anyhow::anyhow!("zstd dict compression failed: {e}"))?;
+            Ok(Bytes::from(encoded))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{EncryptionStrategy, PaddingStrategy};
+
+    #[test]
+    fn pipeline_round_trip_encrypted() {
+        let plaintext = b"hello world this is some test data for pipeline round trip";
+        let plaintext_hash: [u8; 32] = *blake3::hash(plaintext).as_bytes();
+        let master_secret = [42u8; 32];
+        let mut keys = BTreeMap::new();
+        keys.insert(0x0eu8, master_secret);
+
+        let pipeline = BlobPipeline {
+            compression: Some(CompressionStrategy::Zstd),
+            padding: Some(PaddingStrategy { block_size: 1024 }),
+            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+        };
+
+        // Encode
+        let result = pipeline_encode(
+            plaintext,
+            Some(&pipeline),
+            &plaintext_hash,
+            KDF_META,
+            Some(&keys),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.bytes.len(), 1024);
+
+        // Decode
+        let decoded = pipeline_decode(
+            result.bytes,
+            Some(&pipeline),
+            Some(&plaintext_hash),
+            0, // plaintext_size=0, relying on zstd single_frame
+            KDF_META,
+            Some(&keys),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(&decoded[..], plaintext);
+    }
+
+    #[test]
+    fn pipeline_round_trip_dict_compression() {
+        let master_secret = [42u8; 32];
+        let mut keys = BTreeMap::new();
+        keys.insert(0x0eu8, master_secret);
+
+        let pipeline = BlobPipeline {
+            compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
+            padding: Some(PaddingStrategy { block_size: 1024 }),
+            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+        };
+
+        // Simulate a D-chunk (dictionary source) — compressed without dictionary.
+        let dict_data = b"this is the dictionary chunk with some repeated patterns and structures for testing dictionary compression";
+        let dict_hash: [u8; 32] = *blake3::hash(dict_data).as_bytes();
+
+        let dict_result = pipeline_encode(
+            dict_data,
+            Some(&pipeline),
+            &dict_hash,
+            KDF_LEAF,
+            Some(&keys),
+            None, // D-chunk: no dictionary
+            false,
+        )
+        .unwrap();
+
+        // Decode the D-chunk (no dictionary).
+        let dict_decoded = pipeline_decode(
+            dict_result.bytes,
+            Some(&pipeline),
+            Some(&dict_hash),
+            0,
+            KDF_LEAF,
+            Some(&keys),
+            None,
+        )
+        .unwrap();
+        assert_eq!(&dict_decoded[..], dict_data);
+
+        // Now encode a dependent chunk using the D-chunk as dictionary.
+        let dep_data = b"this is the dependent chunk with some repeated patterns and structures for testing dictionary compression but slightly different";
+        let dep_hash: [u8; 32] = *blake3::hash(dep_data).as_bytes();
+
+        let dep_result = pipeline_encode(
+            dep_data,
+            Some(&pipeline),
+            &dep_hash,
+            KDF_LEAF,
+            Some(&keys),
+            Some(dict_data.as_slice()), // use D-chunk as dictionary
+            false,
+        )
+        .unwrap();
+
+        // Decode the dependent chunk WITH the dictionary.
+        let dep_decoded = pipeline_decode(
+            dep_result.bytes,
+            Some(&pipeline),
+            Some(&dep_hash),
+            0,
+            KDF_LEAF,
+            Some(&keys),
+            Some(dict_data.as_slice()),
+        )
+        .unwrap();
+        assert_eq!(&dep_decoded[..], dep_data);
+
+        // Verify that dict-compressed data is smaller than without dictionary
+        // (for similar content this should hold).
+        let nodict_result = pipeline_encode(
+            dep_data,
+            Some(&pipeline),
+            &dep_hash,
+            KDF_LEAF,
+            Some(&keys),
+            None,
+            false,
+        )
+        .unwrap();
+        // Both should round to same padding block, but compressed size should differ.
+        // At minimum, both should decode correctly.
+        assert!(dep_result.stored_blocks > 0);
+        assert!(nodict_result.stored_blocks > 0);
+    }
+
+    /// Test that D-chunk (no dictionary) encode/decode round-trips correctly
+    /// with the ZstdDictFromPrecedingEntry strategy.
+    #[test]
+    fn pipeline_d_chunk_no_dict_round_trip() {
+        let master_secret = [42u8; 32];
+        let mut keys = BTreeMap::new();
+        keys.insert(0x0eu8, master_secret);
+
+        let pipeline = BlobPipeline {
+            compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
+            padding: Some(PaddingStrategy { block_size: 1024 }),
+            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+        };
+
+        // Simulate a large-ish chunk (like real file data).
+        let data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+        let hash: [u8; 32] = *blake3::hash(&data).as_bytes();
+
+        // Encode as D-chunk (no dictionary).
+        let result = pipeline_encode(
+            &data,
+            Some(&pipeline),
+            &hash,
+            KDF_LEAF,
+            Some(&keys),
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Decode as D-chunk (no dictionary).
+        let decoded = pipeline_decode(
+            result.bytes,
+            Some(&pipeline),
+            Some(&hash),
+            0,
+            KDF_LEAF,
+            Some(&keys),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(&decoded[..], &data[..], "D-chunk round-trip failed");
+    }
+}

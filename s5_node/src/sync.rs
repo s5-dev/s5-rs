@@ -3,8 +3,8 @@ use std::{path::Path, sync::Arc};
 use anyhow::Result;
 use ed25519_dalek::SigningKey as DalekSigningKey;
 use s5_blobs::{Client as BlobsClient, RemoteBlobStore};
-use s5_core::{BlobStore, RegistryApi, StreamKey};
-use s5_fs::{DirContext, FS5, SigningKey as FsSigningKey};
+use s5_core::{RegistryApi, StreamKey, blob::BlobStore};
+use s5_fs::{DirActorContext, FS5, SigningKey as FsSigningKey};
 
 use crate::{RemoteRegistry, S5Node};
 
@@ -48,7 +48,7 @@ pub fn derive_sync_keys(shared_secret: impl AsRef<[u8]>) -> SyncKeys {
 
 /// Opens a plaintext FS5 instance rooted at the given path.
 pub fn open_plaintext_fs(path: &Path) -> Result<FS5> {
-    let context = DirContext::open_local_root(path)?;
+    let context = DirActorContext::open_local_root(path)?;
     Ok(FS5::open(context))
 }
 
@@ -59,11 +59,11 @@ pub fn open_encrypted_fs(
     blob_client: BlobsClient,
     registry: RemoteRegistry,
 ) -> FS5 {
-    let remote_store = RemoteBlobStore::new(blob_client);
-    let blob_store = BlobStore::new(remote_store);
+    // Client implements Store via RemoteBlobStore; wrap in BlobStore for FS5
+    let blob_store = BlobStore::new(RemoteBlobStore::new(blob_client));
     let registry_arc: Arc<dyn RegistryApi + Send + Sync> = Arc::new(registry);
 
-    let context = DirContext::new_encrypted_registry(
+    let context = DirActorContext::new_encrypted_registry(
         stream_key,
         derived.fs_signing_key(),
         derived.encryption_key,
@@ -102,87 +102,12 @@ pub async fn pull_snapshot(encrypted: &FS5, plaintext: &FS5) -> Result<()> {
 
 /// Runs all configured file syncs for a node.
 ///
-/// This is the orchestration previously implemented as
-/// `S5Node::run_file_sync`; the method now forwards here.
-pub async fn run_file_sync(node: &S5Node) -> Result<()> {
-    use s5_blobs::Client as BlobsClient;
-    use std::{path::Path, str::FromStr};
-
-    for (name, sync_cfg) in &node.config.sync {
-        tracing::info!("sync.{name} -> {}", sync_cfg.local_path);
-        // Determine untrusted hop (first entry)
-        let Some(first) = sync_cfg.via_untrusted.first() else {
-            continue;
-        };
-        let Some(peer) = node.config.peer.get(first) else {
-            tracing::warn!("sync.{name}: via_untrusted peer '{}' not found", first);
-            continue;
-        };
-
-        // Use the peer id string (EndpointId Debug/Display) for dialing
-        let dial_str = peer.id.clone();
-
-        // Derive keys
-        let keys = derive_sync_keys(&sync_cfg.shared_secret);
-        let stream_key = keys.stream_key();
-
-        // Open plaintext FS once
-        let plaintext = open_plaintext_fs(Path::new(&sync_cfg.local_path))?;
-
-        // Prepare owned captures for optional spawn
-        let endpoint = node.endpoint.clone();
-        let sync_name = name.clone();
-        if let Some(secs) = sync_cfg.interval_secs {
-            tracing::info!("sync.{name}: starting continuous sync every {secs}s");
-            let plaintext_fs = plaintext.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
-                loop {
-                    interval.tick().await;
-                    match iroh::EndpointId::from_str(&dial_str) {
-                        Ok(pid) => {
-                            let peer_addr: iroh::EndpointAddr = pid.into();
-                            let blobs_client =
-                                BlobsClient::connect(endpoint.clone(), peer_addr.clone());
-                            let registry_client =
-                                RemoteRegistry::connect(endpoint.clone(), peer_addr.clone());
-                            let encrypted =
-                                open_encrypted_fs(stream_key, &keys, blobs_client, registry_client);
-                            if let Err(err) = push_snapshot(&plaintext_fs, &encrypted).await {
-                                tracing::warn!("sync.{sync_name}: push failed: {err}");
-                            }
-                            if let Err(err) = pull_snapshot(&encrypted, &plaintext_fs).await {
-                                tracing::warn!("sync.{sync_name}: pull failed: {err}");
-                            }
-                        }
-                        Err(_) => tracing::warn!(
-                            "sync.{sync_name}: invalid endpoint id string '{}'; set peer.endpoint_id",
-                            dial_str
-                        ),
-                    }
-                }
-            });
-        } else {
-            match iroh::EndpointId::from_str(&dial_str) {
-                Ok(pid) => {
-                    let peer_addr: iroh::EndpointAddr = pid.into();
-                    let blobs_client = BlobsClient::connect(endpoint.clone(), peer_addr.clone());
-                    let registry_client = RemoteRegistry::connect(endpoint.clone(), peer_addr);
-                    let encrypted =
-                        open_encrypted_fs(stream_key, &keys, blobs_client, registry_client);
-                    if let Err(err) = push_snapshot(&plaintext, &encrypted).await {
-                        tracing::warn!("sync.{name}: push failed: {err}");
-                    }
-                    if let Err(err) = pull_snapshot(&encrypted, &plaintext).await {
-                        tracing::warn!("sync.{name}: pull failed: {err}");
-                    }
-                }
-                Err(_) => tracing::warn!(
-                    "sync.{name}: invalid endpoint id string '{}'; set peer.endpoint_id",
-                    dial_str
-                ),
-            }
-        }
-    }
+/// NOTE: The old `[sync.*]` config section has been removed. Sync is now
+/// handled through the vault/task model. This function is a no-op stub
+/// until the new task executor integrates sync logic.
+pub async fn run_file_sync(_node: &S5Node) -> Result<()> {
+    // The old config.sync field no longer exists. Sync operations will be
+    // driven by the task executor via RunTask RPC in the future.
+    tracing::debug!("run_file_sync: no-op (sync config removed, use tasks instead)");
     Ok(())
 }

@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use reqwest::header::{CONTENT_LENGTH, LAST_MODIFIED};
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::{FS5, FileRef};
 use scraper::{Html, Selector};
 use std::sync::Arc;

@@ -36,6 +36,7 @@
 
 use crate::Hash;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 mod order;
 
@@ -301,6 +302,44 @@ impl StreamMessage {
             signature,
             data,
         })
+    }
+
+    /// Create a signed Ed25519 registry entry.
+    ///
+    /// Derives the public key from `signing_key`, constructs the canonical
+    /// signing bytes, signs them, and returns a ready-to-publish message.
+    ///
+    /// TODO: Long-term, move Ed25519 signing internals into the s5_registry
+    /// crate so s5_core doesn't depend on ed25519-dalek directly.
+    ///
+    /// Signing bytes:
+    /// `[0x01 (Registry), 0x01 (Ed25519), pub_key(32), revision(8), 0x21 (Blake3), hash(32)]`
+    pub fn sign_ed25519_registry(
+        signing_key: &SigningKey,
+        hash: Hash,
+        revision: u64,
+    ) -> Result<Self, StreamMessageError> {
+        let verifying_key: VerifyingKey = signing_key.into();
+        let pub_key_bytes = verifying_key.to_bytes();
+
+        let mut sign_bytes = Vec::with_capacity(1 + 1 + 32 + 8 + 1 + 32);
+        sign_bytes.push(MessageType::Registry as u8);
+        sign_bytes.push(StreamKey::PUBLIC_KEY_ED25519_ID);
+        sign_bytes.extend_from_slice(&pub_key_bytes);
+        sign_bytes.extend_from_slice(&revision.to_be_bytes());
+        sign_bytes.push(0x21); // Multihash Blake3 identifier
+        sign_bytes.extend_from_slice(hash.as_bytes());
+
+        let signature = signing_key.sign(&sign_bytes);
+
+        Self::new(
+            MessageType::Registry,
+            StreamKey::PublicKeyEd25519(pub_key_bytes),
+            revision,
+            hash,
+            signature.to_bytes().to_vec().into_boxed_slice(),
+            None,
+        )
     }
 
     /// Serializes the message for wire transport.

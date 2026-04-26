@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use directories::ProjectDirs;
-use s5_core::BlobStore;
+use s5_core::blob::BlobStore;
 use s5_fs::FS5;
 use s5_node::config::S5NodeConfig;
 

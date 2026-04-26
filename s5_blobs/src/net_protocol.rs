@@ -4,8 +4,9 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use irpc_iroh::read_request;
+use s5_core::blob::BlobsRead;
 use s5_core::pins::{PinContext, Pins};
-use s5_core::{BlobStore, Hash};
+use s5_core::{Hash, blob::BlobStore};
 
 use crate::config::PeerConfigBlobs;
 use crate::rpc::{
@@ -16,7 +17,10 @@ const CHUNK_SIZE: usize = 64 * 1024; // 64k
 
 #[derive(Clone)]
 pub struct BlobsServer {
-    stores: Arc<HashMap<String, BlobStore>>, // named stores
+    stores: Arc<HashMap<String, BlobStore>>, // named stores (read + write)
+    /// Read-only sources that can be queried and downloaded from, but not written to.
+    /// These are checked alongside `stores` when a peer has the source name in `readable_stores`.
+    read_sources: Arc<HashMap<String, Arc<dyn BlobsRead>>>,
     // Keyed by stringified remote id (Display or Debug form).
     // The map may also contain a special "*" wildcard entry which
     // is used when no exact peer id match is found.
@@ -31,6 +35,10 @@ impl std::fmt::Debug for BlobsServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlobsServer")
             .field("stores", &self.stores.keys().collect::<Vec<_>>())
+            .field(
+                "read_sources",
+                &self.read_sources.keys().collect::<Vec<_>>(),
+            )
             .field("peer_cfg", &self.peer_cfg.keys().collect::<Vec<_>>())
             .field("pinner", &self.pinner.is_some())
             .finish()
@@ -45,6 +53,25 @@ impl BlobsServer {
     ) -> Self {
         Self {
             stores: Arc::new(stores),
+            read_sources: Arc::new(HashMap::new()),
+            peer_cfg: Arc::new(peer_cfg),
+            pinner,
+        }
+    }
+
+    /// Creates a new BlobsServer with both read-write stores and read-only sources.
+    ///
+    /// Read-only sources (like `LocalLinksStore`) can be queried and downloaded from
+    /// but cannot receive uploads. They are referenced by name in `readable_stores`.
+    pub fn with_read_sources(
+        stores: HashMap<String, BlobStore>,
+        read_sources: HashMap<String, Arc<dyn BlobsRead>>,
+        peer_cfg: HashMap<String, PeerConfigBlobs>,
+        pinner: Option<Arc<dyn Pins>>,
+    ) -> Self {
+        Self {
+            stores: Arc::new(stores),
+            read_sources: Arc::new(read_sources),
             peer_cfg: Arc::new(peer_cfg),
             pinner,
         }
@@ -61,90 +88,60 @@ impl BlobsServer {
 
 impl ProtocolHandler for BlobsServer {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // Use remote_id if available on this iroh version
-        let node_id = conn.remote_id()?;
-        log::debug!("s5_blobs: accepted connection from {node_id}");
-        // Use the EndpointId display string as the canonical key for
-        // ACL lookups so that the same string can be used consistently
-        // in logs, configs, and client code.
+        let node_id = conn.remote_id();
         let node_key = node_id.to_string();
         let node_id_bytes: [u8; 32] = *node_id.as_bytes();
 
+        tracing::info!(
+            peer = %node_id.fmt_short(),
+            "blobs: accepted connection"
+        );
+
+        let mut request_count = 0u64;
         while let Some(msg) = read_request::<RpcProto>(&conn).await? {
+            request_count += 1;
             match msg {
                 RpcMessage::Query(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ =
-                        handle_query(&node_key, &self.stores, self.cfg_for(&node_key), inner, tx)
-                            .await;
+                    let _ = handle_query(self, &node_key, inner, tx).await;
                 }
                 RpcMessage::UploadBlob(msg) => {
                     let irpc::WithChannels { inner, rx, tx, .. } = msg;
-                    let _ = handle_upload(
-                        node_id_bytes,
-                        &self.stores,
-                        self.cfg_for(&node_key),
-                        self.pinner.clone(),
-                        inner,
-                        rx,
-                        tx,
-                    )
-                    .await;
+                    let _ = handle_upload(self, &node_key, node_id_bytes, inner, rx, tx).await;
                 }
                 RpcMessage::DownloadBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_download(
-                        &node_key,
-                        node_id_bytes,
-                        &self.stores,
-                        self.cfg_for(&node_key),
-                        self.pinner.clone(),
-                        inner,
-                        tx,
-                    )
-                    .await;
+                    let _ = handle_download(self, &node_key, node_id_bytes, inner, tx).await;
                 }
                 RpcMessage::DeleteBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_delete(
-                        &node_key,
-                        node_id_bytes,
-                        &self.stores,
-                        self.cfg_for(&node_key),
-                        self.pinner.clone(),
-                        inner,
-                        tx,
-                    )
-                    .await;
+                    let _ = handle_delete(self, &node_key, node_id_bytes, inner, tx).await;
                 }
                 RpcMessage::PinBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_pin(
-                        node_id_bytes,
-                        &self.stores,
-                        self.cfg_for(&node_key),
-                        self.pinner.clone(),
-                        inner,
-                        tx,
-                    )
-                    .await;
+                    let _ = handle_pin(self, &node_key, node_id_bytes, inner, tx).await;
                 }
             }
         }
+
+        tracing::info!(
+            peer = %node_id.fmt_short(),
+            request_count,
+            "blobs: connection closed"
+        );
         conn.closed().await;
         Ok(())
     }
 }
 
 async fn handle_pin(
+    server: &BlobsServer,
+    node_key: &str,
     node_id_bytes: [u8; 32],
-    stores: &HashMap<String, BlobStore>,
-    cfg: Option<&PeerConfigBlobs>,
-    pinner: Option<Arc<dyn Pins>>,
     req: PinBlob,
     tx: irpc::channel::oneshot::Sender<Result<bool, String>>,
 ) {
-    let Some(cfg) = cfg else {
+    let Some(cfg) = server.cfg_for(node_key) else {
         let _ = tx.send(Err("permission denied".into())).await;
         return;
     };
@@ -153,7 +150,7 @@ async fn handle_pin(
         let _ = tx.send(Err("uploads (pinning) not allowed".into())).await;
         return;
     };
-    let Some(store) = stores.get(store_name) else {
+    let Some(store) = server.stores.get(store_name) else {
         let _ = tx.send(Err("invalid upload store".into())).await;
         return;
     };
@@ -164,7 +161,7 @@ async fn handle_pin(
     match store.contains(hash).await {
         Ok(true) => {
             // Blob exists, try to pin it
-            if let Some(pinner) = pinner
+            if let Some(pinner) = &server.pinner
                 && let Err(e) = pinner
                     .pin_hash(hash, PinContext::NodeId(node_id_bytes))
                     .await
@@ -185,23 +182,23 @@ async fn handle_pin(
 }
 
 async fn handle_query(
-    _node_key: &str,
-    stores: &HashMap<String, BlobStore>,
-    cfg: Option<&PeerConfigBlobs>,
+    server: &BlobsServer,
+    node_key: &str,
     query: Query,
     tx: irpc::channel::oneshot::Sender<QueryResponse>,
 ) {
     // TODO: If/when target_types is added, support additional targets (e.g. Obao6) in queries/answers.
     let mut resp = QueryResponse::default();
 
-    if let Some(cfg) = cfg {
+    if let Some(cfg) = server.cfg_for(node_key) {
         if query.blinded {
             // Blinded query: hash field contains blake3(actual_hash)
             // We need to find a blob where blake3(blob_hash) == query.hash
+            // Note: blinded queries only work on full BlobStores (need list_hashes)
             let blinded_hash = query.hash;
 
             for name in &cfg.readable_stores {
-                if let Some(store) = stores.get(name) {
+                if let Some(store) = server.stores.get(name) {
                     // Try to find matching blob by checking blinded hashes
                     if let Some(actual_hash) = find_blob_by_blinded_hash(store, blinded_hash).await
                     {
@@ -226,7 +223,8 @@ async fn handle_query(
             let hash: Hash = query.hash.into();
 
             for name in &cfg.readable_stores {
-                if let Some(store) = stores.get(name)
+                // Check full stores first (they can provide locations)
+                if let Some(store) = server.stores.get(name)
                     && let Ok(true) = store.contains(hash).await
                 {
                     resp.exists = true;
@@ -240,6 +238,18 @@ async fn handle_query(
                         // TODO: optionally filter by query.location_types
                         resp.locations.append(&mut locs);
                     }
+                }
+                // Also check read-only sources
+                else if let Some(source) = server.read_sources.get(name)
+                    && let Ok(true) = source.blob_contains(hash).await
+                {
+                    resp.exists = true;
+                    if resp.size.is_none()
+                        && let Ok(sz) = source.blob_get_size(hash).await
+                    {
+                        resp.size = Some(sz);
+                    }
+                    // Read-only sources don't provide locations
                 }
             }
         }
@@ -272,15 +282,14 @@ async fn find_blob_by_blinded_hash(store: &BlobStore, blinded_hash: [u8; 32]) ->
 }
 
 async fn handle_upload(
+    server: &BlobsServer,
+    node_key: &str,
     node_id_bytes: [u8; 32],
-    stores: &HashMap<String, BlobStore>,
-    cfg: Option<&PeerConfigBlobs>,
-    pinner: Option<Arc<dyn Pins>>,
     req: UploadBlob,
     rx: irpc::channel::mpsc::Receiver<bytes::Bytes>,
     tx: irpc::channel::oneshot::Sender<Result<(), String>>,
 ) {
-    let Some(cfg) = cfg else {
+    let Some(cfg) = server.cfg_for(node_key) else {
         let _ = tx.send(Err("permission denied".into())).await;
         return;
     };
@@ -288,7 +297,7 @@ async fn handle_upload(
         let _ = tx.send(Err("uploads not allowed".into())).await;
         return;
     };
-    let Some(store) = stores.get(store_name) else {
+    let Some(store) = server.stores.get(store_name) else {
         let _ = tx.send(Err("invalid upload store".into())).await;
         return;
     };
@@ -312,7 +321,7 @@ async fn handle_upload(
                 let _ = store.delete(got_hash).await; // best-effort cleanup on mismatch
                 let _ = tx.send(Err("hash/size mismatch".into())).await;
             } else {
-                if let Some(pinner) = pinner
+                if let Some(pinner) = &server.pinner
                     && let Err(e) = pinner
                         .pin_hash(got_hash, PinContext::NodeId(node_id_bytes))
                         .await
@@ -331,53 +340,135 @@ async fn handle_upload(
 }
 
 async fn handle_download(
-    _node_key: &str,
+    server: &BlobsServer,
+    node_key: &str,
     node_id_bytes: [u8; 32],
-    stores: &HashMap<String, BlobStore>,
-    cfg: Option<&PeerConfigBlobs>,
-    pinner: Option<Arc<dyn Pins>>,
     req: DownloadBlob,
     tx: irpc::channel::mpsc::Sender<bytes::Bytes>,
 ) {
-    let Some(cfg) = cfg else {
+    let hash: Hash = req.hash.into();
+    let hash_short = hash.fmt_short();
+
+    tracing::info!(
+        peer = node_key,
+        hash = hash_short,
+        "handle_download: request received"
+    );
+
+    let Some(cfg) = server.cfg_for(node_key) else {
+        tracing::warn!(
+            peer = node_key,
+            hash = hash_short,
+            "download denied: no peer config"
+        );
         return;
     };
-    let hash: Hash = req.hash.into();
 
-    if let Some(pinner) = &pinner {
-        // Check if user has pinned the blob
+    // Find first readable source containing the blob (stores or read-only sources)
+    let mut size_opt: Option<u64> = None;
+    let mut source_opt: Option<Arc<dyn BlobsRead>> = None;
+    let mut from_read_source = false;
+    let mut source_name: Option<String> = None;
+
+    for name in &cfg.readable_stores {
+        // Check full stores first
+        if let Some(store) = server.stores.get(name) {
+            match store.contains(hash).await {
+                Ok(true) => {
+                    if let Ok(sz) = store.size(hash).await {
+                        size_opt = Some(sz);
+                    }
+                    source_opt = Some(Arc::new(store.clone()) as Arc<dyn BlobsRead>);
+                    source_name = Some(name.clone());
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::info!(
+                        store = name,
+                        hash = hash_short,
+                        error = %e,
+                        "store.contains failed"
+                    );
+                }
+            }
+        }
+        // Also check read-only sources
+        if let Some(source) = server.read_sources.get(name) {
+            match source.blob_contains(hash).await {
+                Ok(true) => {
+                    if let Ok(sz) = source.blob_get_size(hash).await {
+                        size_opt = Some(sz);
+                    }
+                    source_opt = Some(source.clone());
+                    from_read_source = true;
+                    source_name = Some(name.clone());
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::info!(
+                        source = name,
+                        hash = hash_short,
+                        error = %e,
+                        "read_source.blob_contains failed"
+                    );
+                }
+            }
+        }
+    }
+
+    // Pin check: only required for blobs from regular stores.
+    // Read sources are explicitly published data — any peer configured
+    // to read them should be able to download without pinning.
+    if !from_read_source
+        && !cfg.skip_pin_check
+        && let Some(pinner) = &server.pinner
+    {
         let is_pinned = pinner
             .is_pinned(hash, PinContext::NodeId(node_id_bytes))
             .await
             .unwrap_or(false);
 
         if !is_pinned {
+            tracing::info!(
+                peer = node_key,
+                hash = hash_short,
+                "download denied: not pinned"
+            );
             return; // Not pinned by this user, deny download
         }
     }
 
-    // find first readable store containing the blob
-    let mut size_opt = None;
-    let mut store_opt: Option<&BlobStore> = None;
-    for name in &cfg.readable_stores {
-        if let Some(s) = stores.get(name)
-            && let Ok(true) = s.contains(hash).await
-        {
-            if let Ok(sz) = s.size(hash).await {
-                size_opt = Some(sz);
-            }
-            store_opt = Some(s);
-            break;
-        }
-    }
-    let Some(store) = store_opt else {
+    let Some(source) = source_opt else {
+        tracing::info!(
+            peer = node_key,
+            hash = hash_short,
+            readable_stores = ?cfg.readable_stores,
+            num_stores = server.stores.len(),
+            num_read_sources = server.read_sources.len(),
+            "download: blob not found in any readable store"
+        );
         return;
     };
     let Some(size) = size_opt else {
+        tracing::warn!(
+            peer = node_key,
+            hash = hash_short,
+            source = ?source_name,
+            "download: blob exists but size unknown"
+        );
         return;
     };
 
     if req.offset > size {
+        tracing::warn!(
+            peer = node_key,
+            hash = hash_short,
+            offset = req.offset,
+            size,
+            "download: offset beyond blob size"
+        );
         return;
     }
     // TODO: If requests carry chunk bitmaps, use them to shape the read plan and coalesce chunks.
@@ -386,37 +477,62 @@ async fn handle_download(
         None => size - req.offset,
     };
 
+    tracing::info!(
+        peer = node_key,
+        hash = hash_short,
+        source = ?source_name,
+        size,
+        to_send,
+        from_read_source,
+        "download: sending blob"
+    );
+
     let mut sent: u64 = 0;
     while sent < to_send {
         let want = std::cmp::min(CHUNK_SIZE as u64, to_send - sent);
-        match store
-            .read_as_bytes(hash, req.offset + sent, Some(want))
+        match source
+            .blob_download_slice(hash, req.offset + sent, Some(want))
             .await
         {
             Ok(bytes) => {
                 if bytes.is_empty() {
+                    tracing::warn!(
+                        hash = hash_short,
+                        sent,
+                        to_send,
+                        offset = req.offset + sent,
+                        "download: got empty slice mid-transfer"
+                    );
                     break;
                 }
                 if tx.send(bytes.clone()).await.is_err() {
+                    tracing::info!(hash = hash_short, sent, "download: peer disconnected");
                     break;
                 }
                 sent += bytes.len() as u64;
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!(
+                    hash = hash_short,
+                    sent,
+                    to_send,
+                    error = %e,
+                    "download: slice read failed"
+                );
+                break;
+            }
         }
     }
 }
 
 async fn handle_delete(
-    _node_key: &str,
+    server: &BlobsServer,
+    node_key: &str,
     node_id_bytes: [u8; 32],
-    stores: &HashMap<String, BlobStore>,
-    cfg: Option<&PeerConfigBlobs>,
-    pinner: Option<Arc<dyn Pins>>,
     req: DeleteBlob,
     tx: irpc::channel::oneshot::Sender<Result<bool, String>>,
 ) {
-    let Some(cfg) = cfg else {
+    let Some(cfg) = server.cfg_for(node_key) else {
         let _ = tx.send(Err("permission denied".into())).await;
         return;
     };
@@ -428,14 +544,14 @@ async fn handle_delete(
 
     let hash: Hash = req.hash.into();
 
-    if let Some(pinner) = pinner {
+    if let Some(pinner) = &server.pinner {
         match pinner
             .unpin_hash(hash, PinContext::NodeId(node_id_bytes))
             .await
         {
             Ok(orphaned) => {
                 if orphaned {
-                    for store in stores.values() {
+                    for store in server.stores.values() {
                         let _ = store.delete(hash).await;
                     }
                     let _ = tx.send(Ok(true)).await;

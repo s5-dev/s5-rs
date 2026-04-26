@@ -183,9 +183,12 @@ enum BlobsCmd {
 enum SnapshotsCmd {
     /// Show the current remote snapshot head for a sync job
     Head {
-        /// Name of the sync entry in the node config (e.g. "project")
-        #[arg(long, value_name = "NAME")]
-        sync: String,
+        /// Name of the peer in the node config to query the registry from
+        #[arg(short, long)]
+        peer: String,
+        /// Shared secret used to derive the sync stream key
+        #[arg(long, value_name = "SECRET")]
+        shared_secret: String,
     },
     /// Download a raw directory snapshot blob from a peer
     Download {

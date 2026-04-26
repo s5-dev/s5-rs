@@ -4,13 +4,10 @@
 //! for exchanging content-addressed blobs over iroh:
 //!
 //! - [`Client`]: a high-level RPC client that implements
-//!   [`s5_core::BlobsRead`] and [`s5_core::BlobsWrite`] (with `server` feature).
+//!   [`s5_core::BlobsRead`] and [`s5_core::BlobsWrite`] (read is always available,
+//!   write requires `server` feature).
 //! - [`BlobsServer`]: a server-side handler that exposes named
 //!   blob stores over an iroh [`iroh::Endpoint`]. (requires `server` feature)
-//! - [`RemoteBlobStore`]: a remote implementation of
-//!   [`s5_core::Store`] backed by a [`Client`], suitable for
-//!   use with [`s5_core::BlobStore`] as a generic remote
-//!   storage backend.
 //! - [`MultiFetcher`]: fetches blobs from multiple sources with fallback.
 //!
 //! These building blocks can be composed to run a blob-serving
@@ -19,11 +16,12 @@
 //! ## Features
 //!
 //! - `server` (default): Enables server-side functionality including `BlobsServer`
-//!   and the `BlobsRead`/`BlobsWrite` trait implementations on `Client`.
+//!   and the `BlobsWrite` trait implementation on `Client`.
 //!   Requires tokio. Not WASM-compatible.
 //!
-//! For WASM/browser usage, disable default features to get `Client`, `RemoteBlobStore`,
-//! `MultiFetcher`, and RPC types.
+//! For WASM/browser usage, disable default features to get `Client`,
+//! `MultiFetcher`, and RPC types (note: `Client` still implements `BlobsRead`
+//! even without the server feature).
 
 pub mod rpc;
 pub use crate::rpc::ALPN;

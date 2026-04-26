@@ -1,0 +1,35 @@
+[package]
+name = "vup_cli"
+version.workspace = true
+edition = "2024"
+description = "Personal backup, sync, and archive tool built on S5"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "vup"
+path = "src/main.rs"
+
+[dependencies]
+age = { version = "0.11", default-features = false }
+anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["derive"] }
+clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
+dialoguer = "0.11"
+directories = "6.0.0"
+dirs = "6.0.0"
+humansize = "2"
+indicatif = "0.17"
+rand = "0.8"
+s5_core = { workspace = true }
+s5_node = { workspace = true }
+s5_node_api.workspace = true
+s5_store_s3 = { path = "../blob_stores/s3" }
+serde_json.workspace = true
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
