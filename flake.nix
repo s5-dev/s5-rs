@@ -41,6 +41,7 @@
           default = pkgs.mkShell {
             buildInputs = [
               rustToolchain
+              pkgs.cargo-deny
               pkgs.cargo-nextest
               pkgs.sccache
               pkgs.pkg-config

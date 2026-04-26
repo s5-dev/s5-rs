@@ -49,3 +49,19 @@ jobs:
 
       - name: Run Doctests
         run: nix develop --command cargo test --workspace --doc --locked
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/flakehub-cache-action@main
+
+      - name: cargo deny check
+        run: nix develop --command cargo deny --workspace check
