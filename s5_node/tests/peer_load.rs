@@ -233,9 +233,10 @@ async fn peer_snapshot_round_trip_via_relay() -> Result<()> {
     // we crack open A's vault root file directly — same secret, just a
     // different code path to it.
     let a_root_file = vault_root_path(&a_vault_dir.path().to_string_lossy());
-    let (root_node_a, _, ctx_a) = load_vault_root(&a_root_file, &[identity_path_str.clone()])
-        .context("loading A's vault root for vault_id extraction")?
-        .ok_or_else(|| anyhow!("A's vault root file missing after publish"))?;
+    let (root_node_a, _, ctx_a) =
+        load_vault_root(&a_root_file, std::slice::from_ref(&identity_path_str))
+            .context("loading A's vault root for vault_id extraction")?
+            .ok_or_else(|| anyhow!("A's vault root file missing after publish"))?;
     let recovery_secret: [u8; 32] = ctx_a
         .keys
         .as_ref()
@@ -277,7 +278,7 @@ async fn peer_snapshot_round_trip_via_relay() -> Result<()> {
         vault_id,
         &registry_b,
         &relay_b_blob,
-        &[identity_path_str.clone()],
+        std::slice::from_ref(&identity_path_str),
         Arc::clone(&read_store),
     )
     .await

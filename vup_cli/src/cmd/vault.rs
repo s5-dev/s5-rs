@@ -73,10 +73,7 @@ pub async fn run_history(client: &S5NodeClient, vault: &str) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<16} {:<10} {:<12} DATE",
-        "HASH", "FILES", "SIZE"
-    );
+    println!("{:<16} {:<10} {:<12} DATE", "HASH", "FILES", "SIZE");
     for snap in &resp.snapshots {
         let hash_short = if snap.hash.len() > 12 {
             &snap.hash[..12]
@@ -230,10 +227,7 @@ pub async fn run_info(client: &S5NodeClient, vault: &str) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn fetch_vault_config(
-    client: &S5NodeClient,
-    vault: &str,
-) -> Result<serde_json::Value> {
+async fn fetch_vault_config(client: &S5NodeClient, vault: &str) -> Result<serde_json::Value> {
     let resp = client.get_config().await?;
     let config: serde_json::Value = serde_json::from_str(&resp.config_json)?;
     config

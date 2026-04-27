@@ -152,6 +152,7 @@ enum BlobsCmd {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::enum_variant_names)] // `Fs` distinguishes the local-FS5-root verbs from future non-FS subcommands; renaming is a CLI surface change.
 enum SnapshotsCmd {
     /// List snapshots for the local FS5 root backing this node
     ListFs,

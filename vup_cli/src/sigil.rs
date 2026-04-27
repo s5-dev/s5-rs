@@ -192,26 +192,11 @@ mod tests {
 
     #[test]
     fn rewrite_with_combined_globals() {
-        let mut a = argv(&[
-            "vup",
-            "--config",
-            "/p",
-            "--verbose",
-            "+music",
-            "s",
-        ]);
+        let mut a = argv(&["vup", "--config", "/p", "--verbose", "+music", "s"]);
         rewrite_vault_prefix(&mut a);
         assert_eq!(
             a,
-            argv(&[
-                "vup",
-                "--config",
-                "/p",
-                "--verbose",
-                "vault",
-                "music",
-                "s"
-            ])
+            argv(&["vup", "--config", "/p", "--verbose", "vault", "music", "s"])
         );
     }
 
