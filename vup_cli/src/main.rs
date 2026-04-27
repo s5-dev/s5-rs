@@ -2,17 +2,33 @@ mod cmd;
 mod node;
 mod progress;
 mod recovery;
+mod sigil;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::InfoLevel;
 use std::path::PathBuf;
 
+use crate::cmd::{StoreCmd, VaultAction};
+
 #[derive(Parser)]
 #[command(
     name = "vup",
     version,
-    about = "Personal backup, sync, and archive tool built on S5"
+    about = "Personal backup, sync, and archive tool built on S5",
+    long_about = "\
+The vup CLI uses sigil-prefixed references:
+  +vault         a configured vault   (e.g. `vup +music snap`)
+  @identity      a paired peer        (e.g. `vup +music grant @alice -r`)
+  #snap          a snapshot id        (e.g. `vup +music restore --snap #ab12…`)
+
+Top-level verbs (no `+vault`):
+  onboard ls new drop join peers unpair store
+
+Vault-scoped verbs (after `+vault`):
+  add info snap history restore mount grant pair export who kick
+
+See `cli-workflows.md` for the full grammar and worked examples."
 )]
 struct Cli {
     #[command(flatten)]
@@ -28,123 +44,102 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize vup: create config, keys, and directories
-    Init,
+    // -- Top-level vocabulary ------------------------------------------------
+    /// First-run setup wizard.
+    #[command(alias = "o")]
+    Onboard,
 
-    /// Show node status, configured stores, sources, and running tasks
+    /// List configured vaults.
+    #[command(alias = "l")]
+    Ls,
+
+    /// Create a new vault.
+    #[command(alias = "n")]
+    New {
+        /// Vault to create, e.g. `+music` or `music`.
+        #[arg(value_parser = sigil::parse_vault_ref)]
+        vault: String,
+    },
+
+    /// Delete a vault config (does not destroy stored data).
+    #[command(alias = "d")]
+    Drop {
+        /// Vault to drop, e.g. `+music` or `music`.
+        #[arg(value_parser = sigil::parse_vault_ref)]
+        vault: String,
+    },
+
+    /// Consume a share/pair/grant URL.
+    #[command(alias = "j")]
+    Join {
+        /// `s5://…` URL.
+        url: String,
+    },
+
+    /// List known peer identities.
+    #[command(alias = "p")]
+    Peers,
+
+    /// Forget a peer identity.
+    #[command(alias = "u")]
+    Unpair {
+        /// Identity to forget (e.g. `@alice`).
+        id: String,
+    },
+
+    /// Store sub-namespace (`add`, `ls`, `info`, `rm`, `allow`, `disallow`).
+    Store {
+        #[command(subcommand)]
+        cmd: StoreCmd,
+    },
+
+    /// Vault-scoped action — invoked as `vup +<vault> <action>`.
+    /// Hidden because users learn the `+vault` form.
+    #[command(hide = true)]
+    Vault {
+        /// Vault name (already stripped of the `+` prefix by the sigil
+        /// router). May be `all` for the wildcard form.
+        name: String,
+        #[command(subcommand)]
+        action: VaultAction,
+    },
+
+    // -- Utility verbs (kept) ------------------------------------------------
+    /// Show node status, configured stores, sources, and running tasks.
     Status,
 
-    /// Add a path to a source (creates the source if needed)
-    Add {
-        /// Paths to add
-        paths: Vec<PathBuf>,
-        /// Source name (default: "default")
-        #[arg(long, short, default_value = "default")]
-        source: String,
-    },
-
-    /// Run a full backup (ingest + publish)
-    Backup {
-        /// Vault name (default: from config)
-        #[arg(long)]
-        vault: Option<String>,
-        /// Source name (default: from config)
-        #[arg(long)]
-        source: Option<String>,
-        /// Blob store name (default: from vault config)
-        #[arg(long)]
-        blob_store: Option<String>,
-        /// Encryption key names (default: vault key + recovery)
-        #[arg(long, short)]
-        key: Vec<String>,
-    },
-
-    /// Restore a vault snapshot to a local directory
-    Restore {
-        /// Vault name
-        #[arg(long)]
-        vault: String,
-        /// Target directory for restored files
-        #[arg(long)]
-        target: String,
-        /// Override blob store (default: use vault's blob_stores)
-        #[arg(long)]
-        blob_store: Option<String>,
-    },
-
-    /// Disaster recovery: restore from paper age key + remote store
-    RemoteRestore {
-        /// Vault name (must match the original vault)
-        #[arg(long)]
-        vault: String,
-        /// The age secret key (AGE-SECRET-KEY-1...)
-        #[arg(long)]
-        age_secret_key: String,
-        /// Blob store name for downloading
-        #[arg(long)]
-        blob_store: String,
-        /// Target directory for restored files
-        #[arg(long)]
-        target: String,
-    },
-
-    /// List vault snapshots
-    Snapshots {
-        /// Vault name (omit for all vaults)
-        vault: Option<String>,
-    },
-
-    /// Show or edit node configuration
+    /// Show or edit node configuration.
     Config {
-        /// Print current config as JSON
+        /// Print current config as JSON.
         #[arg(long)]
         json: bool,
-        /// Apply a JSON Patch (RFC 6902) from a string
+        /// Apply a JSON Patch (RFC 6902) from a string.
         #[arg(long)]
         patch: Option<String>,
-        /// Apply a JSON Patch (RFC 6902) from a file
+        /// Apply a JSON Patch (RFC 6902) from a file.
         #[arg(long)]
         patch_file: Option<PathBuf>,
     },
 
-    /// Run a named task from node config
-    RunTask {
-        /// Task name (defined in [task.*] config)
-        name: String,
-    },
-
-    /// Run an inline ingest task (walk + upload + persist)
-    Ingest {
-        /// Vault name
-        #[arg(long)]
-        vault: String,
-        /// Source name
-        #[arg(long)]
-        source: String,
-        /// Blob store name for file content
-        #[arg(long)]
-        blob_store: String,
-    },
-
-    /// Show status of a running or completed task
-    TaskStatus {
-        /// Task ID
-        task_id: u64,
-    },
-
-    /// List all tasks
+    /// List all node tasks.
     Tasks,
 
-    /// Cancel a running task
-    Cancel {
-        /// Task ID
+    /// Show status of a running or completed task.
+    TaskStatus {
+        /// Task ID.
         task_id: u64,
     },
 
-    /// Shut down the running s5 node
+    /// Cancel a running task.
+    Cancel {
+        /// Task ID.
+        task_id: u64,
+    },
+
+    /// Shut down the running s5 node.
     Shutdown,
 
-    /// Run the s5 node daemon (internal — used by auto-start)
+    /// Run the s5 node daemon (internal — used by auto-start).
     #[command(hide = true)]
     #[command(name = "_daemon")]
     Daemon,
@@ -159,20 +154,24 @@ fn resolve_config(cli_override: Option<PathBuf>) -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Sigil routing: rewrite `+<vault> …` into `vault <vault> …` so clap
+    // dispatches to the hidden Vault subcommand.
+    let mut argv: Vec<String> = std::env::args().collect();
+    sigil::rewrite_vault_prefix(&mut argv);
 
-    // For the daemon, write logs to ~/.cache/s5/logs/node.log
+    let cli = Cli::parse_from(&argv);
+
     let is_daemon = matches!(&cli.cmd, Commands::Daemon);
 
     if is_daemon {
         let log_dir = dirs::cache_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .unwrap_or_else(|| PathBuf::from("."))
             .join("s5")
             .join("logs");
         std::fs::create_dir_all(&log_dir)?;
 
         let file_appender = tracing_appender::rolling::never(&log_dir, "node.log");
-        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
         tracing_subscriber::fmt()
             .with_max_level(cli.verbosity)
@@ -180,8 +179,8 @@ async fn main() -> Result<()> {
             .with_ansi(false)
             .init();
 
-        // Leak the guard to keep it alive for the entire program
-        Box::leak(Box::new(_guard));
+        // Keep the appender guard alive for the program's lifetime.
+        Box::leak(Box::new(guard));
     } else {
         tracing_subscriber::fmt()
             .with_max_level(cli.verbosity)
@@ -190,80 +189,79 @@ async fn main() -> Result<()> {
 
     let config_path = resolve_config(cli.config)?;
 
-    // Commands that don't need a shared node connection.
-    match &cli.cmd {
-        Commands::Init => return cmd::init::run_init(&config_path).await,
-        Commands::Daemon => return node::run_daemon(&config_path).await,
-        Commands::Shutdown => return cmd::run_shutdown(&config_path).await,
-        _ => {}
+    // The CLI is an RPC frontend; every verb routes through the running
+    // daemon. Only two verbs are exempt:
+    //   - `_daemon` IS the daemon (cannot connect to itself).
+    //   - `onboard` is the bootstrap that creates the config the daemon
+    //     needs to start.
+    if matches!(&cli.cmd, Commands::Daemon) {
+        return node::run_daemon(&config_path).await;
+    }
+    if matches!(&cli.cmd, Commands::Onboard) {
+        return cmd::onboard::run_onboard(&config_path).await;
     }
 
-    // Commands that need a node connection — connect once, close cleanly.
     let client = node::ensure_node_running(&config_path).await?;
     let result = match cli.cmd {
-        Commands::Init | Commands::Daemon | Commands::Shutdown => unreachable!(),
+        Commands::Daemon | Commands::Onboard => unreachable!("handled above"),
 
+        // -- Utility ---------------------------------------------------------
+        Commands::Shutdown => cmd::run_shutdown(&client).await,
         Commands::Status => cmd::run_status(&client).await,
-
-        Commands::Add { paths, source } => cmd::run_add(&client, &source, &paths).await,
-
-        Commands::Snapshots { vault } => cmd::run_snapshots(&client, vault).await,
-
         Commands::Config {
             json,
             patch,
             patch_file,
         } => cmd::run_config(&client, json, patch, patch_file).await,
-
-        // Task commands
-        Commands::RunTask { name } => cmd::tasks::run_task_by_name(&client, &name).await,
-        Commands::Ingest {
-            vault,
-            source,
-            blob_store,
-        } => cmd::tasks::run_ingest(&client, &vault, &source, &blob_store).await,
-        Commands::Backup {
-            vault,
-            source,
-            blob_store,
-            key,
-        } => {
-            cmd::tasks::run_backup(
-                &client,
-                vault.as_deref(),
-                source.as_deref(),
-                blob_store.as_deref(),
-                &key,
-            )
-            .await
-        }
-        Commands::Restore {
-            vault,
-            target,
-            blob_store,
-        } => cmd::tasks::run_restore_task(&client, &vault, &target, blob_store.as_deref()).await,
-        Commands::RemoteRestore {
-            vault,
-            age_secret_key,
-            blob_store,
-            target,
-        } => {
-            cmd::tasks::run_remote_restore_task(
-                &client,
-                &age_secret_key,
-                &vault,
-                &blob_store,
-                &target,
-            )
-            .await
-        }
-        Commands::TaskStatus { task_id } => cmd::tasks::task_status(&client, task_id).await,
         Commands::Tasks => cmd::tasks::list_tasks(&client).await,
+        Commands::TaskStatus { task_id } => cmd::tasks::task_status(&client, task_id).await,
         Commands::Cancel { task_id } => cmd::tasks::cancel_task(&client, task_id).await,
+
+        // -- Top-level vault lifecycle --------------------------------------
+        Commands::Ls => cmd::lifecycle::run_ls(&client).await,
+        Commands::New { vault } => cmd::lifecycle::run_new(&client, &vault).await,
+        Commands::Drop { vault } => cmd::lifecycle::run_drop(&client, &vault).await,
+
+        // -- Top-level identity / consume URL (stubs) -----------------------
+        Commands::Join { url } => cmd::stubs::run_join(&client, &url).await,
+        Commands::Peers => cmd::stubs::run_peers(&client).await,
+        Commands::Unpair { id } => cmd::stubs::run_unpair(&client, &id).await,
+        Commands::Store { cmd } => cmd::stubs::run_store(&client, cmd).await,
+
+        // -- Vault-scoped: dispatch on action -------------------------------
+        Commands::Vault { name, action } => dispatch_vault(&client, &name, action).await,
     };
 
-    // Gracefully close the iroh endpoint before the runtime shuts down.
     client.close().await;
-
     result
+}
+
+async fn dispatch_vault(
+    client: &s5_node_api::S5NodeClient,
+    vault: &str,
+    action: VaultAction,
+) -> Result<()> {
+    use cmd::stubs as st;
+    use cmd::vault as v;
+    match action {
+        VaultAction::Add { paths } => v::run_add(client, vault, &paths).await,
+        VaultAction::Info => v::run_info(client, vault).await,
+        VaultAction::Snap { watch } => v::run_snap(client, vault, watch).await,
+        VaultAction::History => v::run_history(client, vault).await,
+        VaultAction::Restore { snap } => {
+            // Restore target defaults to <cwd>/restored/<vault>; the user
+            // can override later (for now there's no --to flag).
+            let target = std::env::current_dir()?.join("restored").join(vault);
+            std::fs::create_dir_all(&target)?;
+            v::run_restore(client, vault, snap.as_deref(), &target).await
+        }
+        VaultAction::Mount { path } => st::run_mount(client, vault, &path).await,
+        VaultAction::Grant { id, read, write } => {
+            st::run_grant(client, vault, &id, read, write).await
+        }
+        VaultAction::Pair { id } => st::run_pair(client, vault, &id).await,
+        VaultAction::Export { path } => st::run_export(client, vault, path.as_deref()).await,
+        VaultAction::Who => st::run_who(client, vault).await,
+        VaultAction::Kick { id } => st::run_kick(client, vault, &id).await,
+    }
 }

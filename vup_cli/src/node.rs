@@ -92,7 +92,7 @@ pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
     // Verify config exists before attempting to spawn
     if !config_path.exists() {
         bail!(
-            "s5 node config not found at {}. Run `vup init` to set up, or pass --config.",
+            "s5 node config not found at {}. Run `vup onboard` to set up, or pass --config.",
             config_path.display()
         );
     }

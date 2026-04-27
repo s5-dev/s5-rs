@@ -1,6 +1,17 @@
 //! Task-based CLI commands that use the s5_node_api RPC.
 //!
-//! Each command receives an already-connected `S5NodeClient` from `ensure_node_running()`.
+//! Each command receives an already-connected `S5NodeClient` from
+//! `ensure_node_running()`.
+//!
+//! Some helpers here (`run_task_by_name`, `run_ingest`, `run_backup`,
+//! `resolve_single_or_default`, `run_remote_restore_task`) currently
+//! have no caller — they're legacy verb wrappers tied to the old config
+//! shape (e.g. `run_backup` derives keys from `vault.<name>.key` rather
+//! than `vault.<name>.recipients`). The new vocabulary verbs in
+//! `cmd::vault` build their `TaskSpec`s inline against the new schema.
+//! These wrappers are kept as the natural starting point for future
+//! sub-verbs (`vup tasks run <name>`, recovery URL consumers) that will
+//! revive them once they are needed.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::progress::{format_one_line, new_progress_bar, update_progress_bar};
 
 /// `vup run-task <name>` — run a named task from node config and poll progress.
+#[allow(dead_code)] // retained as the basis for a future `vup tasks run <name>` sub-verb
 pub async fn run_task_by_name(client: &S5NodeClient, name: &str) -> Result<()> {
     let resp = client.run_task_by_name(name).await?;
     println!("Task {} started (id={})", name, resp.task_id);
@@ -20,6 +32,7 @@ pub async fn run_task_by_name(client: &S5NodeClient, name: &str) -> Result<()> {
 }
 
 /// `vup ingest` — run an inline ingest task.
+#[allow(dead_code)] // ingest is bundled into `+vault snap`; kept for direct-task scenarios
 pub async fn run_ingest(
     client: &S5NodeClient,
     vault: &str,
@@ -44,6 +57,12 @@ pub async fn run_ingest(
 /// - source: the sole source, or "default"
 /// - blob_store: first store from the vault's `blob_stores`
 /// - keys: vault's `key` + "recovery" if configured
+///
+/// This reads the **legacy** vault shape (`vault.<name>.key` as a single
+/// key string + a parallel `recovery` lookup). The new vocabulary verb
+/// `vup +<vault> snap` reads `vault.<name>.recipients` directly and
+/// builds the `TaskSpec::Backup` inline in `cmd::vault::run_snap`.
+#[allow(dead_code)] // legacy resolver — superseded by cmd::vault::run_snap
 pub async fn run_backup(
     client: &S5NodeClient,
     vault_override: Option<&str>,
@@ -125,6 +144,7 @@ pub async fn run_backup(
 
 /// Resolve a config section: if there's exactly one entry use it, otherwise
 /// try `fallback` name, otherwise error with a helpful message.
+#[allow(dead_code)] // helper for run_backup (currently legacy)
 fn resolve_single_or_default(
     config: &serde_json::Value,
     section: &str,
@@ -170,6 +190,7 @@ pub async fn run_restore_task(
 }
 
 /// `vup remote-restore` — disaster recovery from paper age key.
+#[allow(dead_code)] // retained — natural fit for a future `vup join s5://…` recovery URL flow
 pub async fn run_remote_restore_task(
     client: &S5NodeClient,
     age_secret_key: &str,
@@ -227,7 +248,7 @@ pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
 /// Poll a task until it finishes, printing progress updates.
 /// Uses a streaming RPC to receive status updates as they happen,
 /// avoiding tight polling loops.
-async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
+pub async fn poll_until_done(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let started = Instant::now();
 
     // Create a spinner for initial state
