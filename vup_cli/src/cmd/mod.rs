@@ -1,16 +1,160 @@
-pub mod init;
+//! `vup` command surface.
+//!
+//! - `onboard` is the bootstrap wizard (the only verb besides `_daemon`
+//!   that runs without a daemon connection — it creates the config the
+//!   daemon needs to start).
+//! - `lifecycle` holds top-level vault lifecycle verbs (`ls`, `new`, `drop`).
+//! - `vault` holds vault-scoped verbs (`snap`, `history`, `restore`,
+//!   `add`, `info`) — everything reachable via `vup +<vault> <verb>`.
+//! - `tasks` holds the RPC-client helpers, including the shared
+//!   `poll_until_done` loop that vault verbs submitting long-running
+//!   tasks call into.
+//! - `stubs` holds the verbs that need infrastructure not yet built
+//!   (`mount`, `share`/`export`/`join`, `grant`/`pair`/`kick`/`who`,
+//!   `peers`/`unpair`, `store …`, and `snap --watch`).
+//!
+//! Utility verbs (`status`, `config`, `shutdown`) live directly in this
+//! module.
+
+pub mod lifecycle;
+pub mod onboard;
+pub mod stubs;
 pub mod tasks;
+pub mod vault;
 
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
+use clap::Subcommand;
 use s5_node_api::S5NodeClient;
 
-use crate::node::ensure_node_running;
+// ---------------------------------------------------------------------------
+// Vault-scoped action enum (dispatched after `+vault` rewrite)
+// ---------------------------------------------------------------------------
+
+/// Verbs that operate on a single vault. Each is reachable via
+/// `vup +<vault> <verb>` (which the sigil module rewrites to
+/// `vup vault <name> <verb>`).
+///
+/// First-letter aliases (`s`, `i`, `a`, …) mirror the canonical name.
+#[derive(Subcommand, Debug)]
+pub enum VaultAction {
+    /// Attach paths to the vault for snap to pick up.
+    #[command(alias = "a")]
+    Add {
+        /// One or more paths.
+        paths: Vec<PathBuf>,
+    },
+    /// Show vault details.
+    #[command(alias = "i")]
+    Info,
+    /// Take a snapshot and publish it to the vault's meta_targets.
+    #[command(alias = "s")]
+    Snap {
+        /// Continuously watch the vault's sources and snap on change.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// List snapshots in this vault.
+    #[command(alias = "h")]
+    History,
+    /// Restore from a snapshot (defaults to the latest).
+    #[command(alias = "r")]
+    Restore {
+        /// Snapshot id to restore. Omit for the latest snapshot.
+        #[arg(long)]
+        snap: Option<String>,
+    },
+    /// FUSE-mount this vault read-only at a local path.
+    #[command(alias = "m")]
+    Mount {
+        /// Mount point.
+        path: PathBuf,
+    },
+    /// Grant a peer ongoing read or write access to the vault.
+    #[command(alias = "g")]
+    Grant {
+        /// Identity to grant (e.g. `@alice`).
+        id: String,
+        /// Read access (default).
+        #[arg(long, short)]
+        read: bool,
+        /// Write access — interactive confirm required on a TTY.
+        #[arg(long, short)]
+        write: bool,
+    },
+    /// Pair an own-device for bidirectional sync.
+    #[command(alias = "p")]
+    Pair {
+        /// Identity to pair with (e.g. `@laptop`).
+        id: String,
+    },
+    /// Generate an anonymous frozen-snapshot share URL.
+    #[command(alias = "e")]
+    Export {
+        /// Re-encrypt only this subtree under fresh keys.
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// List vault members and their capabilities.
+    #[command(alias = "w")]
+    Who,
+    /// Revoke a member from future snapshots.
+    #[command(alias = "k")]
+    Kick {
+        /// Identity to kick (e.g. `@alice`).
+        id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Store sub-namespace
+// ---------------------------------------------------------------------------
+
+/// Verbs under `vup store …`. Stores are configured rarely and referenced
+/// by name in vault `--target` flags — they never appear as the subject of
+/// an interactive command.
+#[derive(Subcommand, Debug)]
+pub enum StoreCmd {
+    /// Add a new store.
+    Add {
+        /// Store name.
+        name: String,
+    },
+    /// List configured stores.
+    Ls,
+    /// Show store details.
+    Info {
+        /// Store name.
+        name: String,
+    },
+    /// Remove a store.
+    Rm {
+        /// Store name.
+        name: String,
+    },
+    /// Authorise an identity to push to this store.
+    Allow {
+        /// Store name.
+        name: String,
+        /// Identity (e.g. `@alice`).
+        id: String,
+    },
+    /// Revoke an identity's push access to this store.
+    Disallow {
+        /// Store name.
+        name: String,
+        /// Identity (e.g. `@alice`).
+        id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Utility verbs (kept working through the grammar rewrite)
+// ---------------------------------------------------------------------------
 
 /// Shut down the running node.
-pub async fn run_shutdown(config_path: &std::path::Path) -> Result<()> {
-    let client = ensure_node_running(config_path).await?;
+pub async fn run_shutdown(client: &S5NodeClient) -> Result<()> {
     client.shutdown().await?;
     println!("Service stopped.");
     Ok(())
@@ -68,112 +212,7 @@ pub async fn run_status(client: &S5NodeClient) -> Result<()> {
     Ok(())
 }
 
-/// `vup add <paths> --source <name>` — add paths to a source via JSON Patch.
-pub async fn run_add(client: &S5NodeClient, source: &str, paths: &[PathBuf]) -> Result<()> {
-    if paths.is_empty() {
-        bail!("no paths specified");
-    }
-
-    // Canonicalize paths
-    let mut abs_paths = Vec::new();
-    for p in paths {
-        let abs = std::fs::canonicalize(p)
-            .map_err(|e| anyhow::anyhow!("cannot resolve path '{}': {}", p.display(), e))?;
-        abs_paths.push(abs.to_string_lossy().to_string());
-    }
-
-    // Check if the source already exists
-    let config_resp = client.get_config().await?;
-    let config: serde_json::Value = serde_json::from_str(&config_resp.config_json)?;
-    let source_exists = config.get("source").and_then(|s| s.get(source)).is_some();
-
-    let patch = if source_exists {
-        // Append paths to existing source
-        let mut ops: Vec<serde_json::Value> = Vec::new();
-        for path in &abs_paths {
-            ops.push(serde_json::json!({
-                "op": "add",
-                "path": format!("/source/{}/paths/-", source),
-                "value": path,
-            }));
-        }
-        serde_json::Value::Array(ops)
-    } else {
-        // Create new source with these paths
-        serde_json::json!([
-            {
-                "op": "add",
-                "path": format!("/source/{}", source),
-                "value": {
-                    "paths": abs_paths,
-                    "exclude": [],
-                }
-            }
-        ])
-    };
-
-    let resp = client.patch_config(patch).await?;
-    if resp.ok {
-        if source_exists {
-            println!("Added {} path(s) to source '{}'.", abs_paths.len(), source);
-        } else {
-            println!(
-                "Created source '{}' with {} path(s).",
-                source,
-                abs_paths.len()
-            );
-        }
-        for p in &abs_paths {
-            println!("  + {}", p);
-        }
-    } else {
-        bail!("failed to update config: {}", resp.message);
-    }
-
-    Ok(())
-}
-
-/// `vup snapshots [vault]` — list vault snapshots.
-pub async fn run_snapshots(client: &S5NodeClient, vault: Option<String>) -> Result<()> {
-    let resp = client.list_snapshots(vault.clone()).await?;
-
-    if resp.snapshots.is_empty() {
-        match vault {
-            Some(v) => println!("No snapshots found for vault '{}'.", v),
-            None => println!("No snapshots found."),
-        }
-        return Ok(());
-    }
-
-    println!(
-        "{:<12} {:<16} {:<10} {:<12} DATE",
-        "VAULT", "HASH", "FILES", "SIZE"
-    );
-    for snap in &resp.snapshots {
-        let hash_short = if snap.hash.len() > 12 {
-            &snap.hash[..12]
-        } else {
-            &snap.hash
-        };
-        let files = snap
-            .file_count
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".into());
-        let size = snap
-            .total_bytes
-            .map(|b| humansize::format_size(b, humansize::BINARY))
-            .unwrap_or_else(|| "-".into());
-        let date = &snap.timestamp;
-        println!(
-            "{:<12} {:<16} {:<10} {:<12} {}",
-            snap.vault, hash_short, files, size, date
-        );
-    }
-
-    Ok(())
-}
-
-/// `vup config` — interactive configuration wizard or JSON patch.
+/// `vup config` — JSON read/patch + interactive wizard.
 pub async fn run_config(
     client: &S5NodeClient,
     json: bool,
@@ -277,7 +316,6 @@ fn print_config_summary(config: &serde_json::Value) {
     println!("Current Configuration");
     println!("─────────────────────");
 
-    // Keys
     if let Some(keys) = config.get("key").and_then(|v| v.as_object()) {
         if !keys.is_empty() {
             let names: Vec<&String> = keys.keys().collect();
@@ -296,7 +334,6 @@ fn print_config_summary(config: &serde_json::Value) {
         println!("  Keys:    (none)");
     }
 
-    // Stores
     if let Some(stores) = config.get("store").and_then(|v| v.as_object()) {
         if !stores.is_empty() {
             for (name, store) in stores {
@@ -310,7 +347,6 @@ fn print_config_summary(config: &serde_json::Value) {
         println!("  Stores:  (none)");
     }
 
-    // Sources
     if let Some(sources) = config
         .get("source")
         .and_then(|v| v.as_object())
@@ -326,7 +362,6 @@ fn print_config_summary(config: &serde_json::Value) {
         }
     }
 
-    // Vaults
     if let Some(vaults) = config
         .get("vault")
         .and_then(|v| v.as_object())
@@ -343,7 +378,6 @@ fn print_config_summary(config: &serde_json::Value) {
 async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) -> Result<()> {
     use dialoguer::Confirm;
 
-    // Check if recovery key already exists
     let has_recovery = config.get("key").and_then(|k| k.get("recovery")).is_some();
 
     if has_recovery {
@@ -389,8 +423,7 @@ async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) 
         return Ok(());
     }
 
-    // Build the patch to add/replace the recovery key
-    let mut ops = vec![serde_json::json!({
+    let ops = vec![serde_json::json!({
         "op": if has_recovery { "replace" } else { "add" },
         "path": "/key/recovery",
         "value": {
@@ -398,42 +431,9 @@ async fn wizard_recovery_key(client: &S5NodeClient, config: &serde_json::Value) 
         }
     })];
 
-    // Also add "recovery" to each vault's backup tasks' keys list if not already present
-    if let Some(tasks) = config.get("task").and_then(|v| v.as_object()) {
-        for (name, task) in tasks {
-            let task_type = task.get("type").and_then(|v| v.as_str());
-            if matches!(task_type, Some("backup") | Some("publish"))
-                && let Some(keys) = task.get("keys").and_then(|k| k.as_array())
-            {
-                let already_has = keys.iter().any(|k| k.as_str() == Some("recovery"));
-                if !already_has {
-                    ops.push(serde_json::json!({
-                        "op": "add",
-                        "path": format!("/task/{}/keys/-", name),
-                        "value": "recovery"
-                    }));
-                }
-            }
-        }
-    }
-
     let resp = client.patch_config(serde_json::Value::Array(ops)).await?;
     if resp.ok {
         println!("Recovery key added to config.");
-
-        // Check if it was added to any tasks
-        if let Some(ref new_config_json) = resp.config_json {
-            let new_config: serde_json::Value = serde_json::from_str(new_config_json)?;
-            if let Some(tasks) = new_config.get("task").and_then(|v| v.as_object()) {
-                for (name, task) in tasks {
-                    if let Some(keys) = task.get("keys").and_then(|k| k.as_array())
-                        && keys.iter().any(|k| k.as_str() == Some("recovery"))
-                    {
-                        println!("  + added to task '{}'", name);
-                    }
-                }
-            }
-        }
     } else {
         bail!("failed to save recovery key: {}", resp.message);
     }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use s5_core::{BlobsRead, RegistryPinner};
+use s5_core::RegistryPinner;
 use s5_node::config::S5NodeConfig;
 use s5_registry_redb::RedbRegistry;
 

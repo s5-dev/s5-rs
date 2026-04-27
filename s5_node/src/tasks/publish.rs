@@ -1000,8 +1000,10 @@ mod tests {
         use s5_fs_v2::snapshot::KEY_SLOT_RECOVERY;
         let mut keys = std::collections::BTreeMap::new();
         keys.insert(KEY_SLOT_RECOVERY, recovery_secret);
-        let mut ctx = TraversalContext::default();
-        ctx.keys = Some(keys);
+        let ctx = TraversalContext {
+            keys: Some(keys),
+            ..Default::default()
+        };
         let entry = NodeEntry {
             content: Some(ContentRef {
                 structural: Structural::Link,
