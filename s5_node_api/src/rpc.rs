@@ -88,11 +88,34 @@ pub struct Shutdown;
 
 // ── Response types ─────────────────────────────────────────────────
 
+/// Outcome of a `RunTask` RPC. Tagged so the daemon can communicate
+/// dispatch failures (vault not in config, invalid spec, executor
+/// refusal, …) without the previous `task_id == 0` sentinel that
+/// callers had to know to special-case. The CLI client flattens this
+/// into `Result<SpawnedTask>` at the seam (see `S5NodeClient::run_task`).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RunTaskResponse {
-    /// Unique task ID for status/cancel.
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RunTaskResponse {
+    /// Task spawned successfully.
+    Spawned {
+        /// Unique task ID for status/cancel.
+        task_id: u64,
+        /// The resolved task spec as JSON string.
+        spec_json: String,
+    },
+    /// The daemon refused to spawn the task. `error` carries the
+    /// human-readable reason (already includes the originating
+    /// `vault`/`task` name where relevant).
+    Refused { error: String },
+}
+
+/// Flattened success payload of a `RunTask` RPC. Returned by
+/// `S5NodeClient::run_task` / `run_task_by_name` so callers don't have
+/// to match on the `RunTaskResponse` enum themselves; refusals come
+/// back as a real `Err` instead.
+#[derive(Debug, Clone)]
+pub struct SpawnedTask {
     pub task_id: u64,
-    /// The resolved task spec as JSON string.
     pub spec_json: String,
 }
 

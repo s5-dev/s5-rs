@@ -2,8 +2,8 @@
 //!
 //! These types are the subset of `S5NodeConfig` that can live in the
 //! API crate without pulling in heavy store/blob dependencies.
-//! The full `S5NodeConfig` (which adds `NodeConfigStore`, `NodeConfigPeer`,
-//! and cross-references) remains in `s5_node::config`.
+//! The full `S5NodeConfig` (which adds `NodeConfigStore` and
+//! cross-reference validation) remains in `s5_node::config`.
 
 use serde::{Deserialize, Serialize};
 
@@ -108,11 +108,31 @@ pub struct NodeConfigVault {
     #[serde(default)]
     pub preset: Option<String>,
 
-    /// Peers this vault is shared with (for sync/replication).
-    /// Must reference declared `[peer.*]` entries.
-    // TODO: design peer-based sync — deferred, focus on backups first.
+    /// Names of `[key.*]` entries that form the vault's full recipient set
+    /// for publish encryption. Every published Transparent Node is age-encrypted
+    /// to all of these. Empty list = vault is local-only and cannot publish.
     #[serde(default)]
-    pub peers: Vec<String>,
+    pub recipients: Vec<String>,
+
+    /// Names of `[source.*]` entries that feed into this vault on snap/backup.
+    /// Empty list = no automatic source mapping (paths must be passed explicitly).
+    #[serde(default)]
+    pub sources: Vec<String>,
+
+    /// Names of `[store.*]` entries — destinations for the encrypted Transparent
+    /// Node on publish. Distinct from `blob_stores` (which is the read-fallback
+    /// chain for file content). Empty list = vault is local-only and cannot publish;
+    /// no implicit fallback to `blob_stores` (publishing meta to every blob backend
+    /// would leak vault structure to backends meant only for opaque content).
+    #[serde(default)]
+    pub meta_targets: Vec<String>,
+
+    /// Store FS5 tree nodes in plaintext (true) instead of encrypted (false,
+    /// default). Set this only for content-store interop (e.g. Hugging Face
+    /// Xet). The published Transparent Node is still age-encrypted to
+    /// `recipients` — only the inner tree nodes are plaintext when this is on.
+    #[serde(default)]
+    pub plaintext_tree: bool,
 
     /// Use filesystem events (inotify/FSEvents) for immediate detection.
     /// Default: false.
@@ -150,18 +170,6 @@ pub enum NodeConfigRegistry {
     },
     /// In-memory registry for testing or ephemeral nodes.
     Memory,
-    /// Remote registry accessed via iroh/irpc from another S5 node.
-    Remote {
-        /// The peer name (key in `peer` map) to connect to.
-        peer: String,
-    },
-    /// Tee registry: writes to both a local and remote registry.
-    Tee {
-        /// Local backend configuration (nested).
-        local: Box<NodeConfigRegistry>,
-        /// Remote peer name (key in `peer` map) for the remote backend.
-        remote_peer: String,
-    },
     /// Registry backed by a named store (e.g. S3, Sia, local).
     ///
     /// References a `[store.*]` entry by name. Uses `StoreRegistry` internally,
