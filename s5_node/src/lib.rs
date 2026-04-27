@@ -37,6 +37,7 @@ use tokio::sync::{RwLock, oneshot};
 use tracing::info;
 
 pub mod config;
+pub mod export;
 pub mod fuse;
 pub mod identity;
 pub mod s5_server;

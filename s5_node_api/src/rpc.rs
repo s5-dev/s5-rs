@@ -58,6 +58,11 @@ pub enum S5NodeProto {
     #[rpc(tx = oneshot::Sender<UnmountVaultResponse>)]
     UnmountVault(UnmountVault),
 
+    /// Build a frozen-anonymous share URL for the current snapshot of
+    /// a vault.
+    #[rpc(tx = oneshot::Sender<ExportVaultResponse>)]
+    ExportVault(ExportVault),
+
     /// Graceful shutdown.
     #[rpc(tx = oneshot::Sender<()>)]
     Shutdown(Shutdown),
@@ -424,4 +429,41 @@ pub struct UnmountVault {
 pub enum UnmountVaultResponse {
     Ok,
     Err { error: String },
+}
+
+// ── Share / export ────────────────────────────────────────────────
+
+/// Build a frozen-anonymous share URL for the named vault. See
+/// `docs/reference/share-links.md` for the URL grammar.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportVault {
+    /// Vault name to export.
+    pub vault: String,
+    /// Optional sub-path; whole-vault export only today, so this must
+    /// be `None` until sub-tree export lands.
+    pub path: Option<String>,
+}
+
+/// Outcome of an `ExportVault` RPC. Same tagged-enum shape as
+/// `RunTaskResponse` / `MountVaultResponse`: success carries the URL
+/// and blob hash, failure carries the human-readable error. The CLI
+/// client flattens this into `Result<ExportedShare>`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExportVaultResponse {
+    /// Export succeeded. `url` is the share link, `blob_hash_hex` is
+    /// the encrypted Transparent Node's CAS hash.
+    Ok { url: String, blob_hash_hex: String },
+    /// Export refused or failed (vault not found, sub-tree path not
+    /// yet implemented, store unreachable, etc.).
+    Err { error: String },
+}
+
+/// Flattened success payload of `ExportVault`. Returned by
+/// `S5NodeClient::export_vault` so callers don't have to match on the
+/// response enum themselves.
+#[derive(Debug, Clone)]
+pub struct ExportedShare {
+    pub url: String,
+    pub blob_hash_hex: String,
 }

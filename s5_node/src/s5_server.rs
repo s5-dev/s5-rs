@@ -15,11 +15,11 @@ use tokio::sync::oneshot as tokio_oneshot;
 use tracing::info;
 
 use s5_node_api::{
-    CancelTask, CancelTaskResponse, GetConfig, GetConfigResponse, GetStatus, GetStatusResponse,
-    GetTaskStatus, ListSnapshots, ListSnapshotsResponse, ListTasksResponse, MountVault,
-    MountVaultResponse, PatchConfig, PatchConfigResponse, RunTask, RunTaskResponse, S5NodeMessage,
-    S5NodeProto, SnapshotInfo, TaskState, TaskStatusResponse, UnmountVault, UnmountVaultResponse,
-    WatchTaskStatus,
+    CancelTask, CancelTaskResponse, ExportVault, ExportVaultResponse, GetConfig, GetConfigResponse,
+    GetStatus, GetStatusResponse, GetTaskStatus, ListSnapshots, ListSnapshotsResponse,
+    ListTasksResponse, MountVault, MountVaultResponse, PatchConfig, PatchConfigResponse, RunTask,
+    RunTaskResponse, S5NodeMessage, S5NodeProto, SnapshotInfo, TaskState, TaskStatusResponse,
+    UnmountVault, UnmountVaultResponse, WatchTaskStatus,
 };
 
 use crate::config::S5NodeConfig;
@@ -87,6 +87,21 @@ impl S5NodeServer {
         match self.mount_manager.unmount(req.mount_id).await {
             Ok(()) => UnmountVaultResponse::Ok,
             Err(e) => UnmountVaultResponse::Err {
+                error: format!("{e:#}"),
+            },
+        }
+    }
+
+    async fn handle_export_vault(&self, req: ExportVault) -> ExportVaultResponse {
+        let ctx = self.executor.ctx();
+        let config = ctx.config.read().await;
+        match crate::export::run_export(&config, &ctx.stores, &req.vault, req.path.as_deref()).await
+        {
+            Ok(result) => ExportVaultResponse::Ok {
+                url: result.url,
+                blob_hash_hex: hex::encode(result.blob_hash.as_bytes()),
+            },
+            Err(e) => ExportVaultResponse::Err {
                 error: format!("{e:#}"),
             },
         }
@@ -552,6 +567,10 @@ impl ProtocolHandler for S5NodeServer {
                 }
                 S5NodeMessage::UnmountVault(irpc::WithChannels { inner, tx, .. }) => {
                     let resp = self.handle_unmount_vault(inner).await;
+                    let _ = oneshot::Sender::send(tx, resp).await;
+                }
+                S5NodeMessage::ExportVault(irpc::WithChannels { inner, tx, .. }) => {
+                    let resp = self.handle_export_vault(inner).await;
                     let _ = oneshot::Sender::send(tx, resp).await;
                 }
                 S5NodeMessage::Shutdown(irpc::WithChannels { inner: _, tx, .. }) => {

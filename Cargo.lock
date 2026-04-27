@@ -7393,6 +7393,7 @@ dependencies = [
  "dirs",
  "humansize",
  "indicatif 0.17.11",
+ "notify 7.0.0",
  "rand 0.8.5",
  "s5_core",
  "s5_node",
