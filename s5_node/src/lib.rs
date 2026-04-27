@@ -365,6 +365,7 @@ pub async fn run_node(
         registry: registry.clone(),
     });
     let executor = Arc::new(tasks::TaskExecutor::new(executor_ctx));
+    let mount_manager = Arc::new(fuse::MountManager::new(executor.clone()));
 
     // Create shutdown channel and S5NodeServer RPC.
     let endpoint_id = endpoint.id().to_string();
@@ -373,6 +374,7 @@ pub async fn run_node(
         config.clone(),
         config_file_path.clone(),
         executor.clone(),
+        mount_manager,
         endpoint_id,
         shutdown_tx,
     );

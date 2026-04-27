@@ -9,7 +9,6 @@
 //! a thin RPC frontend over the running daemon.
 //!
 //! Currently stubbed:
-//! - `mount` — needs s5_fuse on s5_fs_v2
 //! - `snap --watch` — needs the notify-based file watcher
 //! - `export`, `join` — need the share-link spec + URL grammar
 //! - `grant`, `pair`, `kick`, `who`, `peers`, `unpair` — need the
@@ -18,7 +17,6 @@
 
 use anyhow::Result;
 use s5_node_api::S5NodeClient;
-use std::path::Path;
 
 use super::StoreCmd;
 
@@ -49,11 +47,6 @@ pub async fn run_store(_client: &S5NodeClient, cmd: StoreCmd) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Vault-scoped
 // ---------------------------------------------------------------------------
-
-pub async fn run_mount(_client: &S5NodeClient, vault: &str, path: &Path) -> Result<()> {
-    todo_stub(&format!("+{vault} mount {}", path.display()));
-    Ok(())
-}
 
 pub async fn run_grant(
     _client: &S5NodeClient,

@@ -138,6 +138,49 @@ impl S5NodeClient {
             .context("list_snapshots RPC failed")
     }
 
+    /// Mount a vault on the daemon as a FUSE filesystem. Returns a
+    /// `MountedVault` carrying the handle the daemon expects on
+    /// `unmount_vault`. Daemon-side preflight failures (vault missing,
+    /// `/dev/fuse` absent, mount point doesn't exist, etc.) come back
+    /// as `Err`, not as a sentinel response.
+    pub async fn mount_vault(
+        &self,
+        vault: impl Into<String>,
+        mountpoint: std::path::PathBuf,
+        rw: bool,
+        debounce_ms: u64,
+    ) -> Result<MountedVault> {
+        let resp: MountVaultResponse = self
+            .inner
+            .rpc(MountVault {
+                vault: vault.into(),
+                mountpoint,
+                rw,
+                debounce_ms,
+            })
+            .await
+            .context("mount_vault RPC failed")?;
+        match resp {
+            MountVaultResponse::Mounted { mount_id } => Ok(MountedVault { mount_id }),
+            MountVaultResponse::Refused { error } => Err(anyhow!(error)),
+        }
+    }
+
+    /// Unmount a vault previously mounted via `mount_vault`. Drops the
+    /// daemon-side `MountHandle` (which performs the actual FUSE
+    /// unmount) and tears down any attached rw debounce loop.
+    pub async fn unmount_vault(&self, mount_id: u64) -> Result<()> {
+        let resp: UnmountVaultResponse = self
+            .inner
+            .rpc(UnmountVault { mount_id })
+            .await
+            .context("unmount_vault RPC failed")?;
+        match resp {
+            UnmountVaultResponse::Ok => Ok(()),
+            UnmountVaultResponse::Err { error } => Err(anyhow!(error)),
+        }
+    }
+
     /// Gracefully close the underlying iroh endpoint.
     ///
     /// Call this before dropping the client to avoid the
