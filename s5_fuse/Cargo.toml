@@ -8,24 +8,31 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.98"
-async-trait = "0.1.88"
+async-trait = "0.1"
 bytes.workspace = true
 clap = "4.5.40"
-dashmap = "6.1.0"
-lasso = { version = "0.7.3", features = ["multi-threaded"] }
 libc = "0.2.174"
 chacha20poly1305 = "0.10"
 
+futures = "0.3"
+futures-util = "0.3"
+
 # workspace crates
 s5_core.workspace = true
-s5_fs.workspace = true
+s5_fs_v2 = { path = "../s5_fs_v2" }
 s5_store_local.workspace = true
 
-# fuse
-fuser = "0.11.1"
-fuser-async = "0.1.1"
+# fuse3 — async-native bindings against libfuse 3 (or fusermount3 in
+# unprivileged mode). The path-based filesystem trait lets us serve the
+# vault directly out of `s5_fs_v2::Snapshot` without our own inode table
+# (the path → inode bridge inside fuse3 handles that).
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 
 # FUSE needs full tokio (native-only crate)
 tokio = { version = "1.48.0", features = ["full"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+s5_fs_local = { path = "../ingest/local" }
+tempfile = "3.10"
