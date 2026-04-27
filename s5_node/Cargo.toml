@@ -27,7 +27,6 @@ notify = "7"
 rand = "0.8.5"
 s5_blobs = { workspace = true, features = ["server"] }
 s5_core.workspace = true
-s5_fs.workspace = true
 s5_fuse.workspace = true
 s5_registry.workspace = true
 s5_registry_redb.workspace = true

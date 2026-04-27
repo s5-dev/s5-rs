@@ -135,9 +135,16 @@ pub async fn run_ingest(
                 );
                 let mut leaf_key = [0u8; 32];
                 let mut node_key = [0u8; 32];
+                let mut recovery_secret = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut leaf_key);
                 rand::rngs::OsRng.fill_bytes(&mut node_key);
-                Snapshot::empty_encrypted_split(read_store.clone(), leaf_key, node_key)
+                rand::rngs::OsRng.fill_bytes(&mut recovery_secret);
+                Snapshot::empty_encrypted_split(
+                    read_store.clone(),
+                    leaf_key,
+                    node_key,
+                    recovery_secret,
+                )
             }
         }
     };

@@ -5,6 +5,7 @@
 //! task, tracks its state and progress, and supports cancellation.
 
 pub mod ingest;
+pub mod peer_load;
 pub mod publish;
 pub mod restore;
 pub mod vault_persist;
