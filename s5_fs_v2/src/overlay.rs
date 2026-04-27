@@ -1,54 +1,79 @@
 //! Mutable overlay layer for FS5 trees.
 //!
 //! [`WritableOverlay`] is the mutable top layer that sits above a base
-//! [`ReadableLayer`]. Reads check the overlay first and fall through to
-//! the base on miss. Writes (inserts, tombstones) go into an in-memory
-//! `BTreeMap` and are immediately visible to subsequent reads.
+//! [`ReadableLayer`]. It owns the three pieces a writable layer needs:
+//! the read view (`base`), the per-blob ops machinery (`pipeline`),
+//! and the in-memory entry buffer (`entries`). Reads check the buffer
+//! first and fall through to the base on miss. Writes (inserts,
+//! tombstones) go into the buffer and are immediately visible.
 //!
 //! The base can be any `ReadableLayer`: a [`Snapshot`](crate::snapshot::Snapshot),
 //! a [`MergedView`](crate::merge::MergedView), or even another `WritableOverlay`.
 //!
+//! # Why pipeline + base live together
+//!
+//! Every consumer that mutates an overlay needs both: the base for
+//! reads, and the pipeline for materialising file bytes (encrypt on
+//! commit, decrypt on read) and for the eventual flush. Holding them
+//! as separate fields on each consumer (`WritableFs`,
+//! `s5_fs_local::backup`, the publish convergence path, …) gave each
+//! caller two `Arc`s that always travelled together and could
+//! conceivably drift. Pinning them to the overlay collapses that and
+//! gives the [`flush`](Self::flush) method a single self-contained
+//! call site.
+//!
 //! # FUSE / live-mount pattern
 //!
 //! ```text
-//! WritableOverlay (mutable, immediate reads)
-//!   └── Snapshot (immutable prolly tree)
+//! WritableOverlay (mutable; owns base + pipeline)
+//!   ├── base: Snapshot / MergedView / another overlay
+//!   └── pipeline: Pipeline (encrypt/decrypt machinery)
 //!
 //! Periodic flush:
-//!   snapshot.merge_and_persist(&overlay, store)
-//!   → swap base snapshot, clear overlay
+//!   overlay.flush(store) → (root_hash, plaintext_hash, MergeStats)
+//!   → caller wraps in a new Snapshot and clears the buffer
 //! ```
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
+use s5_core::{BlobsWrite, Hash};
 
 use crate::layer::ReadableLayer;
 use crate::node::NodeEntry;
+use crate::persist::MergeStats;
+use crate::pipeline::Pipeline;
 
 /// Mutable overlay backed by a `BTreeMap` behind a `RwLock`, with
-/// fall-through reads to a base [`ReadableLayer`].
+/// fall-through reads to a base [`ReadableLayer`] and a [`Pipeline`]
+/// for byte-level operations.
 ///
 /// - Writes go into the local BTreeMap (inserts, tombstones)
 /// - Reads check overlay first, fall through to base on miss
 /// - `scan()` merges overlay entries with the base stream (overlay wins)
+/// - [`flush`](Self::flush) folds the overlay into a fresh prolly tree
 ///
 /// Write lock is held for microseconds (BTreeMap insert is O(log n)).
 /// Concurrent readers are not blocked by each other.
 pub struct WritableOverlay {
     entries: RwLock<BTreeMap<String, NodeEntry>>,
-    base: Box<dyn ReadableLayer>,
+    base: Arc<dyn ReadableLayer>,
+    pipeline: Arc<Pipeline>,
 }
 
 impl WritableOverlay {
-    /// Creates an overlay on top of a base layer.
-    pub fn new(base: Box<dyn ReadableLayer>) -> Self {
+    /// Construct an overlay over a base layer with an explicit pipeline.
+    /// The pipeline owns the encryption keys + per-blob ops the overlay
+    /// uses for [`flush`](Self::flush) and that consumers reach for via
+    /// [`pipeline`](Self::pipeline) when materialising file bytes.
+    pub fn new(base: Arc<dyn ReadableLayer>, pipeline: Arc<Pipeline>) -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
             base,
+            pipeline,
         }
     }
 
@@ -96,14 +121,41 @@ impl WritableOverlay {
         std::mem::take(&mut *self.entries.write().expect("overlay lock poisoned"))
     }
 
-    /// Returns a reference to the base layer.
-    pub fn base(&self) -> &dyn ReadableLayer {
-        &*self.base
+    /// Returns the base layer (an `Arc<dyn ReadableLayer>` clone). Held
+    /// as `Arc` so callers that need to compose it (e.g. `WritableFs`'s
+    /// `flush_overlay` passing it to `merge_and_persist`) don't have
+    /// to up-cast or re-wrap.
+    pub fn base(&self) -> &Arc<dyn ReadableLayer> {
+        &self.base
     }
 
-    /// Replaces the base layer, returning the old one.
-    pub fn swap_base(&mut self, new_base: Box<dyn ReadableLayer>) -> Box<dyn ReadableLayer> {
-        std::mem::replace(&mut self.base, new_base)
+    /// Returns the pipeline owned by this overlay. Used by consumers
+    /// (writable FUSE adapters, ingestors) that need to import bytes,
+    /// export bytes, or otherwise touch blob-level operations.
+    pub fn pipeline(&self) -> &Arc<Pipeline> {
+        &self.pipeline
+    }
+
+    /// Folds the overlay's pending entries into a fresh prolly tree
+    /// rooted on top of the base, producing a new persisted root.
+    ///
+    /// Returns `None` when the resulting tree has no live entries
+    /// (everything was tombstones, or the overlay was empty over an
+    /// empty base). Otherwise returns the new root hash, plaintext
+    /// hash, and merge stats — caller wraps these in a `Snapshot`.
+    ///
+    /// The chunk mask is read from the base via the trait method —
+    /// `Snapshot` returns its `BuildContext`-derived value, layered
+    /// types delegate to whatever owns the structural shape, and
+    /// callers without a strong opinion get the workspace default.
+    pub async fn flush(
+        &self,
+        store: &dyn BlobsWrite,
+    ) -> anyhow::Result<Option<(Hash, [u8; 32], MergeStats)>> {
+        let chunk_mask = self.base.chunk_mask().await;
+        self.pipeline
+            .merge_and_persist(self.base.as_ref(), chunk_mask, self, store)
+            .await
     }
 }
 
@@ -157,6 +209,12 @@ impl ReadableLayer for WritableOverlay {
         // Two-way merge: overlay wins on key collision.
         merge_two(overlay_stream, base_stream).boxed()
     }
+
+    /// Delegate to the base — the overlay buffer doesn't own structural
+    /// shape, only entry mutations.
+    async fn chunk_mask(&self) -> u32 {
+        self.base.chunk_mask().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +224,12 @@ impl ReadableLayer for WritableOverlay {
 /// Merges two sorted streams, yielding entries in key order.
 /// On key collision, the entry from `primary` (overlay) wins and the
 /// `secondary` (base) entry is discarded.
+///
+/// Each stream is polled at most until it returns `None` once;
+/// subsequent rounds skip the exhausted stream. Without the
+/// `done_p`/`done_s` flags we would re-poll a completed `unfold`-based
+/// stream (e.g. `MergedView::scan`) and trip "Unfold must not be polled
+/// after it returned `Poll::Ready(None)`".
 fn merge_two<'a>(
     primary: BoxStream<'a, anyhow::Result<(String, NodeEntry)>>,
     secondary: BoxStream<'a, anyhow::Result<(String, NodeEntry)>>,
@@ -176,23 +240,22 @@ fn merge_two<'a>(
             secondary,
             buf_p: None,
             buf_s: None,
+            done_p: false,
+            done_s: false,
         },
         |mut state| async move {
-            // Fill buffers.
-            if state.buf_p.is_none()
-                && let Some(result) = state.primary.next().await
-            {
-                match result {
-                    Ok(item) => state.buf_p = Some(item),
-                    Err(e) => return Some((Err(e), state)),
+            if state.buf_p.is_none() && !state.done_p {
+                match state.primary.next().await {
+                    Some(Ok(item)) => state.buf_p = Some(item),
+                    Some(Err(e)) => return Some((Err(e), state)),
+                    None => state.done_p = true,
                 }
             }
-            if state.buf_s.is_none()
-                && let Some(result) = state.secondary.next().await
-            {
-                match result {
-                    Ok(item) => state.buf_s = Some(item),
-                    Err(e) => return Some((Err(e), state)),
+            if state.buf_s.is_none() && !state.done_s {
+                match state.secondary.next().await {
+                    Some(Ok(item)) => state.buf_s = Some(item),
+                    Some(Err(e)) => return Some((Err(e), state)),
+                    None => state.done_s = true,
                 }
             }
 
@@ -235,4 +298,6 @@ struct MergeTwoState<'a> {
     secondary: BoxStream<'a, anyhow::Result<(String, NodeEntry)>>,
     buf_p: Option<(String, NodeEntry)>,
     buf_s: Option<(String, NodeEntry)>,
+    done_p: bool,
+    done_s: bool,
 }

@@ -45,6 +45,7 @@ use s5_core::{BlobId, BlobsRead, BlobsWrite, Hash};
 use crate::context::{self, KDF_META};
 use crate::layer::ReadableLayer;
 use crate::node::{ContentRef, NODE_MAGIC, Node, NodeEntry, NodeHeader, NodeKind, Structural};
+use crate::pipeline::Pipeline;
 use crate::snapshot::Snapshot;
 
 /// Default expected entries per leaf node.
@@ -82,26 +83,50 @@ pub struct MergeStats {
 }
 
 impl Snapshot {
-    /// Merges changes into this snapshot and persists the result as a new prolly tree.
-    ///
-    /// This is the primary write path. It:
-    /// 1. Collects existing entries from `self` (skipped if empty)
-    /// 2. Applies changes from `changes` (changes win on key collision)
-    /// 3. Filters tombstones
-    /// 4. Chunks entries into a prolly tree with content-defined boundaries
-    /// 5. Uploads only new nodes (skips existing via `blob_contains`)
-    ///
-    /// Returns the new root `Hash` and `MergeStats`, or `None` if the
-    /// resulting tree has no live entries.
+    /// Merges changes into this snapshot and persists the result as a
+    /// new prolly tree. Thin wrapper that computes the snapshot's
+    /// chunk mask (from the root node's `BuildContext`) and delegates
+    /// to [`Pipeline::merge_and_persist`].
     pub async fn merge_and_persist(
         &self,
         changes: &dyn ReadableLayer,
         store: &dyn BlobsWrite,
     ) -> anyhow::Result<Option<(Hash, [u8; 32], MergeStats)>> {
+        // Use the trait method via UFCS so we don't accidentally pick
+        // up an inherent shadow if one is added later.
+        let mask = <Snapshot as ReadableLayer>::chunk_mask(self).await;
+        self.as_pipeline()
+            .merge_and_persist(self, mask, changes, store)
+            .await
+    }
+}
+
+impl Pipeline {
+    /// Merges `changes` into the existing tree rooted at `base` and
+    /// persists the result as a new prolly tree. This is the primary
+    /// write path; [`Snapshot::merge_and_persist`] is a thin wrapper
+    /// that computes `chunk_mask` and delegates here.
+    ///
+    /// 1. Collects existing entries from `base` (no-op if empty).
+    /// 2. Applies `changes` (changes win on key collision).
+    /// 3. Filters tombstones.
+    /// 4. Chunks into a prolly tree using `chunk_mask`.
+    /// 5. Uploads only new nodes (skips existing via `blob_contains`).
+    ///
+    /// Returns the new root `Hash`, plaintext-hash, and stats — or
+    /// `None` if the resulting tree has no live entries.
+    pub async fn merge_and_persist(
+        &self,
+        base: &dyn ReadableLayer,
+        chunk_mask: u32,
+        changes: &dyn ReadableLayer,
+        store: &dyn BlobsWrite,
+    ) -> anyhow::Result<Option<(Hash, [u8; 32], MergeStats)>> {
         let mut stats = MergeStats::default();
 
-        // Phase 1: Collect merged entries (old + changes, changes win).
-        let entries = self.collect_merged_entries(changes, &mut stats).await?;
+        let entries = self
+            .collect_merged_entries(base, changes, &mut stats)
+            .await?;
 
         if entries.is_empty() {
             return Ok(None);
@@ -109,45 +134,34 @@ impl Snapshot {
 
         stats.entries = entries.len() as u64;
 
-        // Phase 2: Determine chunk mask from root node's BuildContext or default.
-        let mask = self.chunk_mask().await;
-
-        // Phase 3: Chunk entries into leaf nodes.
-        let leaf_nodes = chunk_entries(&entries, mask, &NodeKind::Namespace, 0);
+        let leaf_nodes = chunk_entries(&entries, chunk_mask, &NodeKind::Namespace, 0);
         stats.leaf_nodes = leaf_nodes.len() as u64;
 
-        // Phase 4: Build tree bottom-up with dedup.
         let (root_hash, root_plaintext_hash) = self
-            .build_tree_dedup(leaf_nodes, store, &NodeKind::Namespace, &mut stats)
+            .build_tree_dedup(
+                leaf_nodes,
+                store,
+                &NodeKind::Namespace,
+                chunk_mask,
+                &mut stats,
+            )
             .await?;
 
         Ok(Some((root_hash, root_plaintext_hash, stats)))
     }
 
-    /// Collects entries from the old snapshot merged with the change layer.
-    ///
-    /// Changes take priority on key collision. Tombstones are filtered out
-    /// of the final result.
+    /// Collects entries from `base` merged with `changes`. Changes
+    /// take priority on key collision; tombstones are filtered out.
     ///
     /// # HIGH PRIORITY TODO: Streaming
     ///
-    /// This currently materializes the entire old snapshot into a `Vec` via
-    /// `scan()`. For 1M+ files this is ~200 MB+ of heap allocation. The
-    /// public API surface (`merge_and_persist` returning
-    /// `Option<(Hash, [u8; 32], MergeStats)>`) is fine — the fix is internal:
-    ///
-    /// 1. Stream old entries via `scan()` + change entries via `scan()` in a
-    ///    sorted merge iterator (both are already sorted).
-    /// 2. Feed merged entries directly into `chunk_entries` as a streaming
-    ///    chunker that emits `Node`s as they fill up.
-    /// 3. Subtree-skip optimization: when an entire subtree is unchanged
-    ///    (no keys in `changes` overlap its key range), reuse the existing
-    ///    node hash without loading it at all.
-    ///
-    /// This is the single biggest scaling bottleneck and should be addressed
-    /// before targeting 1M+ file trees.
+    /// Currently materializes the entire base layer into a `Vec` via
+    /// `scan()`. For 1M+ files this is ~200 MB+ of heap allocation.
+    /// Fix is internal: stream both `base.scan()` and `changes.scan()`
+    /// in a sorted merge iterator and feed straight into `chunk_entries`.
     async fn collect_merged_entries(
         &self,
+        base: &dyn ReadableLayer,
         changes: &dyn ReadableLayer,
         stats: &mut MergeStats,
     ) -> anyhow::Result<Vec<(String, NodeEntry)>> {
@@ -160,29 +174,16 @@ impl Snapshot {
         }
         drop(change_stream);
 
-        // If snapshot is empty, changes are the only source.
-        if self.is_empty() {
-            let mut entries = Vec::new();
-            for (key, entry) in change_map {
-                if entry.is_tombstone() {
-                    stats.tombstones_filtered += 1;
-                    continue;
-                }
-                stats.entries_changed += 1;
-                entries.push((key, entry));
-            }
-            return Ok(entries);
-        }
-
-        // Merge: old entries + changes (changes win).
+        // Walk base + apply changes. If base is empty, the loop body
+        // never runs and the "remaining changes" tail block adds them
+        // all — same outcome as the previous early-return on is_empty.
         let mut entries = Vec::new();
-        let mut old_stream = self.scan(Bound::Unbounded, Bound::Unbounded);
+        let mut old_stream = base.scan(Bound::Unbounded, Bound::Unbounded);
 
         while let Some(result) = old_stream.next().await {
             let (key, entry) = result?;
 
             if let Some(changed) = change_map.remove(&key) {
-                // Change overrides old entry.
                 if changed.is_tombstone() {
                     stats.tombstones_filtered += 1;
                 } else {
@@ -190,14 +191,13 @@ impl Snapshot {
                     entries.push((key, changed));
                 }
             } else {
-                // Old entry kept as-is.
                 stats.entries_reused += 1;
                 entries.push((key, entry));
             }
         }
         drop(old_stream);
 
-        // Remaining changes are new keys not in the old snapshot.
+        // Remaining changes are new keys not in the base.
         for (key, entry) in change_map {
             if entry.is_tombstone() {
                 stats.tombstones_filtered += 1;
@@ -207,31 +207,13 @@ impl Snapshot {
             entries.push((key, entry));
         }
 
-        // Sort by key (BTreeMap iteration was sorted, but we appended new keys at the end).
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         Ok(entries)
     }
 
-    /// Returns the chunk boundary mask from the root node's BuildContext,
-    /// or the default if no BuildContext is set.
-    async fn chunk_mask(&self) -> u32 {
-        if !self.is_empty()
-            && let Ok(root) = self.load_root().await
-            && let Some(build) = &root.header.build
-            && let Some(crate::node::MetaChunkingStrategy::ProllyBlake3 {
-                expected_entries_per_node,
-            }) = &build.meta_chunking
-        {
-            return expected_entries_per_node.wrapping_sub(1);
-        }
-        DEFAULT_ENTRIES_PER_NODE - 1
-    }
-
     /// Encodes a node through the node pipeline, uploads it only if
-    /// it doesn't already exist in the store.
-    ///
-    /// Returns `(BlobId, plaintext_hash)`.
+    /// it doesn't already exist in the store. Returns `(BlobId, plaintext_hash)`.
     async fn write_node_dedup(
         &self,
         node: &Node,
@@ -251,14 +233,11 @@ impl Snapshot {
             &plaintext_hash,
             KDF_META,
             self.context().keys.as_ref(),
-            None,  // nodes never use dictionary compression
-            false, // no compression skip for metadata nodes
+            None, // nodes never use dictionary compression
         )?;
 
-        // Compute what the CAS hash would be.
         let cas_hash = Hash::from(*blake3::hash(&result.bytes).as_bytes());
 
-        // Check if it already exists.
         if read_store.blob_contains(cas_hash).await? {
             stats.nodes_deduped += 1;
             let blob_id = BlobId {
@@ -268,7 +247,6 @@ impl Snapshot {
             return Ok((blob_id, plaintext_hash));
         }
 
-        // Upload.
         let blob_id = store
             .blob_upload_bytes(result.bytes)
             .await
@@ -280,21 +258,19 @@ impl Snapshot {
         Ok((blob_id, plaintext_hash))
     }
 
-    /// Builds the tree bottom-up from nodes, using dedup writes.
-    ///
-    /// 1. Upload all nodes at the current level (skipping existing)
-    /// 2. If only one node remains, it's the root — return its hash
-    /// 3. Otherwise, create internal nodes pointing to them and recurse
+    /// Builds the tree bottom-up from nodes, using dedup writes. The
+    /// chunk mask is threaded through the recursion (caller computed
+    /// it once at the top).
     pub(crate) async fn build_tree_dedup(
         &self,
         nodes: Vec<Node>,
         store: &dyn BlobsWrite,
         kind: &NodeKind,
+        chunk_mask: u32,
         stats: &mut MergeStats,
     ) -> anyhow::Result<(Hash, [u8; 32])> {
         let read_store: &dyn BlobsRead = self.store().as_ref();
 
-        // Upload all nodes at this level, collecting (first_key, link_entry) tuples.
         let mut children: Vec<(String, NodeEntry)> = Vec::with_capacity(nodes.len());
 
         for node in &nodes {
@@ -302,10 +278,8 @@ impl Snapshot {
                 .write_node_dedup(node, store, read_store, stats)
                 .await?;
 
-            // The first key in this node is the routing key for the parent.
             let first_key = node.entries.keys().next().cloned().unwrap_or_default();
 
-            // Total plaintext size of all entries in this node.
             let total_size: u64 = node
                 .entries
                 .values()
@@ -329,7 +303,6 @@ impl Snapshot {
             children.push((first_key, link_entry));
         }
 
-        // Single node = root.
         if children.len() == 1 {
             let content = children[0]
                 .1
@@ -344,13 +317,11 @@ impl Snapshot {
             return Ok((hash, plaintext_hash));
         }
 
-        // Build internal level.
         let level = nodes[0].header.level + 1;
-        let mask = self.chunk_mask().await;
-        let internal_nodes = chunk_entries(&children, mask, kind, level);
+        let internal_nodes = chunk_entries(&children, chunk_mask, kind, level);
         stats.internal_nodes += internal_nodes.len() as u64;
 
-        Box::pin(self.build_tree_dedup(internal_nodes, store, kind, stats)).await
+        Box::pin(self.build_tree_dedup(internal_nodes, store, kind, chunk_mask, stats)).await
     }
 }
 
