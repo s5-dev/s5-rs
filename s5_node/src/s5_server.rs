@@ -16,12 +16,14 @@ use tracing::info;
 
 use s5_node_api::{
     CancelTask, CancelTaskResponse, GetConfig, GetConfigResponse, GetStatus, GetStatusResponse,
-    GetTaskStatus, ListSnapshots, ListSnapshotsResponse, ListTasksResponse, PatchConfig,
-    PatchConfigResponse, RunTask, RunTaskResponse, S5NodeMessage, S5NodeProto, SnapshotInfo,
-    TaskState, TaskStatusResponse, WatchTaskStatus,
+    GetTaskStatus, ListSnapshots, ListSnapshotsResponse, ListTasksResponse, MountVault,
+    MountVaultResponse, PatchConfig, PatchConfigResponse, RunTask, RunTaskResponse, S5NodeMessage,
+    S5NodeProto, SnapshotInfo, TaskState, TaskStatusResponse, UnmountVault, UnmountVaultResponse,
+    WatchTaskStatus,
 };
 
 use crate::config::S5NodeConfig;
+use crate::fuse::MountManager;
 use crate::tasks::TaskExecutor;
 
 /// The S5 Node RPC server.
@@ -33,6 +35,9 @@ pub struct S5NodeServer {
     config: Arc<RwLock<S5NodeConfig>>,
     config_path: PathBuf,
     executor: Arc<TaskExecutor>,
+    /// Daemon-side FUSE mount manager. Mount/unmount RPCs delegate
+    /// here; the manager owns the live `MountHandle`s.
+    mount_manager: Arc<MountManager>,
     endpoint_id: String,
     /// Channel to signal shutdown to the node's run loop.
     shutdown_tx: Arc<RwLock<Option<tokio_oneshot::Sender<()>>>>,
@@ -45,11 +50,13 @@ impl std::fmt::Debug for S5NodeServer {
 }
 
 impl S5NodeServer {
-    /// Creates a new S5NodeServer with a task executor and shutdown channel.
+    /// Creates a new S5NodeServer with a task executor, mount manager,
+    /// and shutdown channel.
     pub fn new(
         config: Arc<RwLock<S5NodeConfig>>,
         config_path: PathBuf,
         executor: Arc<TaskExecutor>,
+        mount_manager: Arc<MountManager>,
         endpoint_id: String,
         shutdown_tx: tokio_oneshot::Sender<()>,
     ) -> Self {
@@ -57,8 +64,31 @@ impl S5NodeServer {
             config,
             config_path,
             executor,
+            mount_manager,
             endpoint_id,
             shutdown_tx: Arc::new(RwLock::new(Some(shutdown_tx))),
+        }
+    }
+
+    async fn handle_mount_vault(&self, req: MountVault) -> MountVaultResponse {
+        match self
+            .mount_manager
+            .mount(&req.vault, req.mountpoint, req.rw, req.debounce_ms)
+            .await
+        {
+            Ok(mount_id) => MountVaultResponse::Mounted { mount_id },
+            Err(e) => MountVaultResponse::Refused {
+                error: format!("{e:#}"),
+            },
+        }
+    }
+
+    async fn handle_unmount_vault(&self, req: UnmountVault) -> UnmountVaultResponse {
+        match self.mount_manager.unmount(req.mount_id).await {
+            Ok(()) => UnmountVaultResponse::Ok,
+            Err(e) => UnmountVaultResponse::Err {
+                error: format!("{e:#}"),
+            },
         }
     }
 
@@ -514,6 +544,14 @@ impl ProtocolHandler for S5NodeServer {
                 }
                 S5NodeMessage::ListSnapshots(irpc::WithChannels { inner, tx, .. }) => {
                     let resp = self.handle_list_snapshots(inner).await;
+                    let _ = oneshot::Sender::send(tx, resp).await;
+                }
+                S5NodeMessage::MountVault(irpc::WithChannels { inner, tx, .. }) => {
+                    let resp = self.handle_mount_vault(inner).await;
+                    let _ = oneshot::Sender::send(tx, resp).await;
+                }
+                S5NodeMessage::UnmountVault(irpc::WithChannels { inner, tx, .. }) => {
+                    let resp = self.handle_unmount_vault(inner).await;
                     let _ = oneshot::Sender::send(tx, resp).await;
                 }
                 S5NodeMessage::Shutdown(irpc::WithChannels { inner: _, tx, .. }) => {

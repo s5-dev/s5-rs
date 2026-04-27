@@ -48,6 +48,16 @@ pub enum S5NodeProto {
     #[rpc(tx = oneshot::Sender<ListSnapshotsResponse>)]
     ListSnapshots(ListSnapshots),
 
+    /// Mount a vault as a FUSE filesystem on the daemon. Returns a
+    /// mount handle the CLI uses to drive `UnmountVault`.
+    #[rpc(tx = oneshot::Sender<MountVaultResponse>)]
+    MountVault(MountVault),
+
+    /// Drop a previously-issued mount handle, which unmounts the FUSE
+    /// session.
+    #[rpc(tx = oneshot::Sender<UnmountVaultResponse>)]
+    UnmountVault(UnmountVault),
+
     /// Graceful shutdown.
     #[rpc(tx = oneshot::Sender<()>)]
     Shutdown(Shutdown),
@@ -354,4 +364,64 @@ pub struct SnapshotInfo {
     pub file_count: Option<u64>,
     /// Total size in bytes (if known).
     pub total_bytes: Option<u64>,
+}
+
+// ── Mount ─────────────────────────────────────────────────────────
+
+/// Mount a vault on the daemon as a FUSE filesystem. The daemon owns
+/// the `MountHandle`; the CLI receives a `mount_id` to drive
+/// `UnmountVault` (or any other future mount-management RPC).
+///
+/// `mountpoint` must be an absolute path the daemon process can see
+/// and `mkdir`-create. With `rw = true`, writes accumulate in the
+/// daemon's in-memory overlay and a debounced flush (idle window
+/// `debounce_ms`) folds bursts into a fresh snapshot, persists the
+/// new vault root, and dispatches a `Publish` task — same flow as a
+/// CLI-driven snap, but without round-tripping through RPC.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MountVault {
+    pub vault: String,
+    pub mountpoint: std::path::PathBuf,
+    pub rw: bool,
+    pub debounce_ms: u64,
+}
+
+/// Outcome of a `MountVault` RPC. Tagged the same way as
+/// `RunTaskResponse`: success carries the mount handle, failure
+/// carries the human-readable error. The CLI client flattens this
+/// into `Result<MountedVault>`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum MountVaultResponse {
+    /// Mount succeeded; `mount_id` is the handle for subsequent
+    /// `UnmountVault` calls.
+    Mounted { mount_id: u64 },
+    /// Daemon refused (preflight failed, vault not in config, store
+    /// type unsupported, mount point already in use, …).
+    Refused { error: String },
+}
+
+/// Flattened success payload of `MountVault`. Returned by
+/// `S5NodeClient::mount_vault` so callers don't have to match on the
+/// response enum themselves.
+#[derive(Debug, Clone)]
+pub struct MountedVault {
+    pub mount_id: u64,
+}
+
+/// Drop the daemon-side mount handle for `mount_id`. The
+/// `MountHandle` drop performs the actual FUSE unmount — both the
+/// kernel mount and any rw-mode debounce loop attached to it go
+/// away. Idempotent at the wire level: unmounting an unknown
+/// `mount_id` returns an `Err` but doesn't disturb other mounts.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnmountVault {
+    pub mount_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum UnmountVaultResponse {
+    Ok,
+    Err { error: String },
 }
