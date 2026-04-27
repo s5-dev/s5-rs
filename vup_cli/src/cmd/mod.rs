@@ -65,11 +65,25 @@ pub enum VaultAction {
         #[arg(long)]
         snap: Option<String>,
     },
-    /// FUSE-mount this vault read-only at a local path.
+    /// FUSE-mount this vault at a local path. Read-only by default.
+    /// The mount runs on the daemon; the CLI just drives the
+    /// lifecycle and unmounts on Ctrl-C.
     #[command(alias = "m")]
     Mount {
         /// Mount point.
         path: PathBuf,
+        /// Mount read-write — writes accumulate in an in-memory overlay
+        /// over the snapshot; a debounce timer (see `--debounce-ms`)
+        /// folds bursts of writes into a fresh snapshot and triggers a
+        /// `Publish` task on the daemon. Writes between the burst and
+        /// the publish call are not yet on disk; SIGINT-while-dirty
+        /// drops them.
+        #[arg(long)]
+        rw: bool,
+        /// Idle window before a burst of writes is folded + published,
+        /// in milliseconds. Only meaningful with `--rw`.
+        #[arg(long, default_value_t = 2000)]
+        debounce_ms: u64,
     },
     /// Grant a peer ongoing read or write access to the vault.
     #[command(alias = "g")]

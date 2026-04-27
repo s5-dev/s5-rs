@@ -255,7 +255,11 @@ async fn dispatch_vault(
             std::fs::create_dir_all(&target)?;
             v::run_restore(client, vault, snap.as_deref(), &target).await
         }
-        VaultAction::Mount { path } => st::run_mount(client, vault, &path).await,
+        VaultAction::Mount {
+            path,
+            rw,
+            debounce_ms,
+        } => v::run_mount(client, vault, &path, rw, debounce_ms).await,
         VaultAction::Grant { id, read, write } => {
             st::run_grant(client, vault, &id, read, write).await
         }

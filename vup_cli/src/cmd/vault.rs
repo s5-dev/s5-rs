@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use s5_node_api::S5NodeClient;
 use s5_node_api::config::TaskSpec;
 
@@ -201,6 +201,67 @@ pub async fn run_add(client: &S5NodeClient, vault: &str, paths: &[PathBuf]) -> R
         bail!("config update failed: {}", resp.message);
     }
 
+    Ok(())
+}
+
+/// `vup +<vault> mount [--rw] <path>` — mount the vault at a local
+/// path. The mount runs on the daemon (it owns `s5_fuse` and the
+/// vault stores); this CLI verb just dispatches the lifecycle and
+/// blocks on Ctrl-C to send the unmount RPC back.
+///
+/// Read-only by default. With `--rw`, writes accumulate in the
+/// daemon's in-memory overlay and a debounced flush + publish loop
+/// (`--debounce-ms`, default 2 s) folds bursts into fresh snapshots.
+///
+/// `path` is canonicalised to an absolute path before sending so the
+/// daemon resolves the mount-point against the same absolute layout
+/// the user typed, regardless of working directory drift between the
+/// two processes.
+pub async fn run_mount(
+    client: &S5NodeClient,
+    vault: &str,
+    mountpoint: &std::path::Path,
+    rw: bool,
+    debounce_ms: u64,
+) -> Result<()> {
+    // Canonicalise so the daemon mounts at exactly the path the user
+    // typed, even if the daemon's CWD differs. fs::canonicalize fails
+    // if the path doesn't exist; that gives us the same up-front
+    // "create the mount point first" hint the daemon-side preflight
+    // would surface, without the round-trip.
+    let mountpoint = std::fs::canonicalize(mountpoint).with_context(|| {
+        format!(
+            "resolving mount point '{}' (it must exist on disk)",
+            mountpoint.display()
+        )
+    })?;
+
+    let resp = client
+        .mount_vault(vault.to_string(), mountpoint.clone(), rw, debounce_ms)
+        .await?;
+
+    let mode = if rw {
+        format!("read-write (debounce {debounce_ms}ms)")
+    } else {
+        "read-only".to_string()
+    };
+    println!(
+        "Mounted +{vault} {mode} at {} (mount id={}). Press Ctrl-C to unmount.",
+        mountpoint.display(),
+        resp.mount_id,
+    );
+
+    // Block until the user hits Ctrl-C, then send the unmount RPC.
+    // The daemon-side `MountHandle` drop is what performs the actual
+    // `umount(2)`; awaiting `unmount_vault` ensures it's complete by
+    // the time we return (so the user's shell sees the mount gone).
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
+
+    eprintln!("\nUnmounting +{vault}…");
+    client.unmount_vault(resp.mount_id).await?;
+    println!("+{vault} unmounted.");
     Ok(())
 }
 
