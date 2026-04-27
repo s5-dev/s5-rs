@@ -181,6 +181,29 @@ impl S5NodeClient {
         }
     }
 
+    /// Build a frozen-anonymous share URL for a vault snapshot.
+    /// Daemon-side errors come back as `Err`, not as a sentinel response.
+    pub async fn export_vault(
+        &self,
+        vault: impl Into<String>,
+        path: Option<String>,
+    ) -> Result<ExportedShare> {
+        let resp: ExportVaultResponse = self
+            .inner
+            .rpc(ExportVault {
+                vault: vault.into(),
+                path,
+            })
+            .await
+            .context("export_vault RPC failed")?;
+        match resp {
+            ExportVaultResponse::Ok { url, blob_hash_hex } => {
+                Ok(ExportedShare { url, blob_hash_hex })
+            }
+            ExportVaultResponse::Err { error } => Err(anyhow!(error)),
+        }
+    }
+
     /// Gracefully close the underlying iroh endpoint.
     ///
     /// Call this before dropping the client to avoid the

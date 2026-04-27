@@ -9,8 +9,7 @@
 //! a thin RPC frontend over the running daemon.
 //!
 //! Currently stubbed:
-//! - `snap --watch` — needs the notify-based file watcher
-//! - `export`, `join` — need the share-link spec + URL grammar
+//! - `join` — needs the share-link consumer (URL parser + import)
 //! - `grant`, `pair`, `kick`, `who`, `peers`, `unpair` — need the
 //!   identity layer (DID resolver + recipient bundle)
 //! - `store add/ls/info/rm/allow/disallow` — store sub-namespace polish
@@ -67,12 +66,6 @@ pub async fn run_grant(
 
 pub async fn run_pair(_client: &S5NodeClient, vault: &str, id: &str) -> Result<()> {
     todo_stub(&format!("+{vault} pair {id}"));
-    Ok(())
-}
-
-pub async fn run_export(_client: &S5NodeClient, vault: &str, path: Option<&str>) -> Result<()> {
-    let suffix = path.map(|p| format!(" --path {p}")).unwrap_or_default();
-    todo_stub(&format!("+{vault} export{suffix}"));
     Ok(())
 }
 

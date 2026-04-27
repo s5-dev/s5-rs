@@ -264,7 +264,7 @@ async fn dispatch_vault(
             st::run_grant(client, vault, &id, read, write).await
         }
         VaultAction::Pair { id } => st::run_pair(client, vault, &id).await,
-        VaultAction::Export { path } => st::run_export(client, vault, path.as_deref()).await,
+        VaultAction::Export { path } => v::run_export(client, vault, path.as_deref()).await,
         VaultAction::Who => st::run_who(client, vault).await,
         VaultAction::Kick { id } => st::run_kick(client, vault, &id).await,
     }

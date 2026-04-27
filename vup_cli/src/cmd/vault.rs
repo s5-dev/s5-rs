@@ -204,6 +204,33 @@ pub async fn run_add(client: &S5NodeClient, vault: &str, paths: &[PathBuf]) -> R
     Ok(())
 }
 
+/// `vup +<vault> export [--path <p>]` — produce a frozen anonymous
+/// share URL for the current snapshot. The daemon re-encrypts the
+/// current Transparent Node with a fresh ephemeral age recipient
+/// added, uploads the new blob, and returns the URL with the
+/// recipient secret in the fragment.
+///
+/// `--path` is reserved for sub-tree exports and currently rejected
+/// by the daemon; passing it surfaces a clear error rather than
+/// silently producing a whole-vault URL.
+pub async fn run_export(client: &S5NodeClient, vault: &str, path: Option<&str>) -> Result<()> {
+    let share = client
+        .export_vault(vault.to_string(), path.map(String::from))
+        .await?;
+    let hash_short = &share.blob_hash_hex[..share.blob_hash_hex.len().min(12)];
+    println!(
+        "Frozen export of +{vault}{} ready (blob {hash_short}…).",
+        path.map(|p| format!(":{p}")).unwrap_or_default()
+    );
+    println!();
+    println!("  Share this URL:");
+    println!("    {}", share.url);
+    println!();
+    println!("  Recipient gets only this snapshot. No future updates,");
+    println!("  no individual revocation; the URL is the capability.");
+    Ok(())
+}
+
 /// `vup +<vault> mount [--rw] <path>` — mount the vault at a local
 /// path. The mount runs on the daemon (it owns `s5_fuse` and the
 /// vault stores); this CLI verb just dispatches the lifecycle and
