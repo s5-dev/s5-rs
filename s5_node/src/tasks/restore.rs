@@ -183,10 +183,6 @@ pub async fn run_restore(
 /// 6. Parse Node → extract snapshot parts
 /// 7. Build Snapshot using the remote store as read backend
 /// 8. Restore files to target path
-// Variables resolved at the top of the function are used only by the
-// unreachable code below (kept as a starting point for the v3 rewrite),
-// so silence the unused warnings at function scope.
-#[allow(unused_variables)]
 pub async fn run_remote_restore(
     ctx: &TaskExecutorContext,
     age_secret_key: &str,
@@ -196,87 +192,77 @@ pub async fn run_remote_restore(
     reporter: TaskReporter,
     _cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    use super::publish::{derive_vault_id, recovery_signing_key};
+    use ed25519_dalek::VerifyingKey;
+    use s5_fs_v2::snapshot::KEY_SLOT_RECOVERY;
+
     let registry = ctx
         .registry
         .as_ref()
-        .ok_or_else(|| anyhow!("no registry configured — cannot perform remote restore"))?;
+        .ok_or_else(|| anyhow!("no registry configured, cannot perform remote restore"))?;
 
     let blob_store = resolve_store(&ctx.stores, blob_store_name)?;
 
-    // -- Step 1: paper-only recovery is not yet wired for the v3 schema --
-    //
-    // The v3 recovery flow:
-    //   1. Derive recovery_age_secret = argon2id(paper_passphrase, …)
-    //   2. Fetch the vault root blob from a configured store
-    //      (e.g. the relay S3 bucket holding meta blobs)
-    //   3. age-decrypt the vault root with recovery_age_secret
-    //   4. Read KEY_SLOT_RECOVERY from its TraversalContext.keys
-    //   5. Derive vault_id + recovery_signing_key from that secret
-    //      (see s5_node::tasks::publish::{derive_vault_id, recovery_signing_key})
-    //   6. registry.get(StreamKey::Vault { pubkey: recovery_pubkey, vault_id })
-    //      → its payload holds a device's signing pubkey
-    //   7. registry.get(StreamKey::Vault { pubkey: device_pubkey, vault_id })
-    //      → current snapshot HEAD hash
-    //
-    // The legacy `(age_secret, vault_name)` lookup that this function
-    // used in the pre-v3 schema produces wrong stream keys for v3
-    // vaults, so rather than silently returning empty, we surface a
-    // clear error until the new flow is implemented.
-    let _ = age_secret_key;
-    return Err(anyhow!(
-        "remote restore for vault '{vault_name}' is not yet supported on \
-         the v3 schema — the recovery flow needs to fetch and \
-         age-decrypt the vault root first to derive vault_id from \
-         KEY_SLOT_RECOVERY (see snapshot-publication.md § Vault ID \
-         derivation)"
-    ));
+    // Step 1: discover the vault root by enumerating blobs in the
+    // store and trying age-decrypt with the paper key. The first blob
+    // that decrypts and parses as a Node carrying KEY_SLOT_RECOVERY is
+    // a vault root. Note: this finds *some* vault root for the paper
+    // recipient (which gives us recovery_secret); the actual current
+    // HEAD comes from the registry lookup in step 4 below, so even an
+    // older snap's vault root is fine here.
+    tracing::info!(
+        vault = vault_name,
+        "scanning relay store for a vault root decryptable with the paper key"
+    );
+    let recovery_secret = discover_recovery_secret(blob_store, age_secret_key).await?;
+    tracing::info!(vault = vault_name, "found a vault root, deriving vault_id");
 
-    // The unreachable code below preserves the shape of the legacy
-    // restore so the v3 reimplementation has a starting point.
-    #[allow(unreachable_code)]
-    let recovery_stream_key: StreamKey = unreachable!();
-    #[allow(unreachable_code)]
+    // Step 2: derive vault_id + recovery_signing_key from the recovered secret.
+    let vault_id = derive_vault_id(&recovery_secret);
+    let recovery_key = recovery_signing_key(&recovery_secret);
+    let recovery_verifying: VerifyingKey = (&recovery_key).into();
+    let recovery_stream_key = StreamKey::Vault {
+        pubkey: recovery_verifying.to_bytes(),
+        vault_id,
+    };
+
+    // Step 3: recovery entry → device's signing pubkey.
     let recovery_entry = registry
         .get(&recovery_stream_key)
         .await
         .context("fetching recovery registry entry")?
         .ok_or_else(|| {
             anyhow!(
-                "no recovery entry found for vault '{}' — \
-                 was this vault ever published with a recovery key?",
-                vault_name
+                "no recovery entry found for vault '{vault_name}' (vault_id={}). \
+                 Was this vault ever published?",
+                hex::encode(vault_id)
             )
         })?;
-
-    // The recovery entry's hash field stores the device's signing pubkey.
     let device_pubkey_bytes: [u8; 32] = *recovery_entry.hash.as_bytes();
-    let vault_stream_key = StreamKey::Vault {
-        pubkey: device_pubkey_bytes,
-        vault_id: [0u8; 16],
-    };
-
     tracing::info!(
         vault = vault_name,
-        vault_pubkey = hex::encode(device_pubkey_bytes),
-        "found vault pubkey via recovery entry"
+        device_pubkey = hex::encode(device_pubkey_bytes),
+        "resolved device signing pubkey via recovery entry"
     );
 
-    // -- Step 3: Vault entry → encrypted TN hash --
+    // Step 4: vault entry under (device_pubkey, vault_id) → latest TN hash.
+    let vault_stream_key = StreamKey::Vault {
+        pubkey: device_pubkey_bytes,
+        vault_id,
+    };
     let vault_entry = registry
         .get(&vault_stream_key)
         .await
         .context("fetching vault registry entry")?
         .ok_or_else(|| {
             anyhow!(
-                "no published snapshot found for vault '{}' — \
-                 vault pubkey {} has no registry entry",
-                vault_name,
-                hex::encode(device_pubkey_bytes)
+                "no published snapshot found for vault '{vault_name}' under \
+                 device pubkey {} + vault_id {}",
+                hex::encode(device_pubkey_bytes),
+                hex::encode(vault_id),
             )
         })?;
-
     let encrypted_tn_hash = vault_entry.hash;
-
     tracing::info!(
         vault = vault_name,
         revision = vault_entry.revision,
@@ -284,32 +270,38 @@ pub async fn run_remote_restore(
         "found latest published snapshot"
     );
 
-    // -- Step 4: Download encrypted TN --
+    // Step 5: fetch + age-decrypt the latest TN.
     let encrypted_bytes = blob_store
         .blob_download(encrypted_tn_hash)
         .await
         .map_err(|e| anyhow!("downloading encrypted Transparent Node: {e}"))?;
-
-    tracing::info!(
-        vault = vault_name,
-        size = encrypted_bytes.len(),
-        "downloaded encrypted Transparent Node"
-    );
-
-    // -- Step 5: Age-decrypt with paper key --
     let cbor = age_decrypt_with_secret_key(&encrypted_bytes, age_secret_key)
-        .context("decrypting Transparent Node with paper key")?;
+        .context("decrypting latest Transparent Node with paper key")?;
 
-    // -- Step 6: Parse Node → snapshot parts --
-    // The published TN may have history entries (timestamps → previous hashes).
-    // We only care about the current entry at "".
+    // Step 6: Parse Node → snapshot parts. The published TN may have
+    // history entries (timestamps → previous hashes); only the "" entry
+    // (current snapshot) matters here.
     let node = Node::from_bytes(&cbor).map_err(|e| anyhow!("CBOR decode Transparent Node: {e}"))?;
-
     let (root, root_plaintext_hash, context) = node_to_snapshot_parts(&node)
         .context("extracting snapshot from published Transparent Node")?;
 
-    let history_count = node.entries.len() - 1; // exclude ""
+    // Defence: the freshly-fetched TN must carry the same recovery_secret
+    // we derived vault_id from. A mismatch means the registry entry
+    // points at a substituted blob (recovery_secret would be different)
+    // and we should not splice that into the restore.
+    let fetched_recovery_secret = context
+        .keys
+        .as_ref()
+        .and_then(|m| m.get(&KEY_SLOT_RECOVERY).copied())
+        .ok_or_else(|| anyhow!("latest TN has no KEY_SLOT_RECOVERY slot"))?;
+    if fetched_recovery_secret != recovery_secret {
+        return Err(anyhow!(
+            "vault root substitution detected: latest TN's KEY_SLOT_RECOVERY \
+             does not match the discovered vault root's. Refusing to restore."
+        ));
+    }
 
+    let history_count = node.entries.len() - 1;
     tracing::info!(
         vault = vault_name,
         root = %root.fmt_short(),
@@ -318,7 +310,7 @@ pub async fn run_remote_restore(
         "decrypted snapshot metadata"
     );
 
-    // -- Step 7: Build Snapshot using remote store --
+    // Step 7: build Snapshot using the remote store as read backend.
     let read_store: Arc<dyn BlobsRead> = Arc::new(blob_store.clone());
     let snapshot = Snapshot::new(root, read_store, context, root_plaintext_hash);
 
@@ -376,4 +368,68 @@ pub async fn run_remote_restore(
     );
 
     Ok(())
+}
+
+/// Bootstrap step for paper-only recovery: enumerate every blob in the
+/// store, try to age-decrypt with the paper key, and return the
+/// `recovery_secret` from the first blob that decrypts and parses as a
+/// vault root (a `Node` whose `TraversalContext.keys` carries
+/// `KEY_SLOT_RECOVERY`).
+///
+/// Once we have `recovery_secret` we can derive `vault_id` and look up
+/// the registry entry for the actual current HEAD — see
+/// [`run_remote_restore`]. The blob found here may be an older snap;
+/// that's fine, we only need it for `recovery_secret`.
+///
+/// O(N) over the relay's blob count. For the M3 demo (single vault,
+/// single device) the relay holds dozens of blobs and the first hit
+/// is typically the encrypted TN. Enumeration order is whatever the
+/// underlying `Store::list` returns; we stop at the first match.
+async fn discover_recovery_secret(
+    blob_store: &s5_core::blob::BlobStore,
+    age_secret_key: &str,
+) -> anyhow::Result<[u8; 32]> {
+    use s5_fs_v2::snapshot::KEY_SLOT_RECOVERY;
+
+    let hashes = blob_store
+        .list_hashes()
+        .await
+        .map_err(|e| anyhow!("listing blobs in relay store: {e}"))?;
+
+    let total = hashes.len();
+    for hash in hashes {
+        let bytes = match blob_store.blob_download(hash).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Most blobs are vault-encrypted leaves, not age-encrypted.
+        // age_decrypt_with_secret_key fails fast on those; we just skip.
+        let cbor = match age_decrypt_with_secret_key(&bytes, age_secret_key) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let node = match Node::from_bytes(&cbor) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let entry = match node.transparent_entry() {
+            Some(e) => e,
+            None => continue,
+        };
+        let recovery_secret = entry
+            .child_context
+            .as_ref()
+            .and_then(|ctx| ctx.keys.as_ref())
+            .and_then(|keys| keys.get(&KEY_SLOT_RECOVERY).copied());
+        if let Some(secret) = recovery_secret {
+            return Ok(secret);
+        }
+    }
+
+    Err(anyhow!(
+        "scanned {total} blob(s) in the relay store, found no vault root \
+         decryptable with the supplied paper key. Either the wrong store \
+         is configured, or no snapshot of any vault has been published \
+         to it yet for this paper recipient."
+    ))
 }
