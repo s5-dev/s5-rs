@@ -1,14 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
-use s5_blobs::Client as BlobsClient;
-use s5_core::{BlobsRead, BlobsWrite, RegistryPinner};
+use anyhow::Result;
+use s5_core::{BlobsRead, RegistryPinner};
 use s5_node::config::S5NodeConfig;
 use s5_registry_redb::RedbRegistry;
 
 use super::util::{open_store, registry_path};
 use crate::BlobsCmd;
-use crate::helpers::{build_endpoint, parse_hash_hex, peer_endpoint_addr};
 
 pub async fn run_blobs(
     cmd: BlobsCmd,
@@ -16,50 +14,7 @@ pub async fn run_blobs(
     node_config_file: &std::path::Path,
     fs_root: &PathBuf,
 ) -> Result<()> {
-    let config_dir = node_config_file.parent();
     match cmd {
-        BlobsCmd::Upload { peer, path } => {
-            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
-            let peer_addr = peer_endpoint_addr(config, &peer)?;
-            let client = BlobsClient::connect(endpoint, peer_addr);
-            let blob = client
-                .blob_upload_file(path.clone())
-                .await
-                .context("failed to upload blob")?;
-            println!("uploaded blob: hash={} size={}", blob.hash, blob.size);
-        }
-        BlobsCmd::Download { peer, hash, out } => {
-            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
-            let peer_addr = peer_endpoint_addr(config, &peer)?;
-            let client = BlobsClient::connect(endpoint, peer_addr);
-            let hash = parse_hash_hex(&hash)?;
-            let bytes = client
-                .blob_download(hash)
-                .await
-                .context("failed to download blob")?;
-            tokio::fs::write(&out, &bytes)
-                .await
-                .with_context(|| format!("failed to write to {}", out.display()))?;
-            println!("downloaded {} bytes to {}", bytes.len(), out.display());
-        }
-        BlobsCmd::Delete { peer, hash } => {
-            let endpoint = build_endpoint(&config.identity, config_dir, &config.key).await?;
-            let peer_addr = peer_endpoint_addr(config, &peer)?;
-            let client = BlobsClient::connect(endpoint, peer_addr);
-            let hash = parse_hash_hex(&hash)?;
-            let res = client.delete_blob(hash).await.map_err(|e| anyhow!(e))?;
-            match res {
-                Ok(true) => {
-                    println!("deleted blob: it became orphaned and was removed from storage")
-                }
-                Ok(false) => {
-                    println!("un-pinned blob for this node; other pins still reference it")
-                }
-                Err(msg) => {
-                    bail!("remote error while deleting blob: {}", msg);
-                }
-            }
-        }
         BlobsCmd::GcLocal { store, dry_run } => {
             // Compute registry path exactly as the node would, so we
             // see the same pin metadata used by the running node.

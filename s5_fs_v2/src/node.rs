@@ -766,6 +766,26 @@ pub struct BlobPipeline {
     /// Encryption strategy with key ID.
     #[n(2)]
     pub encryption: Option<(EncryptionStrategy, u8)>,
+
+    /// When `Some(true)`, the encoder skips compression for this
+    /// pipeline if the padded compressed size doesn't beat the padded
+    /// uncompressed size — and records a per-entry `Uncompressed`
+    /// override in the resulting `NodeEntry.child_context` so the
+    /// decoder knows what to do.
+    ///
+    /// `Option<bool>` (not plain `bool`) because `merge_contexts`
+    /// distinguishes three states: `Some(true)` = explicit opt-in,
+    /// `Some(false)` = explicit opt-out, `None` = inherit from
+    /// parent. With plain `bool` a child entry's default `false`
+    /// would silently override a parent's explicit `Some(true)` —
+    /// the merge could no longer express "I have no opinion."
+    ///
+    /// Lives here (rather than as a runtime flag on `Snapshot` /
+    /// `Pipeline`) so the policy travels with the rest of the encoding
+    /// definition and propagates correctly through `merge_contexts`
+    /// when child entries override the parent's leaf pipeline.
+    #[n(3)]
+    pub skip_when_unhelpful: Option<bool>,
 }
 
 // =============================================================================
@@ -795,15 +815,16 @@ pub struct BuildContext {
     #[n(1)]
     pub file_chunking: Option<FileChunkingStrategy>,
 
-    /// Skip compression when compressed size exceeds this percentage of plaintext.
+    /// Legacy on-wire field from the pre-`dad2135` percentage-threshold
+    /// design of compression-skip. Kept for on-wire compatibility but
+    /// **not read by the current encode path**.
     ///
-    /// When set, blobs where `compressed_len * 100 / plaintext_len > threshold`
-    /// are stored uncompressed (with a per-entry `CompressionStrategy::Uncompressed`
-    /// override). This avoids wasting CPU on incompressible data (e.g. already-
-    /// compressed media, encrypted blobs) and prevents zstd inflation.
+    /// Skip-when-unhelpful now lives on the per-pipeline
+    /// [`BlobPipeline::skip_when_unhelpful`] field (so the policy
+    /// travels with the rest of the encoding definition and propagates
+    /// correctly through `merge_contexts`).
     ///
-    /// Range: 0–100. Typical value: 95 (skip if compression saves < 5%).
-    /// `None` = always compress (no skip).
+    /// This field may be retired or reused in a future on-wire revision.
     #[n(2)]
     pub compression_skip_threshold: Option<u8>,
 }

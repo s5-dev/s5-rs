@@ -42,13 +42,16 @@ pub trait ReadableLayer: Send + Sync {
         self.scan(Bound::Unbounded, Bound::Unbounded)
     }
 
-    // TODO: Add `readdir(prefix: &str)` — skip-scan for efficient directory listing.
-    //
-    // Lists direct children of `prefix` (e.g. "src/") by scanning (prefix, prefix0)
-    // and skipping over subdirectory ranges: when encountering a key like "src/tests/",
-    // jump to "src/tests0" instead of scanning all descendants.
-    //
-    // Cost: O(direct_children × log n) tree seeks, regardless of total descendant count.
-    // For M2, a simple filter on `scan()` output is sufficient for reasonable directory
-    // sizes. The skip-scan matters for FUSE on large trees.
+    /// Chunking mask used when building child trees on top of this layer.
+    /// `Snapshot` reads it from the root node's `BuildContext`; merge-style
+    /// layers (`MergedView`, `WritableOverlay`) delegate to whichever
+    /// underlying base owns the structural shape. The default is the
+    /// project-wide constant for callers that don't have any opinion.
+    ///
+    /// `async` because `Snapshot` may need to fault in the root node from
+    /// the blob store on first call.
+    async fn chunk_mask(&self) -> u32 {
+        // DEFAULT_ENTRIES_PER_NODE = 64; mask = entries - 1 = 0x3F.
+        crate::persist::DEFAULT_ENTRIES_PER_NODE - 1
+    }
 }

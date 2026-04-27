@@ -56,13 +56,17 @@ mod tests {
 
     #[test]
     fn recovery_signing_key_is_deterministic() {
-        let secret = "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ";
-        let k1 = recovery_signing_key(secret, "test-vault");
-        let k2 = recovery_signing_key(secret, "test-vault");
+        // v3: recovery_signing_key derives from the vault root's
+        // KEY_SLOT_RECOVERY value (32 raw bytes), not from age secret +
+        // vault name (see docs/reference/snapshot-publication.md
+        // § Vault ID derivation).
+        let recovery_secret = [42u8; 32];
+        let k1 = recovery_signing_key(&recovery_secret);
+        let k2 = recovery_signing_key(&recovery_secret);
         assert_eq!(k1.to_bytes(), k2.to_bytes());
 
-        // Different vault → different key
-        let k3 = recovery_signing_key(secret, "other-vault");
+        let other = [43u8; 32];
+        let k3 = recovery_signing_key(&other);
         assert_ne!(k1.to_bytes(), k3.to_bytes());
     }
 }

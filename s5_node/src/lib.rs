@@ -5,7 +5,6 @@
 //! - **Storage management**: Initializes configured blob stores (local, S3, Sia, memory).
 //! - **Networking**: Sets up the Iroh endpoint and router, registering protocol handlers
 //!   for [`s5_blobs`] and [`s5_registry`].
-//! - **Sync**: Runs file synchronization jobs via [`sync::run_file_sync`].
 //! - **FUSE**: Spawns FUSE mounts for configured filesystems via [`fuse::spawn_fuse_mounts`].
 //!
 //! # Usage
@@ -15,9 +14,9 @@
 
 use std::path::PathBuf;
 
-use crate::config::{NodeConfigPeer, NodeConfigRegistry, NodeConfigStore, S5NodeConfig};
+use crate::config::{NodeConfigRegistry, NodeConfigStore, S5NodeConfig};
 use anyhow::anyhow;
-use iroh::{Endpoint, EndpointId, protocol::Router};
+use iroh::{Endpoint, protocol::Router};
 use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer};
 use s5_core::blob::{BlobStore, BlobsRead};
 use s5_core::{RegistryApi, StoreResult};
@@ -33,7 +32,7 @@ use s5_node_api::connect::{ServiceLock, lock_path, remove_lock, write_lock};
 use s5_store_fjall::FjallStore;
 use s5_store_s3::S3Store;
 use s5_store_sia::SiaStore;
-use std::{collections::BTreeMap, collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 use tokio::sync::{RwLock, oneshot};
 use tracing::info;
 
@@ -42,14 +41,12 @@ pub mod fuse;
 pub mod identity;
 pub mod s5_server;
 pub mod snapshot;
-pub mod sync;
 pub mod tasks;
 
 pub use s5_registry::{
     ALPN as REGISTRY_ALPN, Client as RegistryClient, MultiRegistry, RegistryServer, RemoteRegistry,
     TeeRegistry, WritePolicy,
 };
-pub use sync::{SyncKeys, derive_sync_keys};
 
 pub struct S5Node {
     pub config: S5NodeConfig,
@@ -149,13 +146,10 @@ impl S5Node {
             }
         }
 
-        // Map peer id -> blobs ACL config
-        let mut peer_cfg: HashMap<String, s5_blobs::PeerConfigBlobs> = HashMap::new();
-        for NodeConfigPeer { id, blobs, .. } in config.peer.values() {
-            if !id.is_empty() {
-                peer_cfg.insert(id.clone(), blobs.clone());
-            }
-        }
+        // No peer-keyed ACL plumbing yet — the Option A model uses
+        // identity-bundle-based ACLs; until that lands, BlobsServer runs
+        // without per-peer ACL configuration.
+        let peer_cfg: HashMap<String, s5_blobs::PeerConfigBlobs> = HashMap::new();
 
         // Create and register protocol servers.
         // When a registry is available we also create a `RegistryPinner`
@@ -202,10 +196,6 @@ impl S5Node {
         })
     }
 
-    pub async fn run_file_sync(&self) -> anyhow::Result<()> {
-        crate::sync::run_file_sync(self).await
-    }
-
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.router.shutdown().await?;
         Ok(())
@@ -243,12 +233,8 @@ pub async fn create_store(config: NodeConfigStore) -> StoreResult<BlobStore> {
     Ok(BlobStore::from_arc(store))
 }
 
-/// Context needed to create registries that may require network access.
+/// Context needed to create registries.
 pub struct RegistryContext<'a> {
-    /// The iroh endpoint for creating remote connections.
-    pub endpoint: &'a Endpoint,
-    /// Peer configurations for resolving peer names to addresses.
-    pub peers: &'a BTreeMap<String, NodeConfigPeer>,
     /// Pre-built raw stores for resolving store-backed registries.
     pub stores: &'a HashMap<String, Arc<dyn s5_core::store::Store>>,
 }
@@ -282,47 +268,6 @@ fn create_registry_inner(
         NodeConfigRegistry::Memory => {
             let registry = MemoryRegistry::new();
             Ok(Arc::new(registry))
-        }
-        NodeConfigRegistry::Remote { peer } => {
-            let peer_config = ctx
-                .peers
-                .get(&peer)
-                .ok_or_else(|| anyhow!("registry remote peer '{}' not found in config", peer))?;
-            if peer_config.id.is_empty() {
-                return Err(anyhow!(
-                    "registry remote peer '{}' has no id configured",
-                    peer
-                ));
-            }
-            let endpoint_id = EndpointId::from_str(&peer_config.id)
-                .map_err(|e| anyhow!("invalid endpoint id for peer '{}': {}", peer, e))?;
-            let remote = RemoteRegistry::connect(ctx.endpoint.clone(), endpoint_id);
-            Ok(Arc::new(remote))
-        }
-        NodeConfigRegistry::Tee { local, remote_peer } => {
-            // Create local backend recursively
-            let local_registry = create_registry_inner(*local, ctx)?;
-
-            // Create remote backend
-            let peer_config = ctx.peers.get(&remote_peer).ok_or_else(|| {
-                anyhow!(
-                    "registry tee remote peer '{}' not found in config",
-                    remote_peer
-                )
-            })?;
-            if peer_config.id.is_empty() {
-                return Err(anyhow!(
-                    "registry tee remote peer '{}' has no id configured",
-                    remote_peer
-                ));
-            }
-            let endpoint_id = EndpointId::from_str(&peer_config.id)
-                .map_err(|e| anyhow!("invalid endpoint id for peer '{}': {}", remote_peer, e))?;
-            let remote_registry: Arc<dyn RegistryApi + Send + Sync> =
-                Arc::new(RemoteRegistry::connect(ctx.endpoint.clone(), endpoint_id));
-
-            let tee = TeeRegistry::new(local_registry, remote_registry);
-            Ok(Arc::new(tee))
         }
         NodeConfigRegistry::Store { store, prefix } => {
             let raw_store = ctx.stores.get(&store).ok_or_else(|| {
@@ -396,8 +341,6 @@ pub async fn run_node(
 
     // Create the default registry (if configured)
     let registry_ctx = RegistryContext {
-        endpoint: &endpoint,
-        peers: &config.peer,
         stores: &raw_stores,
     };
     let registry = match config.registry.get("default") {
@@ -458,11 +401,6 @@ pub async fn run_node(
     // Spawn configured FUSE mounts (best-effort)
     if let Err(err) = crate::fuse::spawn_fuse_mounts(&node).await {
         tracing::warn!("failed to spawn FUSE mounts: {err}");
-    }
-
-    // Fire-and-forget one-shot sync; keep services alive
-    if let Err(err) = crate::sync::run_file_sync(&node).await {
-        tracing::warn!("file sync failed: {err}");
     }
 
     // Spawn configured snapshot cycles (background tasks)

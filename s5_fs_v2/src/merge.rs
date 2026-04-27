@@ -78,6 +78,17 @@ impl ReadableLayer for MergedView {
             .collect();
         k_way_merge(streams).boxed()
     }
+
+    /// Delegate to the highest-priority layer — that's the canonical
+    /// owner of structural shape in the merge stack. An empty merge
+    /// view falls back to the trait default (workspace constant).
+    async fn chunk_mask(&self) -> u32 {
+        if let Some(top) = self.layers.first() {
+            top.chunk_mask().await
+        } else {
+            crate::persist::DEFAULT_ENTRIES_PER_NODE - 1
+        }
+    }
 }
 
 /// K-way merge of sorted streams with priority (first stream wins on ties).
@@ -99,39 +110,41 @@ fn k_way_merge<'a>(
 
 /// Internal state for k-way merge.
 struct KMergeState<'a> {
-    /// (stream, buffered next item) per layer. Index = priority.
+    /// `(stream, buffered next item, exhausted)` per layer. Index = priority.
+    /// `exhausted` flips to `true` the first time the stream returns
+    /// `None`; subsequent rounds skip it. Without this flag we would
+    /// re-poll an already-completed `unfold`-based stream and trip
+    /// "Unfold must not be polled after it returned `Poll::Ready(None)`".
     #[allow(clippy::type_complexity)]
     heads: Vec<(
         BoxStream<'a, anyhow::Result<(String, NodeEntry)>>,
         Option<(String, NodeEntry)>,
+        bool,
     )>,
-    initialized: bool,
 }
 
 impl<'a> KMergeState<'a> {
     fn new(streams: Vec<BoxStream<'a, anyhow::Result<(String, NodeEntry)>>>) -> Self {
-        let heads = streams.into_iter().map(|s| (s, None)).collect();
-        Self {
-            heads,
-            initialized: false,
-        }
+        let heads = streams.into_iter().map(|s| (s, None, false)).collect();
+        Self { heads }
     }
 
-    /// Advance: fill buffers, pick smallest key, skip duplicates.
+    /// Advance: fill buffers (skipping exhausted streams), pick smallest
+    /// key, skip duplicates.
     async fn next(&mut self) -> anyhow::Result<Option<(String, NodeEntry)>> {
-        // Fill all empty buffers.
-        for (stream, buf) in self.heads.iter_mut() {
-            if (!self.initialized || buf.is_none())
-                && let Some(result) = stream.next().await
-            {
-                *buf = Some(result?);
+        for (stream, buf, exhausted) in self.heads.iter_mut() {
+            if buf.is_some() || *exhausted {
+                continue;
+            }
+            match stream.next().await {
+                Some(result) => *buf = Some(result?),
+                None => *exhausted = true,
             }
         }
-        self.initialized = true;
 
         // Find the smallest key (lowest index wins ties).
         let mut best_idx: Option<usize> = None;
-        for (i, (_, buf)) in self.heads.iter().enumerate() {
+        for (i, (_, buf, _)) in self.heads.iter().enumerate() {
             if let Some((key, _)) = buf {
                 match best_idx {
                     None => best_idx = Some(i),
@@ -162,7 +175,7 @@ impl<'a> KMergeState<'a> {
             .expect("best_idx points to populated buffer");
 
         // Skip duplicate keys from lower-priority streams.
-        for (i, (_, buf)) in self.heads.iter_mut().enumerate() {
+        for (i, (_, buf, _)) in self.heads.iter_mut().enumerate() {
             if i != best_idx
                 && let Some((key, _)) = buf
                 && *key == winner.0

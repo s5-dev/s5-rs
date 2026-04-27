@@ -71,29 +71,24 @@ impl S5NodeServer {
             (Some(name), None) => match config.task.get(&name) {
                 Some(tc) => tc.spec.clone(),
                 None => {
-                    tracing::warn!(name = %name, "RunTask: task not found in config");
-                    return RunTaskResponse {
-                        task_id: 0,
-                        spec_json: String::from("null"),
-                    };
+                    let error = format!("task '{name}' not found in config");
+                    tracing::warn!(name = %name, "RunTask: {error}");
+                    return RunTaskResponse::Refused { error };
                 }
             },
             (None, Some(json)) => match serde_json::from_str::<TaskSpec>(&json) {
                 Ok(spec) => spec,
                 Err(e) => {
-                    tracing::warn!(error = %e, "RunTask: invalid spec_json");
-                    return RunTaskResponse {
-                        task_id: 0,
-                        spec_json: String::from("null"),
-                    };
+                    let error = format!("invalid spec_json: {e}");
+                    tracing::warn!(error = %e, "RunTask: {error}");
+                    return RunTaskResponse::Refused { error };
                 }
             },
             _ => {
-                tracing::warn!("RunTask: must specify exactly one of `name` or `spec_json`");
-                return RunTaskResponse {
-                    task_id: 0,
-                    spec_json: String::from("null"),
-                };
+                let error =
+                    "RunTask: must specify exactly one of `name` or `spec_json`".to_string();
+                tracing::warn!("{error}");
+                return RunTaskResponse::Refused { error };
             }
         };
         drop(config);
@@ -102,17 +97,15 @@ impl S5NodeServer {
         match self.executor.spawn(spec.clone()).await {
             Ok((task_id, resolved_spec)) => {
                 tracing::info!(task_id, "task spawned");
-                RunTaskResponse {
+                RunTaskResponse::Spawned {
                     task_id,
                     spec_json: serde_json::to_string(&resolved_spec).unwrap_or_default(),
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to spawn task");
-                RunTaskResponse {
-                    task_id: 0,
-                    spec_json: serde_json::to_string(&spec).unwrap_or_default(),
-                }
+                let error = format!("failed to spawn task: {e}");
+                tracing::error!(error = %e, "{error}");
+                RunTaskResponse::Refused { error }
             }
         }
     }
@@ -338,10 +331,18 @@ impl S5NodeServer {
         use ed25519_dalek::VerifyingKey;
         use s5_core::StreamKey;
 
-        // Derive the signing key → verifying key → stream key for this vault
-        let signing_key = crate::tasks::publish::vault_signing_key(&ctx.node_secret, vault_name);
+        // Derive the device's signing key → verifying key → stream key.
+        //
+        // TODO(v3 lookup): compute `vault_id` from the vault root's
+        // `KEY_SLOT_RECOVERY` slot. The zero-`vault_id` placeholder means
+        // this lookup will not find entries published with the proper
+        // `VAULT_ID` field; use as a temporary compile fix only.
+        let signing_key = crate::tasks::publish::device_signing_key(&ctx.node_secret);
         let verifying_key: VerifyingKey = (&signing_key).into();
-        let stream_key = StreamKey::PublicKeyEd25519(verifying_key.to_bytes());
+        let stream_key = StreamKey::Vault {
+            pubkey: verifying_key.to_bytes(),
+            vault_id: [0u8; 16],
+        };
 
         // Resolve identity files from vault's key config
         let mut identity_files = Vec::new();

@@ -34,8 +34,6 @@ pub struct S5NodeConfig {
     #[serde(default)]
     pub key: BTreeMap<String, NodeConfigKey>,
     pub store: BTreeMap<String, NodeConfigStore>,
-    #[serde(default)]
-    pub peer: BTreeMap<String, NodeConfigPeer>,
     /// Named registry backends keyed by name (e.g., "default").
     /// At least one entry named "default" is expected for normal operation.
     #[serde(default)]
@@ -82,16 +80,6 @@ pub struct LocalLinksStoreConfig {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NodeConfigPeer {
-    /// Peer public ID string used for both ACLs and dialing.
-    #[serde(default)]
-    pub id: String,
-    /// Optional blob ACL configuration; defaults to no access.
-    #[serde(default)]
-    pub blobs: s5_blobs::PeerConfigBlobs,
-}
-
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
@@ -134,10 +122,24 @@ impl S5NodeConfig {
                     ));
                 }
             }
-            for peer_name in &vault_config.peers {
-                if !self.peer.contains_key(peer_name) {
+            for recipient_name in &vault_config.recipients {
+                if !self.key.contains_key(recipient_name) {
                     errors.push(format!(
-                        "vault.{vault_name}: peer \"{peer_name}\" not found in [peer.*]"
+                        "vault.{vault_name}: recipient \"{recipient_name}\" not found in [key.*]"
+                    ));
+                }
+            }
+            for source_name in &vault_config.sources {
+                if !self.source.contains_key(source_name) {
+                    errors.push(format!(
+                        "vault.{vault_name}: source \"{source_name}\" not found in [source.*]"
+                    ));
+                }
+            }
+            for store_name in &vault_config.meta_targets {
+                if !self.store.contains_key(store_name) {
+                    errors.push(format!(
+                        "vault.{vault_name}: meta_target \"{store_name}\" not found in [store.*]"
                     ));
                 }
             }
@@ -273,21 +275,6 @@ impl S5NodeConfig {
                     ));
                 }
             }
-            NodeConfigRegistry::Remote { peer } => {
-                if !self.peer.contains_key(peer) {
-                    errors.push(format!(
-                        "registry.{name}: peer \"{peer}\" not found in [peer.*]"
-                    ));
-                }
-            }
-            NodeConfigRegistry::Tee { local, remote_peer } => {
-                self.validate_registry(name, local, errors);
-                if !self.peer.contains_key(remote_peer) {
-                    errors.push(format!(
-                        "registry.{name}: remote_peer \"{remote_peer}\" not found in [peer.*]"
-                    ));
-                }
-            }
             NodeConfigRegistry::Multi { backends, .. } => {
                 for backend in backends {
                     self.validate_registry(name, backend, errors);
@@ -345,6 +332,9 @@ root_path = "/data/backups-metadata"
 key = "local"
 preset = "e2ee_prolly_chunked_zstd_dict_default_chacha20"
 blob_stores = ["hetzner", "local-ssd"]
+recipients = ["local", "yubikey"]
+sources = ["unsorted", "photos"]
+meta_targets = ["hetzner"]
 
 [task.ingest-unsorted]
 type = "ingest"
@@ -417,7 +407,10 @@ base_path = "/blobs"
             Some("e2ee_prolly_chunked_zstd_dict_default_chacha20")
         );
         assert_eq!(backup.blob_stores, vec!["hetzner", "local-ssd"]);
-        assert!(backup.peers.is_empty());
+        assert_eq!(backup.recipients, vec!["local", "yubikey"]);
+        assert_eq!(backup.sources, vec!["unsorted", "photos"]);
+        assert_eq!(backup.meta_targets, vec!["hetzner"]);
+        assert!(!backup.plaintext_tree); // default false → tree is encrypted
 
         // Tasks
         assert_eq!(config.task.len(), 3);
@@ -508,7 +501,9 @@ paths = ["/data"]
 root_path = "/tmp/v"
 key = "missing_key"
 blob_stores = ["missing_store"]
-peers = ["missing_peer"]
+recipients = ["missing_recipient"]
+sources = ["missing_source_ref"]
+meta_targets = ["missing_meta_store"]
 
 [task.ingest]
 type = "ingest"
@@ -547,7 +542,18 @@ keys = ["missing_key"]
             has("missing_store"),
             "missing: vault blob_store\n{errors:#?}"
         );
-        assert!(has("missing_peer"), "missing: vault peer\n{errors:#?}");
+        assert!(
+            has("missing_recipient"),
+            "missing: vault recipient\n{errors:#?}"
+        );
+        assert!(
+            has("missing_source_ref"),
+            "missing: vault source ref\n{errors:#?}"
+        );
+        assert!(
+            has("missing_meta_store"),
+            "missing: vault meta_target\n{errors:#?}"
+        );
         assert!(
             has("task.ingest") && has("missing_vault"),
             "missing: task vault\n{errors:#?}"

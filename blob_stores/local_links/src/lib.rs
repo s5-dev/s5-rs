@@ -23,10 +23,10 @@
 //! [store.links]
 //! type = "local_links"
 //! path = "./links"
-//!
-//! [peer."*".blobs]
-//! readable_stores = ["default", "links"]
 //! ```
+//!
+//! Make the store readable from a vault by listing it in
+//! `vault.<name>.blob_stores` (see `docs/reference/configuration.md`).
 //!
 //! # Limitations
 //!

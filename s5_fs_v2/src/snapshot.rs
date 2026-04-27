@@ -17,21 +17,21 @@
 //!   the first key in each child.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use s5_core::{BlobId, BlobsRead, BlobsWrite, Hash};
 
-use crate::context::{self, KDF_LEAF, KDF_META};
+use crate::context::{self, KDF_META};
 use crate::layer::ReadableLayer;
 use crate::node::{
     BlobPipeline, CompressionStrategy, ContentRef, EncryptionStrategy, Node, NodeEntry, NodeKind,
     PaddingStrategy, SemanticMeta, Structural, TraversalContext,
 };
+use crate::pipeline::NodeCache;
 
 /// Master secret key slot in the on-wire `TraversalContext.keys` map.
 const KEY_SLOT_MASTER: u8 = 0x0e;
@@ -42,7 +42,38 @@ pub const KEY_SLOT_LEAF: u8 = 0x10;
 /// Node blob encryption key slot (serialized metadata).
 pub const KEY_SLOT_NODE: u8 = 0x11;
 
+/// Recovery seed slot (vault root only). Holds the per-vault
+/// `recovery_secret` from which `vault_id` and `recovery_signing_key`
+/// are derived. No blob pipeline references this slot — it is pure
+/// derivation material, not an encryption key. See
+/// `docs/reference/snapshot-publication.md` § Vault ID derivation.
+pub const KEY_SLOT_RECOVERY: u8 = 0x12;
+
 /// Default padding block size (1 KiB).
+///
+/// After compression and before encryption, blob bytes are zero-padded up to
+/// the next multiple of this size. An observer sees the padded length on the
+/// wire (the plaintext length is unknowable without the decryption key); the
+/// padding bucket width determines how much size-fingerprint information
+/// leaks per blob.
+///
+/// 1 KiB is chosen because:
+///
+/// - At a ~64 KiB average chunk size (see [`chunking`](crate::chunking)),
+///   1 KiB padding adds at most ~1.5 % storage overhead per leaf chunk
+///   (worst case: 1023 bytes of padding on a 1024-byte-aligned blob).
+/// - 1 024-byte bucket granularity gives enough size obfuscation that size
+///   alone is a weak identifier for mid-to-large files (the typical target of
+///   a content-addressed store). It does not defend against adversaries who
+///   already have strong content-hash or filename signals.
+/// - Larger padding (e.g. 4 KiB) would give coarser buckets for modest extra
+///   obfuscation but adds ~4–6 % storage overhead on small/medium chunks,
+///   which is a poor trade for a general-purpose FS.
+///
+/// Internal prolly-tree node blobs inherit this same padding from the node
+/// pipeline and pay a higher relative overhead (node blobs are typically
+/// 1–8 KiB). A different `node.padding` policy is a reasonable future tweak
+/// but is not currently differentiated.
 const DEFAULT_PAD_BLOCK_SIZE: u32 = 1024;
 
 /// An immutable snapshot backed by a prolly tree in the blob store.
@@ -56,18 +87,16 @@ pub struct Snapshot {
     root_plaintext_hash: Option<[u8; 32]>,
     /// Blob store for fetching and uploading.
     store: Arc<dyn BlobsRead>,
-    /// On-wire context: keys and blob processing pipelines.
+    /// On-wire context: keys and blob processing pipelines. Includes
+    /// the per-pipeline `skip_when_unhelpful` policy — there is no
+    /// runtime flag duplicating it on `Snapshot`.
     ctx: TraversalContext,
-    /// When true, compression is skipped for blobs where the padded compressed
-    /// size is not smaller than the padded uncompressed size (i.e. compression
-    /// yields no storage savings after accounting for block padding).
-    skip_unhelpful_compression: bool,
     /// Decoded node cache — avoids repeated blob_download + decrypt +
     /// decompress + CBOR parse for the same prolly tree node. Shared
-    /// across clones so concurrent `is_changed()` calls benefit.
-    /// Values are `Arc<Node>` so cache hits return a cheap pointer bump
-    /// instead of cloning the entire `BTreeMap` inside each `Node`.
-    node_cache: Arc<RwLock<HashMap<Hash, Arc<Node>>>>,
+    /// across clones (and with derived `Pipeline`s via
+    /// [`Pipeline::with_node_cache`]) so concurrent `is_changed()`
+    /// calls and pipeline loads see each other's hits.
+    node_cache: Arc<NodeCache>,
 }
 
 impl Snapshot {
@@ -91,8 +120,7 @@ impl Snapshot {
             root_plaintext_hash,
             store,
             ctx,
-            skip_unhelpful_compression: false,
-            node_cache: Arc::new(RwLock::new(HashMap::new())),
+            node_cache: Arc::new(NodeCache::new()),
         }
     }
 
@@ -111,8 +139,7 @@ impl Snapshot {
             root_plaintext_hash: None,
             store,
             ctx,
-            skip_unhelpful_compression: false,
-            node_cache: Arc::new(RwLock::new(HashMap::new())),
+            node_cache: Arc::new(NodeCache::new()),
         }
     }
 
@@ -128,10 +155,13 @@ impl Snapshot {
     /// Compression is automatically skipped for blobs where it yields no
     /// storage savings after padding.
     pub fn empty_encrypted(store: Arc<dyn BlobsRead>, master_secret: [u8; 32]) -> Self {
-        Self::empty(store, encrypted_context(master_secret)).with_skip_unhelpful_compression(true)
+        // The skip-when-unhelpful policy is set on the leaf pipeline
+        // inside `encrypted_context` — no runtime flag to flip here.
+        Self::empty(store, encrypted_context(master_secret))
     }
 
-    /// Creates an empty, encrypted snapshot with separate leaf and node keys.
+    /// Creates an empty, encrypted snapshot with separate leaf and node keys
+    /// plus a recovery seed (vault root shape).
     ///
     /// Both pipelines use Zstd compression, 4 KiB padding, and
     /// DeterministicChaCha20 encryption — but with independent keys so
@@ -139,15 +169,23 @@ impl Snapshot {
     /// Compression is automatically skipped for blobs where it yields no
     /// storage savings after padding.
     ///
-    /// The caller is responsible for generating the keys securely
-    /// (e.g. `rand::rngs::OsRng`).
+    /// `recovery_secret` is stored in `KEY_SLOT_RECOVERY` and is the seed
+    /// from which `vault_id` and `recovery_signing_key` are derived.
+    ///
+    /// The caller is responsible for generating all three values
+    /// securely (e.g. `rand::rngs::OsRng`).
     pub fn empty_encrypted_split(
         store: Arc<dyn BlobsRead>,
         leaf_key: [u8; 32],
         node_key: [u8; 32],
+        recovery_secret: [u8; 32],
     ) -> Self {
-        Self::empty(store, encrypted_split_context(leaf_key, node_key))
-            .with_skip_unhelpful_compression(true)
+        // The skip-when-unhelpful policy is set on the leaf pipeline
+        // inside `encrypted_split_context` — no runtime flag to flip here.
+        Self::empty(
+            store,
+            encrypted_split_context(leaf_key, node_key, recovery_secret),
+        )
     }
 
     /// Creates an encrypted snapshot with default pipelines.
@@ -205,13 +243,15 @@ impl Snapshot {
             .and_then(|keys| keys.get(&KEY_SLOT_MASTER))
     }
 
-    /// Enables skipping compression when unhelpful (builder style).
-    ///
-    /// When enabled, leaf blobs where padded compressed size >= padded
-    /// uncompressed size are stored uncompressed with a per-entry
-    /// `child_context` override.
+    /// Set the leaf-pipeline `skip_when_unhelpful` policy in
+    /// `self.ctx` (builder style). Equivalent to mutating
+    /// `self.ctx.leaf.skip_when_unhelpful` directly. Has no effect if
+    /// `self.ctx.leaf` is `None` (no leaf pipeline to set the policy
+    /// on, e.g. the unencrypted/uncompressed default context).
     pub fn with_skip_unhelpful_compression(mut self, skip: bool) -> Self {
-        self.skip_unhelpful_compression = skip;
+        if let Some(leaf) = self.ctx.leaf.as_mut() {
+            leaf.skip_when_unhelpful = Some(skip);
+        }
         self
     }
 
@@ -223,6 +263,21 @@ impl Snapshot {
     /// Returns the node blob pipeline.
     pub fn node_pipeline(&self) -> Option<&BlobPipeline> {
         self.ctx.node.as_ref()
+    }
+
+    /// Build a [`Pipeline`](crate::pipeline::Pipeline) view of this
+    /// snapshot's blob-level state — the read store, traversal context,
+    /// and decoded-node cache. The cache is shared (`Arc::clone`), so
+    /// loads via the pipeline and via the snapshot's own internal
+    /// callers see each other's hits. Public so layered consumers
+    /// (e.g. a writable FUSE adapter) can hold a `Pipeline` instead of
+    /// a full `Snapshot`.
+    pub fn as_pipeline(&self) -> crate::pipeline::Pipeline {
+        crate::pipeline::Pipeline::with_node_cache(
+            Arc::clone(&self.store),
+            self.ctx.clone(),
+            Arc::clone(&self.node_cache),
+        )
     }
 
     // =====================================================================
@@ -252,7 +307,6 @@ impl Snapshot {
             root_plaintext_hash: content.plaintext_hash,
             store: self.store.clone(),
             ctx: child_ctx,
-            skip_unhelpful_compression: self.skip_unhelpful_compression,
             node_cache: self.node_cache.clone(),
         }
     }
@@ -261,66 +315,15 @@ impl Snapshot {
     // Node Loading
     // =====================================================================
 
-    /// Loads and decodes a [`Node`] from the blob store.
-    ///
-    /// Uses the node pipeline for decryption/decompression. `plaintext_hash`
-    /// is needed for encrypted nodes — it comes from the parent
-    /// `ContentRef.plaintext_hash`.
-    ///
-    /// Results are cached by hash — repeated loads of the same node skip
-    /// blob download, decryption, decompression, and CBOR parsing entirely.
+    /// Loads and decodes a [`Node`] from the blob store. Delegates to
+    /// [`Pipeline::load`](crate::pipeline::Pipeline::load) — see that
+    /// for the cache + decode details.
     pub async fn load(
         &self,
         hash: Hash,
         plaintext_hash: Option<&[u8; 32]>,
     ) -> anyhow::Result<Arc<Node>> {
-        // Fast path: return cached decoded node (cheap Arc bump).
-        {
-            let cache = self.node_cache.read().unwrap();
-            if let Some(node) = cache.get(&hash) {
-                return Ok(Arc::clone(node));
-            }
-        }
-
-        let bytes = self
-            .store
-            .blob_download(hash)
-            .await
-            .map_err(|e| anyhow::anyhow!("loading Node {hash}: {e}"))?;
-
-        // For node blobs we need the plaintext_size to truncate padding.
-        // But we don't know it yet — that's a chicken-and-egg problem.
-        // Fortunately, node blobs are always compressed (zstd), so the
-        // decompressor handles trailing padding. For uncompressed nodes
-        // without padding, plaintext_size doesn't matter.
-        // We pass 0 as plaintext_size; the pipeline_decode handles this:
-        // - If compressed: zstd frame is self-delimiting, ignores trailing zeros
-        // - If uncompressed + no padding: data is passed through unchanged
-        // - If uncompressed + padding: we'd need the real size (TODO: store it)
-        let plaintext_size = 0; // placeholder — see comment above
-
-        let decoded = context::pipeline_decode(
-            bytes,
-            self.ctx.node.as_ref(),
-            plaintext_hash,
-            plaintext_size,
-            KDF_META,
-            self.ctx.keys.as_ref(),
-            None, // nodes never use dictionary compression
-        )?;
-
-        let node =
-            Node::from_bytes(&decoded).map_err(|e| anyhow::anyhow!("decoding Node {hash}: {e}"))?;
-
-        let node = Arc::new(node);
-
-        // Cache the decoded node.
-        {
-            let mut cache = self.node_cache.write().unwrap();
-            cache.insert(hash, Arc::clone(&node));
-        }
-
-        Ok(node)
+        self.as_pipeline().load(hash, plaintext_hash).await
     }
 
     /// Loads the root node of this snapshot.
@@ -363,8 +366,7 @@ impl Snapshot {
             &plaintext_hash,
             KDF_META,
             self.ctx.keys.as_ref(),
-            None,  // nodes never use dictionary compression
-            false, // no compression skip for metadata nodes
+            None, // nodes never use dictionary compression
         )?;
 
         let blob_id = store
@@ -417,6 +419,27 @@ impl Snapshot {
         }
 
         // Multi-chunk file — apply D-chunk dictionary compression.
+        //
+        // TODO(high-priority, OOM on large files): this collects every chunk
+        // of the file into `all_chunks` before building the tree. For a
+        // 10 GiB VM image that is ~10 GiB of `Bytes` handles plus the
+        // plaintext in memory, which kills the entire process on any
+        // realistic mobile/laptop target. The contract of this function
+        // needs to be "bounded memory regardless of file size":
+        //
+        //   - stream each chunk through `import_bytes` as it arrives (the
+        //     upload/dedup path already supports that per-chunk),
+        //   - emit `(key, NodeEntry)` tuples into a bounded channel,
+        //   - let `chunk_entries` + `build_tree_dedup` consume incrementally,
+        //   - keep at most ~N chunks buffered to preserve the dict-chunk-
+        //     lookback window (N ~= 1/mask + small constant).
+        //
+        // Until this is fixed, blocker for VM images, DB dumps, long video,
+        // ML weight files — the exact "huge file" workloads `import_stream`
+        // is advertised to handle. Was flagged as Critical in the internal
+        // code review; commit-message honesty about the current limitation
+        // is in c8d9938 (feat: implement streaming CDC chunking for file
+        // import).
         let mut all_chunks = vec![first_chunk];
         if let Some(c) = second_chunk {
             all_chunks.push(c);
@@ -480,10 +503,12 @@ impl Snapshot {
 
         let mut stats = crate::persist::MergeStats::default();
         let (root_hash, root_plaintext_hash) = self
+            .as_pipeline()
             .build_tree_dedup(
                 leaf_nodes,
                 store,
                 &crate::node::NodeKind::ByteStream,
+                mask,
                 &mut stats,
             )
             .await?;
@@ -504,12 +529,8 @@ impl Snapshot {
     }
 
     /// Import in-memory bytes into the blob store as a leaf entry.
-    ///
-    /// Pipeline: hash plaintext → compress → pad → encrypt → upload → NodeEntry
-    ///
-    /// Uses the leaf pipeline from the traversal context.
-    /// `dictionary` is the decompressed content of the preceding D-chunk for
-    /// dictionary-based compression (pass `None` for D-chunks or non-dict strategies).
+    /// Delegates to
+    /// [`Pipeline::import_bytes`](crate::pipeline::Pipeline::import_bytes).
     pub async fn import_bytes(
         &self,
         plaintext: &[u8],
@@ -517,250 +538,22 @@ impl Snapshot {
         semantic: Option<SemanticMeta>,
         dictionary: Option<&[u8]>,
     ) -> anyhow::Result<NodeEntry> {
-        let plaintext_size = plaintext.len() as u64;
-        let plaintext_hash_bytes: [u8; 32] = *blake3::hash(plaintext).as_bytes();
-
-        let result = context::pipeline_encode(
-            plaintext,
-            self.ctx.leaf.as_ref(),
-            &plaintext_hash_bytes,
-            KDF_LEAF,
-            self.ctx.keys.as_ref(),
-            dictionary,
-            self.skip_unhelpful_compression,
-        )?;
-
-        let blob_id = store
-            .blob_upload_bytes(result.bytes)
+        self.as_pipeline()
+            .import_bytes(plaintext, store, semantic, dictionary)
             .await
-            .map_err(|e| anyhow::anyhow!("uploading blob: {e}"))?;
-
-        // Determine if transforms were applied (need plaintext_hash + stored_blocks).
-        let has_transforms = self.ctx.leaf.is_some();
-        let (pt_hash, blocks) = if has_transforms {
-            (Some(plaintext_hash_bytes), Some(result.stored_blocks))
-        } else {
-            (None, None)
-        };
-
-        // When compression was skipped, record a per-entry override so the
-        // decoder knows this blob is stored uncompressed despite the default
-        // pipeline specifying Zstd.
-        let child_context = if result.compression_skipped {
-            Some(Box::new(TraversalContext {
-                keys: None,
-                leaf: Some(BlobPipeline {
-                    compression: Some(CompressionStrategy::Uncompressed),
-                    padding: None,
-                    encryption: None,
-                }),
-                node: None,
-            }))
-        } else {
-            None
-        };
-
-        Ok(NodeEntry {
-            content: Some(ContentRef {
-                structural: Structural::Leaf,
-                hash: *blob_id.hash.as_bytes(),
-                size: plaintext_size,
-                plaintext_hash: pt_hash,
-                stored_blocks: blocks,
-            }),
-            semantic,
-            child_context,
-            tombstone: None,
-        })
     }
 
     // =====================================================================
     // File Export
     // =====================================================================
 
-    /// Download, decrypt, decompress, and verify a leaf entry's content.
-    ///
-    /// For chunked files (`Structural::Link`), this recursively fetches all
-    /// chunks and concatenates them into a single contiguous `Bytes`.
-    /// For very large files, a streaming export should be used instead.
-    pub fn export_bytes<'a>(
-        &'a self,
-        entry: &'a NodeEntry,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Bytes>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let content = entry
-                .content
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("cannot export tombstone entry"))?;
-
-            if content.structural == Structural::Link {
-                // It's a chunk tree. Load the node.
-                let node = self
-                    .load(content.hash(), content.plaintext_hash.as_ref())
-                    .await?;
-                if node.header.kind != NodeKind::ByteStream {
-                    anyhow::bail!(
-                        "cannot export structural link of kind {:?}",
-                        node.header.kind
-                    );
-                }
-
-                let child_snap = self.child(entry);
-
-                // Extract D-chunk mask for dictionary-aware decoding.
-                let dict_mask = child_snap
-                    .ctx
-                    .leaf
-                    .as_ref()
-                    .and_then(|p| match &p.compression {
-                        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask }) => {
-                            Some(*mask)
-                        }
-                        _ => None,
-                    });
-
-                use futures::StreamExt;
-                let mut stream =
-                    child_snap.walk_byte_stream(content.hash(), content.plaintext_hash);
-
-                let mut all_bytes = bytes::BytesMut::with_capacity(content.size as usize);
-                let mut dict_content: Option<Vec<u8>> = None;
-                let mut chunk_index: usize = 0;
-
-                while let Some(res) = stream.next().await {
-                    let chunk_entry = res?;
-
-                    // Determine if this chunk is a D-chunk.
-                    let is_d_chunk = match (
-                        dict_mask,
-                        chunk_entry
-                            .content
-                            .as_ref()
-                            .and_then(|c| c.plaintext_hash.as_ref()),
-                    ) {
-                        (Some(mask), Some(ph)) => chunk_index == 0 || (ph[0] & mask) == 0,
-                        _ => true, // no dict compression or no plaintext_hash → treat as independent
-                    };
-
-                    let dictionary = if is_d_chunk {
-                        None
-                    } else {
-                        dict_content.as_deref()
-                    };
-
-                    let chunk_bytes = child_snap.export_leaf(&chunk_entry, dictionary).await?;
-
-                    // Update dictionary: D-chunks become the new dictionary.
-                    if is_d_chunk && dict_mask.is_some() {
-                        dict_content = Some(chunk_bytes.to_vec());
-                    }
-
-                    all_bytes.extend_from_slice(&chunk_bytes);
-                    chunk_index += 1;
-                }
-                return Ok(all_bytes.freeze());
-            }
-
-            // Single leaf entry — no dictionary.
-            self.export_leaf(entry, None).await
-        })
-    }
-
-    /// Download, decrypt, decompress, and verify a single leaf blob.
-    ///
-    /// `dictionary` is the decompressed D-chunk content for dictionary-based
-    /// decompression (pass `None` for D-chunks or non-dict strategies).
-    ///
-    /// If the entry carries a `child_context` with a leaf pipeline override
-    /// (e.g. `Uncompressed` for blobs that skipped compression), that override
-    /// is merged into the snapshot's context before decoding.
-    async fn export_leaf(
-        &self,
-        entry: &NodeEntry,
-        dictionary: Option<&[u8]>,
-    ) -> anyhow::Result<Bytes> {
-        let content = entry
-            .content
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("cannot export tombstone entry"))?;
-
-        let ciphertext = self
-            .store
-            .blob_download(content.hash())
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading blob {}: {e}", content.hash()))?;
-
-        // Merge per-entry leaf pipeline override (e.g. Uncompressed) if present.
-        let effective_ctx = match entry.child_context.as_ref() {
-            Some(child_tcx) => merge_contexts(&self.ctx, child_tcx),
-            None => self.ctx.clone(),
-        };
-
-        let plaintext = context::pipeline_decode(
-            ciphertext,
-            effective_ctx.leaf.as_ref(),
-            content.plaintext_hash.as_ref(),
-            content.size,
-            KDF_LEAF,
-            effective_ctx.keys.as_ref(),
-            dictionary,
-        )?;
-
-        // Verify plaintext hash if available.
-        if let Some(expected_hash) = &content.plaintext_hash {
-            let actual_hash = blake3::hash(&plaintext);
-            if actual_hash.as_bytes() != expected_hash {
-                anyhow::bail!(
-                    "plaintext hash mismatch for blob {}: expected {}, got {}",
-                    content.hash(),
-                    Hash::from(*expected_hash),
-                    actual_hash,
-                );
-            }
-        }
-
-        Ok(plaintext)
-    }
-
-    // =====================================================================
-    // Recursive Walk
-    // =====================================================================
-
-    fn walk_byte_stream<'a>(
-        &'a self,
-        hash: Hash,
-        plaintext_hash: Option<[u8; 32]>,
-    ) -> BoxStream<'a, anyhow::Result<NodeEntry>> {
-        Box::pin(async_stream::try_stream! {
-            let node = self.load(hash, plaintext_hash.as_ref()).await?;
-            if node.header.kind != NodeKind::ByteStream {
-                Err(anyhow::anyhow!("expected ByteStream node, found {:?}", node.header.kind))?;
-            }
-
-            if node.header.level > 0 {
-                // Internal node
-                for entry in node.entries.values() {
-                    if entry.is_link() {
-                        let content = entry.content.as_ref().unwrap();
-                        let child = self.child(entry);
-                        let mut s = std::pin::pin!(child.walk_byte_stream(
-                            content.hash(),
-                            content.plaintext_hash,
-                        ));
-                        while let Some(item) = s.next().await {
-                            let chunk_entry = item?;
-                            yield chunk_entry;
-                        }
-                    }
-                }
-            } else {
-                // Leaf node of chunks
-                for entry in node.entries.values() {
-                    yield entry.clone();
-                }
-            }
-        })
+    /// Download, decrypt, decompress, and verify a leaf entry's
+    /// content. Delegates to
+    /// [`Pipeline::export_bytes`](crate::pipeline::Pipeline::export_bytes),
+    /// which handles both single-leaf and chunked-file (`Structural::Link`)
+    /// cases.
+    pub async fn export_bytes(&self, entry: &NodeEntry) -> anyhow::Result<Bytes> {
+        self.as_pipeline().export_bytes(entry).await
     }
 
     /// Recursively walk the snapshot tree, yielding `(path, NodeEntry)` for
@@ -927,7 +720,6 @@ impl Clone for Snapshot {
             root_plaintext_hash: self.root_plaintext_hash,
             store: self.store.clone(),
             ctx: self.ctx.clone(),
-            skip_unhelpful_compression: self.skip_unhelpful_compression,
             node_cache: self.node_cache.clone(),
         }
     }
@@ -989,6 +781,24 @@ impl ReadableLayer for Snapshot {
             .flatten()
             .boxed()
     }
+
+    /// Snapshot's chunk mask comes from the root node's `BuildContext`
+    /// — it's the only thing tied to this concrete tree's shape. An
+    /// empty / not-yet-loaded snapshot falls back to the workspace
+    /// default. Layers wrapping a `Snapshot` (e.g. `MergedView`,
+    /// `WritableOverlay`) inherit this via their base.
+    async fn chunk_mask(&self) -> u32 {
+        if !self.is_empty()
+            && let Ok(root) = self.load_root().await
+            && let Some(build) = &root.header.build
+            && let Some(crate::node::MetaChunkingStrategy::ProllyBlake3 {
+                expected_entries_per_node,
+            }) = &build.meta_chunking
+        {
+            return expected_entries_per_node.wrapping_sub(1);
+        }
+        crate::persist::DEFAULT_ENTRIES_PER_NODE - 1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +819,9 @@ fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
         encryption: Some((EncryptionStrategy::DeterministicChaCha20, KEY_SLOT_MASTER)),
+        // Encrypted leaves default to padding-aware skip-on-no-gain;
+        // see BlobPipeline::skip_when_unhelpful docs.
+        skip_when_unhelpful: Some(true),
     };
 
     let node_pipeline = BlobPipeline {
@@ -1017,6 +830,9 @@ fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
         encryption: Some((EncryptionStrategy::DeterministicChaCha20, KEY_SLOT_MASTER)),
+        // Tree-node encoding doesn't benefit from skip — node blobs are
+        // small and consistent, and we always want to compress them.
+        skip_when_unhelpful: None,
     };
 
     TraversalContext {
@@ -1026,14 +842,24 @@ fn encrypted_context(master_secret: [u8; 32]) -> TraversalContext {
     }
 }
 
-/// Creates an encrypted `TraversalContext` with separate leaf and node keys.
+/// Creates a vault-root-shaped encrypted `TraversalContext` with
+/// separate leaf and node encryption keys plus a recovery seed slot.
 ///
-/// Each pipeline gets its own key slot (`KEY_SLOT_LEAF` / `KEY_SLOT_NODE`)
+/// Pipelines get their own key slots (`KEY_SLOT_LEAF` / `KEY_SLOT_NODE`)
 /// so that file content and metadata are encrypted with independent keys.
-fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalContext {
+/// `recovery_secret` lives in `KEY_SLOT_RECOVERY` — no pipeline references
+/// it; it's pure derivation material for `vault_id` and the recovery
+/// registry signing key (see `docs/reference/snapshot-publication.md`
+/// § Vault ID derivation).
+fn encrypted_split_context(
+    leaf_key: [u8; 32],
+    node_key: [u8; 32],
+    recovery_secret: [u8; 32],
+) -> TraversalContext {
     let mut keys = BTreeMap::new();
     keys.insert(KEY_SLOT_LEAF, leaf_key);
     keys.insert(KEY_SLOT_NODE, node_key);
+    keys.insert(KEY_SLOT_RECOVERY, recovery_secret);
 
     let leaf_pipeline = BlobPipeline {
         compression: Some(CompressionStrategy::Zstd),
@@ -1041,6 +867,7 @@ fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalC
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
         encryption: Some((EncryptionStrategy::DeterministicChaCha20, KEY_SLOT_LEAF)),
+        skip_when_unhelpful: Some(true),
     };
 
     let node_pipeline = BlobPipeline {
@@ -1049,6 +876,7 @@ fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalC
             block_size: DEFAULT_PAD_BLOCK_SIZE,
         }),
         encryption: Some((EncryptionStrategy::DeterministicChaCha20, KEY_SLOT_NODE)),
+        skip_when_unhelpful: None,
     };
 
     TraversalContext {
@@ -1067,7 +895,14 @@ fn encrypted_split_context(leaf_key: [u8; 32], node_key: [u8; 32]) -> TraversalC
 /// Child fields take priority where `Some`; parent values are inherited
 /// where child is `None`. Keys are merged (child keys override parent keys
 /// with the same slot). Pipelines are merged field-by-field.
-fn merge_contexts(parent: &TraversalContext, child: &TraversalContext) -> TraversalContext {
+///
+/// `pub(crate)` so [`crate::pipeline::Pipeline::child_for`] can reuse
+/// the same merge semantics; the function itself isn't part of the
+/// crate's external API.
+pub(crate) fn merge_contexts(
+    parent: &TraversalContext,
+    child: &TraversalContext,
+) -> TraversalContext {
     let keys = match (&parent.keys, &child.keys) {
         (Some(pk), Some(ck)) => {
             let mut merged = pk.clone();
@@ -1099,6 +934,7 @@ fn merge_pipelines(
             compression: c.compression.clone().or(p.compression.clone()),
             padding: c.padding.clone().or(p.padding.clone()),
             encryption: c.encryption.clone().or(p.encryption.clone()),
+            skip_when_unhelpful: c.skip_when_unhelpful.or(p.skip_when_unhelpful),
         }),
     }
 }

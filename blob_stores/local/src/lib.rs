@@ -90,7 +90,31 @@ impl s5_core::store::Store for LocalStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(&full_path, &bytes).await?;
+        // Atomic write: tmp file in the same directory + rename. The
+        // direct `tokio::fs::write` path opens with O_TRUNC then
+        // streams bytes, leaving the file empty/partial in the window
+        // a concurrent reader could land in. That window is what made
+        // `StoreRegistry::set` (which calls `get` → reads the file)
+        // observe "insufficient bytes for deserialization" under
+        // concurrent publishes — the registry entry was mid-rewrite.
+        // tmp+rename closes the window: readers see either the old
+        // bytes or the new bytes, never partial.
+        //
+        // Tmp suffix combines pid (cross-process uniqueness) with a
+        // process-wide atomic counter (intra-process uniqueness — two
+        // concurrent put_bytes calls in the same process otherwise race
+        // on a shared tmp path and the second's rename fails with
+        // ENOENT after the first's rename consumed the tmp file).
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = full_path.with_extension(format!(
+            "{}.tmp.{}.{}",
+            full_path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+            std::process::id(),
+            counter,
+        ));
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::rename(&tmp_path, &full_path).await?;
         Ok(())
     }
 

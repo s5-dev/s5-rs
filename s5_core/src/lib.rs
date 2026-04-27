@@ -53,7 +53,7 @@ pub mod testutil;
 // --- Core Public Surface ---
 
 // Blob identifiers & locations (always available - protocol types)
-pub use blob::identifier::BlobId;
+pub use blob::identifier::{BlobId, MULTIHASH_BLAKE3};
 pub use blob::location::BlobLocation;
 
 // Hash type (always available - protocol type)

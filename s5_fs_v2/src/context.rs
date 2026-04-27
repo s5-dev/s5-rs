@@ -30,6 +30,44 @@ use bytes::Bytes;
 use crate::node::{BlobPipeline, CompressionStrategy, EncryptionStrategy};
 
 // ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+/// Zstd compression level used for all blob encoding.
+///
+/// Level 1 is chosen as the default because:
+///
+/// - On already-compressed data (photos, videos, PDFs, zip-family archives,
+///   `.deb`/`.rpm` packages) level 1 produces output indistinguishable from
+///   higher levels while running ~1.3× faster per core. This equivalence is
+///   not coincidence: the padding-aware compression-skip (see
+///   [`pipeline_encode`] and `Snapshot::with_skip_unhelpful_compression`)
+///   detects that every level is unhelpful on such data and falls back to
+///   storing plaintext uniformly. L1 just discards the futile compression
+///   attempt faster.
+/// - On moderately-redundant data (JSONL records, logs), level 1 is within
+///   0–2 % of higher levels on size and often *better* on highly-repetitive
+///   logs (zstd's "fast" family catches log patterns efficiently).
+/// - On structured text (source code, XML, uncompressed documents) level 1 is
+///   4–5 % larger than level 3, which is a real cost but typically small in
+///   absolute terms for a mixed backup workload.
+/// - Decompression cost is identical across zstd levels, so higher levels only
+///   tax the encoder. In a backup + share workload, only the backup creator
+///   pays; share recipients don't care which level was used.
+///
+/// For a typical home backup dominated by media and documents, the weighted
+/// storage delta between level 1 and level 3 is under 1 % while the CPU delta
+/// is 30–50 % per core — a strongly favourable trade, especially under a
+/// daemon that runs frequent incremental backups on battery-powered or mobile
+/// hardware.
+///
+/// See `docs/reference/compression-and-chunking.md` for the full benchmark
+/// data this is based on, and for guidance on when a user might want to
+/// override this (code-heavy archives, cold-storage vaults with abundant
+/// CPU).
+pub(crate) const ZSTD_LEVEL: i32 = 1;
+
+// ---------------------------------------------------------------------------
 // KDF Constants
 // ---------------------------------------------------------------------------
 
@@ -150,12 +188,11 @@ pub(crate) struct PipelineEncodeResult {
 /// `dictionary` is the raw decompressed content of the preceding D-chunk for
 /// `ZstdDictFromPrecedingEntry` compression (pass `None` for D-chunks and non-dict strategies).
 ///
-/// `compression_skip_threshold` — when `Some(())`, compression is skipped if
-/// the compressed+padded size is not smaller than the uncompressed+padded size.
-/// This avoids wasting CPU on decompression when there are no storage savings
-/// (accounting for the fact that padding can nullify small compression gains).
-/// The blob is then stored uncompressed and `compression_skipped` is set in
-/// the result so the caller can record a per-entry override.
+/// The "skip compression when unhelpful" policy is read from
+/// `pipeline.skip_when_unhelpful` — when set, compression is skipped if
+/// the compressed+padded size is not smaller than the uncompressed+padded
+/// size. The blob is then stored uncompressed and `compression_skipped`
+/// is set in the result so the caller can record a per-entry override.
 pub(crate) fn pipeline_encode(
     plaintext: &[u8],
     pipeline: Option<&BlobPipeline>,
@@ -163,7 +200,6 @@ pub(crate) fn pipeline_encode(
     kdf_context: &str,
     keys: Option<&BTreeMap<u8, [u8; 32]>>,
     dictionary: Option<&[u8]>,
-    compression_skip_threshold: bool,
 ) -> anyhow::Result<PipelineEncodeResult> {
     let Some(pipeline) = pipeline else {
         // No pipeline = no transforms, pass through.
@@ -176,10 +212,11 @@ pub(crate) fn pipeline_encode(
     };
 
     // Stage 1: Compress (with optional skip when unhelpful)
+    let skip_when_unhelpful = pipeline.skip_when_unhelpful.unwrap_or(false);
     let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
     let (compressed, compression_skipped) = {
         let raw = compress_bytes(plaintext, &pipeline.compression, dictionary)?;
-        if compression_skip_threshold && !plaintext.is_empty() {
+        if skip_when_unhelpful && !plaintext.is_empty() {
             // Compare padded sizes: only keep compression if it actually
             // reduces the stored (post-padding) size.
             let padded_compressed_len = padded_len(raw.len(), block_size);
@@ -376,13 +413,13 @@ pub(crate) fn compress_bytes(
     match compression {
         Some(CompressionStrategy::Uncompressed) | None => Ok(Bytes::copy_from_slice(bytes)),
         Some(CompressionStrategy::Zstd) => {
-            let encoded = zstd::encode_all(bytes, 3)
+            let encoded = zstd::encode_all(bytes, ZSTD_LEVEL)
                 .map_err(|e| anyhow::anyhow!("zstd compression failed: {e}"))?;
             Ok(Bytes::from(encoded))
         }
         Some(CompressionStrategy::ZstdDictFromPrecedingEntry { .. }) => {
             let dict = dictionary.unwrap_or(&[]);
-            let mut compressor = zstd::bulk::Compressor::with_dictionary(3, dict)
+            let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, dict)
                 .map_err(|e| anyhow::anyhow!("zstd dict compressor init failed: {e}"))?;
             let encoded = compressor
                 .compress(bytes)
@@ -409,6 +446,7 @@ mod tests {
             compression: Some(CompressionStrategy::Zstd),
             padding: Some(PaddingStrategy { block_size: 1024 }),
             encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+            skip_when_unhelpful: None,
         };
 
         // Encode
@@ -419,7 +457,6 @@ mod tests {
             KDF_META,
             Some(&keys),
             None,
-            false,
         )
         .unwrap();
 
@@ -450,6 +487,7 @@ mod tests {
             compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
             padding: Some(PaddingStrategy { block_size: 1024 }),
             encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+            skip_when_unhelpful: None,
         };
 
         // Simulate a D-chunk (dictionary source) — compressed without dictionary.
@@ -463,7 +501,6 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             None, // D-chunk: no dictionary
-            false,
         )
         .unwrap();
 
@@ -491,7 +528,6 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             Some(dict_data.as_slice()), // use D-chunk as dictionary
-            false,
         )
         .unwrap();
 
@@ -517,7 +553,6 @@ mod tests {
             KDF_LEAF,
             Some(&keys),
             None,
-            false,
         )
         .unwrap();
         // Both should round to same padding block, but compressed size should differ.
@@ -538,6 +573,7 @@ mod tests {
             compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
             padding: Some(PaddingStrategy { block_size: 1024 }),
             encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+            skip_when_unhelpful: None,
         };
 
         // Simulate a large-ish chunk (like real file data).
@@ -545,16 +581,8 @@ mod tests {
         let hash: [u8; 32] = *blake3::hash(&data).as_bytes();
 
         // Encode as D-chunk (no dictionary).
-        let result = pipeline_encode(
-            &data,
-            Some(&pipeline),
-            &hash,
-            KDF_LEAF,
-            Some(&keys),
-            None,
-            false,
-        )
-        .unwrap();
+        let result =
+            pipeline_encode(&data, Some(&pipeline), &hash, KDF_LEAF, Some(&keys), None).unwrap();
 
         // Decode as D-chunk (no dictionary).
         let decoded = pipeline_decode(

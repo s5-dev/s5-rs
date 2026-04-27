@@ -1,6 +1,6 @@
 //! Thin client wrapper for the S5 node RPC protocol.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::config::TaskSpec;
 use crate::rpc::*;
@@ -28,26 +28,34 @@ impl S5NodeClient {
     }
 
     /// Run a task by name (looked up in node config).
-    pub async fn run_task_by_name(&self, name: impl Into<String>) -> Result<RunTaskResponse> {
-        self.inner
+    /// Daemon-side refusals (task missing, executor full, …) come back
+    /// as `Err`, not as a sentinel response — callers don't have to
+    /// special-case `task_id == 0` any more.
+    pub async fn run_task_by_name(&self, name: impl Into<String>) -> Result<SpawnedTask> {
+        let resp: RunTaskResponse = self
+            .inner
             .rpc(RunTask {
                 name: Some(name.into()),
                 spec_json: None,
             })
             .await
-            .context("run_task RPC failed")
+            .context("run_task RPC failed")?;
+        spawned_or_err(resp)
     }
 
-    /// Run a task with an inline spec.
-    pub async fn run_task(&self, spec: TaskSpec) -> Result<RunTaskResponse> {
+    /// Run a task with an inline spec. See `run_task_by_name` for
+    /// error-handling semantics.
+    pub async fn run_task(&self, spec: TaskSpec) -> Result<SpawnedTask> {
         let spec_json = serde_json::to_string(&spec).context("failed to serialize task spec")?;
-        self.inner
+        let resp: RunTaskResponse = self
+            .inner
             .rpc(RunTask {
                 name: None,
                 spec_json: Some(spec_json),
             })
             .await
-            .context("run_task RPC failed")
+            .context("run_task RPC failed")?;
+        spawned_or_err(resp)
     }
 
     /// Get status of a task.
@@ -138,6 +146,16 @@ impl S5NodeClient {
         if let Some(ref endpoint) = self.endpoint {
             endpoint.close().await;
         }
+    }
+}
+
+/// Convert a `RunTaskResponse` into a flattened `Result<SpawnedTask>`,
+/// used by both `run_task` and `run_task_by_name` so the matching
+/// logic lives in exactly one place.
+fn spawned_or_err(resp: RunTaskResponse) -> Result<SpawnedTask> {
+    match resp {
+        RunTaskResponse::Spawned { task_id, spec_json } => Ok(SpawnedTask { task_id, spec_json }),
+        RunTaskResponse::Refused { error } => Err(anyhow!(error)),
     }
 }
 

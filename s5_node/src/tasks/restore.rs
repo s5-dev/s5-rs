@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
-use ed25519_dalek::VerifyingKey;
 use s5_core::{BlobsRead, FallbackBlobsRead, RegistryApi, StreamKey};
 use s5_fs_local::{RestoreConfig, restore};
 use s5_fs_v2::node::Node;
@@ -26,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::TaskReporter;
 
-use super::publish::{age_decrypt_with_secret_key, recovery_signing_key};
+use super::publish::age_decrypt_with_secret_key;
 use super::vault_persist::{load_vault_root, node_to_snapshot_parts, vault_root_path};
 use super::{
     TaskExecutorContext, resolve_store, resolve_vault, resolve_vault_key_info,
@@ -184,6 +183,10 @@ pub async fn run_restore(
 /// 6. Parse Node → extract snapshot parts
 /// 7. Build Snapshot using the remote store as read backend
 /// 8. Restore files to target path
+// Variables resolved at the top of the function are used only by the
+// unreachable code below (kept as a starting point for the v3 rewrite),
+// so silence the unused warnings at function scope.
+#[allow(unused_variables)]
 pub async fn run_remote_restore(
     ctx: &TaskExecutorContext,
     age_secret_key: &str,
@@ -200,18 +203,39 @@ pub async fn run_remote_restore(
 
     let blob_store = resolve_store(&ctx.stores, blob_store_name)?;
 
-    // -- Step 1: Derive recovery key and look up vault pubkey --
-    let recovery_key = recovery_signing_key(age_secret_key, vault_name);
-    let recovery_verifying: VerifyingKey = (&recovery_key).into();
-    let recovery_stream_key = StreamKey::PublicKeyEd25519(recovery_verifying.to_bytes());
+    // -- Step 1: paper-only recovery is not yet wired for the v3 schema --
+    //
+    // The v3 recovery flow:
+    //   1. Derive recovery_age_secret = argon2id(paper_passphrase, …)
+    //   2. Fetch the vault root blob from a configured store
+    //      (e.g. the relay S3 bucket holding meta blobs)
+    //   3. age-decrypt the vault root with recovery_age_secret
+    //   4. Read KEY_SLOT_RECOVERY from its TraversalContext.keys
+    //   5. Derive vault_id + recovery_signing_key from that secret
+    //      (see s5_node::tasks::publish::{derive_vault_id, recovery_signing_key})
+    //   6. registry.get(StreamKey::Vault { pubkey: recovery_pubkey, vault_id })
+    //      → its payload holds a device's signing pubkey
+    //   7. registry.get(StreamKey::Vault { pubkey: device_pubkey, vault_id })
+    //      → current snapshot HEAD hash
+    //
+    // The legacy `(age_secret, vault_name)` lookup that this function
+    // used in the pre-v3 schema produces wrong stream keys for v3
+    // vaults, so rather than silently returning empty, we surface a
+    // clear error until the new flow is implemented.
+    let _ = age_secret_key;
+    return Err(anyhow!(
+        "remote restore for vault '{vault_name}' is not yet supported on \
+         the v3 schema — the recovery flow needs to fetch and \
+         age-decrypt the vault root first to derive vault_id from \
+         KEY_SLOT_RECOVERY (see snapshot-publication.md § Vault ID \
+         derivation)"
+    ));
 
-    tracing::info!(
-        vault = vault_name,
-        recovery_key = hex::encode(recovery_verifying.to_bytes()),
-        "looking up recovery registry entry"
-    );
-
-    // -- Step 2: Recovery entry → vault pubkey --
+    // The unreachable code below preserves the shape of the legacy
+    // restore so the v3 reimplementation has a starting point.
+    #[allow(unreachable_code)]
+    let recovery_stream_key: StreamKey = unreachable!();
+    #[allow(unreachable_code)]
     let recovery_entry = registry
         .get(&recovery_stream_key)
         .await
@@ -224,13 +248,16 @@ pub async fn run_remote_restore(
             )
         })?;
 
-    // The recovery entry's hash field stores the vault's verifying key (32 bytes)
-    let vault_pubkey_bytes: [u8; 32] = *recovery_entry.hash.as_bytes();
-    let vault_stream_key = StreamKey::PublicKeyEd25519(vault_pubkey_bytes);
+    // The recovery entry's hash field stores the device's signing pubkey.
+    let device_pubkey_bytes: [u8; 32] = *recovery_entry.hash.as_bytes();
+    let vault_stream_key = StreamKey::Vault {
+        pubkey: device_pubkey_bytes,
+        vault_id: [0u8; 16],
+    };
 
     tracing::info!(
         vault = vault_name,
-        vault_pubkey = hex::encode(vault_pubkey_bytes),
+        vault_pubkey = hex::encode(device_pubkey_bytes),
         "found vault pubkey via recovery entry"
     );
 
@@ -244,7 +271,7 @@ pub async fn run_remote_restore(
                 "no published snapshot found for vault '{}' — \
                  vault pubkey {} has no registry entry",
                 vault_name,
-                hex::encode(vault_pubkey_bytes)
+                hex::encode(device_pubkey_bytes)
             )
         })?;
 

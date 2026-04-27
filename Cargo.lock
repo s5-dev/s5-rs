@@ -5858,7 +5858,6 @@ dependencies = [
  "rand 0.8.5",
  "s5_blobs",
  "s5_core",
- "s5_fs",
  "s5_fs_local",
  "s5_fs_v2",
  "s5_fuse",
