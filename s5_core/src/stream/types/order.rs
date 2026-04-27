@@ -32,9 +32,19 @@ mod tests {
     use super::*;
     use crate::stream::types::{
         HASH_SIZE, KEY_SIZE, MessageType, MessageTypeTryFromError, SIGNATURE_SIZE, StreamKey,
-        StreamKeyDeserializeError, StreamMessageError,
+        StreamKeyDeserializeError, StreamMessageError, VAULT_ID_SIZE,
     };
     use bytes::Bytes;
+
+    /// Convenience: build a `StreamKey::Vault` for tests using a placeholder
+    /// (zero) `vault_id`. Tests that exercise the per-vault distinguishing
+    /// behaviour pass a non-zero value explicitly.
+    fn vault_key(pubkey_byte: u8) -> StreamKey {
+        StreamKey::Vault {
+            pubkey: [pubkey_byte; KEY_SIZE],
+            vault_id: [0; VAULT_ID_SIZE],
+        }
+    }
 
     // Helper function to create a dummy message for testing.
     fn create_test_message(revision: u64, hash_byte: u8) -> StreamMessage {
@@ -52,26 +62,30 @@ mod tests {
 
     #[test]
     fn test_stream_key_serialization_roundtrip() {
+        // All variants round-trip uniformly via storage_key /
+        // from_storage_key. (The fixed-length variants — Local /
+        // Blake3HashPin — produce 33-byte storage keys; Vault
+        // produces 49.)
         let local_key = StreamKey::Local([1; KEY_SIZE]);
-        let (id, bytes) = local_key.to_bytes();
-        assert_eq!(id, StreamKey::LOCAL_ID);
-        assert_eq!(bytes.len(), KEY_SIZE);
-        let deserialized = StreamKey::from_bytes(id, bytes).unwrap();
-        assert_eq!(local_key, deserialized);
-
-        let ed_key = StreamKey::PublicKeyEd25519([2; KEY_SIZE]);
-        let (id, bytes) = ed_key.to_bytes();
-        assert_eq!(id, StreamKey::PUBLIC_KEY_ED25519_ID);
-        assert_eq!(bytes.len(), KEY_SIZE);
-        let deserialized = StreamKey::from_bytes(id, bytes).unwrap();
-        assert_eq!(ed_key, deserialized);
+        let storage = local_key.storage_key();
+        assert_eq!(storage[0], StreamKey::LOCAL_ID);
+        assert_eq!(storage.len(), 1 + KEY_SIZE);
+        assert_eq!(StreamKey::from_storage_key(&storage).unwrap(), local_key);
 
         let pin_key = StreamKey::Blake3HashPin([3; KEY_SIZE]);
-        let (id, bytes) = pin_key.to_bytes();
-        assert_eq!(id, StreamKey::BLAKE3_HASH_PIN_ID);
-        assert_eq!(bytes.len(), KEY_SIZE);
-        let deserialized = StreamKey::from_bytes(id, bytes).unwrap();
-        assert_eq!(pin_key, deserialized);
+        let storage = pin_key.storage_key();
+        assert_eq!(storage[0], StreamKey::BLAKE3_HASH_PIN_ID);
+        assert_eq!(storage.len(), 1 + KEY_SIZE);
+        assert_eq!(StreamKey::from_storage_key(&storage).unwrap(), pin_key);
+
+        let vault_key = StreamKey::Vault {
+            pubkey: [2; KEY_SIZE],
+            vault_id: [9; VAULT_ID_SIZE],
+        };
+        let storage = vault_key.storage_key();
+        assert_eq!(storage[0], StreamKey::VAULT_ID_KEYTYPE);
+        assert_eq!(storage.len(), 1 + KEY_SIZE + VAULT_ID_SIZE);
+        assert_eq!(StreamKey::from_storage_key(&storage).unwrap(), vault_key);
     }
 
     #[test]
@@ -97,8 +111,8 @@ mod tests {
         let local = StreamKey::Local([0; KEY_SIZE]);
         assert!(!local.requires_signature());
 
-        let ed = StreamKey::PublicKeyEd25519([0; KEY_SIZE]);
-        assert!(ed.requires_signature());
+        let vault = vault_key(0);
+        assert!(vault.requires_signature());
 
         let pin = StreamKey::Blake3HashPin([0; KEY_SIZE]);
         assert!(!pin.requires_signature());
@@ -106,8 +120,13 @@ mod tests {
 
     #[test]
     fn test_message_type_try_from() {
-        assert_eq!(MessageType::try_from(0).unwrap(), MessageType::Stream);
-        assert_eq!(MessageType::try_from(1).unwrap(), MessageType::Registry);
+        assert_eq!(MessageType::try_from(0x00).unwrap(), MessageType::Stream);
+        assert_eq!(MessageType::try_from(0x5c).unwrap(), MessageType::Registry);
+        // Old v2 registry tag (0x01) is now rejected.
+        assert_eq!(
+            MessageType::try_from(0x01).unwrap_err(),
+            MessageTypeTryFromError(0x01)
+        );
         assert_eq!(
             MessageType::try_from(2).unwrap_err(),
             MessageTypeTryFromError(2)
@@ -171,10 +190,10 @@ mod tests {
         );
         assert!(msg.is_ok());
 
-        // Ed25519 key without signature should fail
+        // Vault key without signature should fail
         let msg = StreamMessage::new(
             MessageType::Registry,
-            StreamKey::PublicKeyEd25519([0; KEY_SIZE]),
+            vault_key(0),
             1,
             [0; HASH_SIZE].into(),
             Box::new([]),
@@ -182,10 +201,10 @@ mod tests {
         );
         assert_eq!(msg.unwrap_err(), StreamMessageError::SignatureRequired);
 
-        // Ed25519 key with proper signature should succeed
+        // Vault key with proper signature should succeed
         let msg = StreamMessage::new(
             MessageType::Registry,
-            StreamKey::PublicKeyEd25519([0; KEY_SIZE]),
+            vault_key(0),
             1,
             [0; HASH_SIZE].into(),
             Box::new([0; SIGNATURE_SIZE]), // 64-byte signature
@@ -224,7 +243,10 @@ mod tests {
     fn test_message_serialization_roundtrip() {
         let original = StreamMessage::new(
             MessageType::Registry,
-            StreamKey::PublicKeyEd25519([42; KEY_SIZE]),
+            StreamKey::Vault {
+                pubkey: [42; KEY_SIZE],
+                vault_id: [0xCD; VAULT_ID_SIZE],
+            },
             0xDEADBEEF,
             [0xAB; HASH_SIZE].into(),
             Box::new([0xFF; SIGNATURE_SIZE]),
@@ -267,27 +289,57 @@ mod tests {
         assert!(stream_msg.should_store(None));
         assert!(stream_msg.should_store(Some(&msg2)));
 
-        // Registry messages only stored if newer
+        // Registry messages: stored only if strictly newer
         assert!(msg1.should_store(None)); // No existing = store
         assert!(!msg1.should_store(Some(&msg2))); // Older = don't store
         assert!(msg2.should_store(Some(&msg1))); // Newer = store
 
-        // Test tie-breaker scenario
-        let msg_tie1 = create_test_message(10, 1); // Same rev, smaller hash
-        let msg_tie2 = create_test_message(10, 2); // Same rev, larger hash
-        assert!(msg_tie1.should_store(Some(&msg_tie2))); // Smaller hash wins
-        assert!(!msg_tie2.should_store(Some(&msg_tie1))); // Larger hash loses
+        // Strict-CAS at same revision: same hash is idempotent
+        // (re-writing the exact same registry entry is a no-op write
+        // and should "succeed"); different hash is rejected so the
+        // losing writer can detect the race and retry.
+        let msg_same_a = create_test_message(10, 1);
+        let msg_same_b = create_test_message(10, 1);
+        assert!(msg_same_a.should_store(Some(&msg_same_b)));
+        assert!(msg_same_b.should_store(Some(&msg_same_a)));
+
+        let msg_diff_smaller = create_test_message(10, 1);
+        let msg_diff_larger = create_test_message(10, 2);
+        assert!(
+            !msg_diff_smaller.should_store(Some(&msg_diff_larger)),
+            "same-rev-different-hash must reject (formerly: smaller hash silently won, \
+             which let later writers bury earlier ones unnoticed)"
+        );
+        assert!(
+            !msg_diff_larger.should_store(Some(&msg_diff_smaller)),
+            "same-rev-different-hash must reject regardless of which side is smaller"
+        );
     }
 
     #[test]
-    fn test_eventual_consistency_scenario() {
-        // Simulate a network partition where two nodes create different entries
-        // for the same revision
+    fn test_eventual_consistency_ordering_preserved() {
+        // Simulate two nodes that independently produced entries at the
+        // same revision (network-partition CRDT scenario). The `Ord`
+        // tie-break (smaller hash wins for read-side reconciliation) is
+        // preserved — it's how a future sync layer could pick a
+        // canonical winner across replicas.
+        //
+        // The *write* side, by contrast, rejects same-revision-
+        // different-hash via `should_store` (strict-CAS) so a local
+        // concurrent writer can detect their loss and retry. Without
+        // that, the loser would be silently overwritten and would
+        // never know to merge their changes back in.
+        //
+        // When P2P registry replication lands and needs to splice a
+        // peer's entry into the local view, it'll use `Ord` directly
+        // (or a dedicated "merge from peer" code path) rather than
+        // `should_store` — which would correctly reject same-rev
+        // overwrites coming from local code paths.
         let node_a_msg = StreamMessage::new(
             MessageType::Registry,
-            StreamKey::PublicKeyEd25519([1; KEY_SIZE]),
+            vault_key(1),
             100,
-            [0x00; HASH_SIZE].into(), // Smaller hash - should win
+            [0x00; HASH_SIZE].into(),
             Box::new([0xAA; SIGNATURE_SIZE]),
             Some(Bytes::from(b"Node A data".to_vec())),
         )
@@ -295,26 +347,28 @@ mod tests {
 
         let node_b_msg = StreamMessage::new(
             MessageType::Registry,
-            StreamKey::PublicKeyEd25519([1; KEY_SIZE]),
+            vault_key(1),
             100,
-            [0xFF; HASH_SIZE].into(), // Larger hash - should lose
+            [0xFF; HASH_SIZE].into(),
             Box::new([0xBB; SIGNATURE_SIZE]),
             Some(Bytes::from(b"Node B data".to_vec())),
         )
         .unwrap();
 
-        // Both nodes should converge to node_a_msg
+        // Read-side: Ord still picks the smaller-hash entry as the
+        // canonical "winner" for any reconciliation that needs a
+        // single answer. Unchanged from the prior tie-break.
         assert!(node_a_msg > node_b_msg);
-        assert!(node_a_msg.should_store(Some(&node_b_msg)));
-        assert!(!node_b_msg.should_store(Some(&node_a_msg)));
-
-        // Verify that a vector of both messages, when sorted and taking the max,
-        // yields the expected winner
-        let winner = vec![node_a_msg.clone(), node_b_msg]
+        let winner = vec![node_a_msg.clone(), node_b_msg.clone()]
             .into_iter()
             .max()
             .unwrap();
         assert_eq!(winner, node_a_msg);
+
+        // Write-side: strict-CAS — same-rev-different-hash is rejected
+        // so the losing local writer can detect the race and retry.
+        assert!(!node_a_msg.should_store(Some(&node_b_msg)));
+        assert!(!node_b_msg.should_store(Some(&node_a_msg)));
     }
 
     #[test]
@@ -334,5 +388,166 @@ mod tests {
         // Next 8 bytes are revision in big-endian.
         let rev_be = &bytes[34..42];
         assert_eq!(rev_be, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    /// Asserts the **exact byte layout** of a v3 vault registry entry on
+    /// the wire (per docs/reference/snapshot-publication.md § Registry
+    /// entry format). Catches drift the symmetric serialize/deserialize
+    /// round-trip can't see — earlier versions of this code wrote
+    /// `... | REVISION | HASH(32) | SIG | data` and round-tripped fine
+    /// because both ends used the wrong (matching) layout.
+    ///
+    /// Expected wire format:
+    /// `TYPE(1) | KEYTYPE(1) | PUBKEY(32) | VAULT_ID(16) | REVISION(8 BE)
+    ///   | LEN(1) | PAYLOAD(LEN) | SIG(64)`
+    /// where `PAYLOAD = MULTIHASH_BLAKE3(0x1e) || hash[32]` for a
+    /// hash-only payload (33 bytes → LEN = 0x21).
+    #[test]
+    fn vault_registry_wire_layout_matches_spec() {
+        use crate::stream::types::{
+            MAX_VAULT_PAYLOAD_LEN, MULTIHASH_BLAKE3, SIG_DOMAIN_TAG_V3, VAULT_ID_SIZE,
+        };
+
+        let pubkey = [0xAAu8; KEY_SIZE];
+        let vault_id = [0xBBu8; VAULT_ID_SIZE];
+        let hash_bytes = [0xCCu8; HASH_SIZE];
+        let sig_bytes = [0xDDu8; SIGNATURE_SIZE];
+        let revision: u64 = 0x0102_0304_0506_0708;
+
+        let msg = StreamMessage::new(
+            MessageType::Registry,
+            StreamKey::Vault { pubkey, vault_id },
+            revision,
+            hash_bytes.into(),
+            Box::new(sig_bytes),
+            None,
+        )
+        .unwrap();
+
+        let bytes = msg.serialize();
+
+        // Layout offsets: 0  1  2..34         34..50     50..58       58   59      60..92       92..156
+        //                 T  K  PUBKEY(32)    VID(16)    REV(8 BE)    LEN  MH(0x1e) HASH(32)     SIG(64)
+        assert_eq!(
+            bytes.len(),
+            1 + 1 + KEY_SIZE + VAULT_ID_SIZE + 8 + 1 + 33 + SIGNATURE_SIZE
+        );
+
+        assert_eq!(bytes[0], 0x5c, "TYPE byte (Registry v3)");
+        assert_eq!(bytes[1], 0xed, "KEYTYPE byte (Vault / ed25519)");
+        assert_eq!(&bytes[2..2 + KEY_SIZE], &pubkey, "PUBKEY");
+        assert_eq!(
+            &bytes[2 + KEY_SIZE..2 + KEY_SIZE + VAULT_ID_SIZE],
+            &vault_id,
+            "VAULT_ID"
+        );
+        let rev_off = 2 + KEY_SIZE + VAULT_ID_SIZE;
+        assert_eq!(
+            &bytes[rev_off..rev_off + 8],
+            &revision.to_be_bytes(),
+            "REVISION big-endian"
+        );
+        let len_off = rev_off + 8;
+        assert_eq!(bytes[len_off], 0x21, "LEN byte (= 33 = 1 + 32)");
+        let payload_off = len_off + 1;
+        assert_eq!(
+            bytes[payload_off], MULTIHASH_BLAKE3,
+            "first PAYLOAD byte = 0x1e (blake3 multihash)"
+        );
+        assert_eq!(
+            &bytes[payload_off + 1..payload_off + 1 + HASH_SIZE],
+            &hash_bytes,
+            "PAYLOAD hash[32]"
+        );
+        let sig_off = payload_off + 33;
+        assert_eq!(&bytes[sig_off..sig_off + SIGNATURE_SIZE], &sig_bytes, "SIG");
+
+        // And the canonical signing-bytes layout (for SIG verification).
+        let mut expected_sign = Vec::new();
+        expected_sign.extend_from_slice(SIG_DOMAIN_TAG_V3);
+        expected_sign.extend_from_slice(&pubkey);
+        expected_sign.extend_from_slice(&vault_id);
+        expected_sign.extend_from_slice(&revision.to_be_bytes());
+        expected_sign.push(MULTIHASH_BLAKE3);
+        expected_sign.extend_from_slice(&hash_bytes);
+        // SIG_DOMAIN_TAG_V3 (10) + 32 + 16 + 8 + 1 + 32 = 99
+        assert_eq!(expected_sign.len(), 10 + 32 + 16 + 8 + 1 + 32);
+        assert_eq!(MAX_VAULT_PAYLOAD_LEN, 255);
+    }
+
+    /// Round-trip a vault entry with inline data (LEN > 33).
+    #[test]
+    fn vault_registry_round_trip_with_inline_data() {
+        let pubkey = [0x11u8; KEY_SIZE];
+        let vault_id = [0x22u8; 16];
+        let hash_bytes = [0x33u8; HASH_SIZE];
+        let sig_bytes = [0x44u8; SIGNATURE_SIZE];
+        let inline = Bytes::from(vec![0x55u8; 64]);
+
+        let msg = StreamMessage::new(
+            MessageType::Registry,
+            StreamKey::Vault { pubkey, vault_id },
+            7,
+            hash_bytes.into(),
+            Box::new(sig_bytes),
+            Some(inline.clone()),
+        )
+        .unwrap();
+
+        let bytes = msg.serialize();
+        // LEN should now be 33 + 64 = 97 = 0x61
+        let len_off = 2 + KEY_SIZE + 16 + 8;
+        assert_eq!(bytes[len_off], 1 + HASH_SIZE as u8 + 64);
+
+        let decoded = StreamMessage::deserialize(bytes).unwrap();
+        assert_eq!(decoded.data, Some(inline));
+        assert_eq!(decoded.hash.as_bytes(), &hash_bytes);
+    }
+
+    /// A vault payload exceeding 255 B must be rejected at construction.
+    #[test]
+    fn vault_payload_over_255_bytes_is_rejected() {
+        let pubkey = [0x11u8; KEY_SIZE];
+        let vault_id = [0x22u8; 16];
+        let hash_bytes = [0x33u8; HASH_SIZE];
+        let sig_bytes = [0x44u8; SIGNATURE_SIZE];
+        // 1 (multihash) + 32 (hash) + 223 (data) = 256 > 255
+        let oversized = Bytes::from(vec![0u8; 223]);
+
+        let err = StreamMessage::new(
+            MessageType::Registry,
+            StreamKey::Vault { pubkey, vault_id },
+            1,
+            hash_bytes.into(),
+            Box::new(sig_bytes),
+            Some(oversized),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StreamMessageError::VaultPayloadTooLarge { .. }
+        ));
+    }
+
+    /// A wire blob with an unknown multihash tag in the payload prefix
+    /// must be rejected on deserialize.
+    #[test]
+    fn vault_payload_with_unknown_multihash_tag_is_rejected() {
+        use crate::stream::types::VAULT_ID_SIZE;
+
+        let mut bytes = Vec::new();
+        bytes.push(0x5c); // TYPE
+        bytes.push(0xed); // KEYTYPE
+        bytes.extend_from_slice(&[0x11u8; KEY_SIZE]);
+        bytes.extend_from_slice(&[0x22u8; VAULT_ID_SIZE]);
+        bytes.extend_from_slice(&7u64.to_be_bytes()); // REVISION
+        bytes.push(0x21); // LEN
+        bytes.push(0xff); // bogus multihash tag
+        bytes.extend_from_slice(&[0x33u8; HASH_SIZE]);
+        bytes.extend_from_slice(&[0x44u8; SIGNATURE_SIZE]);
+
+        let err = StreamMessage::deserialize(Bytes::from(bytes)).unwrap_err();
+        assert!(matches!(err, StreamMessageError::UnknownMultihashTag(0xff)));
     }
 }

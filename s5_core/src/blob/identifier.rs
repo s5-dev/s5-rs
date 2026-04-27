@@ -4,9 +4,18 @@ use crate::Hash;
 use std::fmt;
 use std::str::FromStr;
 
+/// Magic byte at the start of every BlobId, per the s5 v1 spec
+/// (https://docs.s5.pro/spec/blobs.html). Used only by BlobId
+/// encode/decode here — registry entries and other on-wire formats
+/// have their own type bytes (e.g. `MessageType::Registry = 0x5c`)
+/// that are unrelated to this constant despite sitting in adjacent
+/// hex space.
 const S5_MAGIC_BYTE: u8 = 0x5b;
 const BLOB_TYPE_DEFAULT: u8 = 0x82;
-const MULTIHASH_BLAKE3: u8 = 0x1e;
+/// Multicodec varint code for `blake3` (256-bit). Re-exported via
+/// `s5_core::MULTIHASH_BLAKE3` so other layers (registry v3 payloads,
+/// blob identifiers, ...) all spell the same byte the same way.
+pub const MULTIHASH_BLAKE3: u8 = 0x1e;
 
 #[derive(thiserror::Error, Debug)]
 pub enum BlobIdError {
