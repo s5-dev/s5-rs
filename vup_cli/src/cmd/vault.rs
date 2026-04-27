@@ -15,13 +15,40 @@ use s5_node_api::config::TaskSpec;
 ///
 /// Reads `vault.sources` (must currently have exactly one entry; multi-source
 /// vaults are a future enhancement), `vault.blob_stores[0]` for content,
-/// and `vault.recipients` for snapshot encryption recipients. `--watch` is
-/// not yet wired (continuous mode lives in a follow-up).
+/// and `vault.recipients` for snapshot encryption recipients.
+///
+/// With `--watch`, takes an initial snapshot, then watches the source's
+/// paths via `notify` and re-snaps on filesystem change events with a
+/// short debounce. Foreground only; daemon-ised watch is a follow-up.
 pub async fn run_snap(client: &S5NodeClient, vault: &str, watch: bool) -> Result<()> {
-    if watch {
-        bail!("--watch is not yet implemented; run `vup +{vault} snap` once for now");
+    let spec = build_backup_spec(client, vault).await?;
+
+    if !watch {
+        return run_backup_once(client, vault, spec).await;
     }
 
+    let watch_paths = resolve_source_paths(client, vault, &spec).await?;
+    if watch_paths.is_empty() {
+        bail!("vault '{vault}' source has no paths to watch");
+    }
+
+    println!("Initial snap of +{vault}…");
+    run_backup_once(client, vault, spec.clone()).await?;
+
+    println!(
+        "Watching {} path(s) for changes (debounce 2s). Press Ctrl-C to stop.",
+        watch_paths.len()
+    );
+    for p in &watch_paths {
+        println!("  • {}", p.display());
+    }
+
+    watch_loop(client, vault, spec, watch_paths).await
+}
+
+/// Build the `TaskSpec::Backup` that a snap dispatches. Shared between
+/// the one-shot and watch paths.
+async fn build_backup_spec(client: &S5NodeClient, vault: &str) -> Result<TaskSpec> {
     let cfg = fetch_vault_config(client, vault).await?;
     let sources = string_array(&cfg, "sources");
     let recipients = string_array(&cfg, "recipients");
@@ -51,17 +78,113 @@ pub async fn run_snap(client: &S5NodeClient, vault: &str, watch: bool) -> Result
         );
     }
 
-    let spec = TaskSpec::Backup {
+    Ok(TaskSpec::Backup {
         vault: vault.to_string(),
         source,
         blob_store,
         keys: recipients,
         target_path: None,
-    };
+    })
+}
 
+/// Submit a `Backup` spec and poll to completion.
+async fn run_backup_once(client: &S5NodeClient, vault: &str, spec: TaskSpec) -> Result<()> {
     let resp = client.run_task(spec).await?;
     println!("snap on +{vault} started (task id={})", resp.task_id);
     crate::cmd::tasks::poll_until_done(client, resp.task_id).await
+}
+
+/// Resolve the source name in a `Backup` spec to its absolute paths
+/// from `[source.<name>]` config so notify has something concrete to
+/// watch.
+async fn resolve_source_paths(
+    client: &S5NodeClient,
+    vault: &str,
+    spec: &TaskSpec,
+) -> Result<Vec<PathBuf>> {
+    let source_name = match spec {
+        TaskSpec::Backup { source, .. } => source,
+        _ => bail!("watch only supports Backup specs"),
+    };
+    let cfg_resp = client.get_config().await?;
+    let cfg: serde_json::Value = serde_json::from_str(&cfg_resp.config_json)?;
+    let paths = cfg
+        .get("source")
+        .and_then(|s| s.get(source_name))
+        .and_then(|s| s.get("paths"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| {
+            anyhow!("vault '{vault}' source '{source_name}' has no paths configured in [source.*]")
+        })?;
+    Ok(paths
+        .iter()
+        .filter_map(|p| p.as_str().map(PathBuf::from))
+        .collect())
+}
+
+/// notify-driven watch loop. Coalesces bursts of events with a fixed
+/// debounce, then re-runs the snap. Continues until Ctrl-C is received.
+async fn watch_loop(
+    client: &S5NodeClient,
+    vault: &str,
+    spec: TaskSpec,
+    watch_paths: Vec<PathBuf>,
+) -> Result<()> {
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    let debounce = Duration::from_secs(2);
+    let (tx, mut rx) = mpsc::channel::<()>(64);
+
+    // notify::Watcher is sync and lives on a background thread.
+    // We hand-shake to tokio via a blocking_send, dropping the watcher
+    // when the channel closes (which happens when the rx side is
+    // dropped at function exit).
+    let watcher_tx = tx.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if res.is_ok() {
+                let _ = watcher_tx.blocking_send(());
+            }
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| anyhow!("creating notify watcher: {e}"))?;
+
+    for path in &watch_paths {
+        watcher
+            .watch(path, RecursiveMode::Recursive)
+            .with_context(|| format!("watching {}", path.display()))?;
+    }
+
+    let mut last_event: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nWatch stopped on +{vault}.");
+                return Ok(());
+            }
+            evt = rx.recv() => {
+                if evt.is_none() {
+                    bail!("notify watcher dropped its sender — exiting watch");
+                }
+                last_event = Some(Instant::now());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if let Some(t) = last_event
+                    && t.elapsed() >= debounce
+                {
+                    last_event = None;
+                    println!("Detected changes — snapping +{vault}…");
+                    if let Err(e) = run_backup_once(client, vault, spec.clone()).await {
+                        eprintln!("snap failed (will keep watching): {e}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `vup +<vault> history` — list snapshots for this vault.
