@@ -10,7 +10,7 @@ It gives you:
 
 - A small, well-factored Rust API for **content addressing, blob transport, and mutable registries**.
 - **FS5**, an encrypted, content-addressed filesystem with snapshot semantics.
-- A **node + CLI** that wires everything together with pluggable **S5 store backends** (local FS, S3, Sia, in-memory).
+- A **node + `vup` CLI** that wires everything together with pluggable **S5 store backends** (local FS, S3, Sia, in-memory).
 
 If you are familiar with IPFS or Iroh: think of S5 as a focused, Rust-native toolkit for building distributed storage and sync flows, with strong separation between **wire-stable protocol types** and **high-level ergonomics**.
 
@@ -19,16 +19,16 @@ If you are familiar with IPFS or Iroh: think of S5 as a focused, Rust-native too
 ## Quick Install
 
 ```bash
-cargo install --git https://github.com/s5-dev/s5-rs s5_cli
+cargo install --git https://github.com/s5-dev/s5-rs vup_cli
 ```
 
-Minimal workflow:
+Minimal workflow (sigil grammar — `+name` is a vault reference; the daemon auto-starts on first invocation):
 
 ```bash
-s5 config init                # create local node config
-s5 start                      # start node (in one terminal)
-s5 import local ./my-data     # import files into default store
-s5 tree                       # inspect FS5 view of imported data
+vup new +music                # create + onboard a vault, prints recovery key
+vup +music add ~/Music        # configure a source path
+vup +music snap               # snapshot + publish to configured stores
+vup +music mount /mnt/music   # FUSE-mount the vault read-only
 ```
 
 ## Architecture
@@ -37,9 +37,10 @@ The S5 stack is composed of layered crates, moving from low-level primitives to 
 
 ```mermaid
 graph TD
-    CLI[s5_cli] --> Node[s5_node]
-    Fuse[s5_fuse] --> Node
-    Node --> FS[s5_fs]
+    Vup[vup_cli] --> Node[s5_node]
+    LegacyCLI[s5_cli] --> Node
+    Node --> Fuse[s5_fuse]
+    Node --> FS[s5_fs_v2]
     Node --> Net[s5_blobs / s5_registry]
     FS --> Core[s5_core]
     Net --> Core
@@ -50,9 +51,9 @@ graph TD
 1.  **Core (`s5_core`)**: Defines the wire-stable protocol types (`Hash`, `BlobId`, `BlobLocation`) and abstract traits (`Store`, `RegistryApi`).
 2.  **Storage (`blob_stores/*`)**: Concrete backends for storing immutable blobs (Local disk, S3, Sia, Memory).
 3.  **Network (`s5_blobs`, `s5_registry`)**: Iroh-based transport protocols for exchanging blobs and registry updates.
-4.  **Filesystem (`s5_fs`)**: A content-addressed filesystem abstraction. Directories are immutable snapshots (`DirV1`) managed by stateful actors.
-5.  **Orchestration (`s5_node`)**: Wires together storage, networking, and filesystem logic into a runnable server.
-6.  **Interface (`s5_cli`, `s5_fuse`)**: User-facing tools to interact with the node.
+4.  **Filesystem (`s5_fs_v2`)**: A content-addressed filesystem abstraction with `Node`-based snapshots and prolly-tree merges.
+5.  **Orchestration (`s5_node`)**: Wires together storage, networking, filesystem logic, and FUSE mounts into a runnable daemon.
+6.  **Interface (`vup_cli`, `s5_cli`)**: `vup_cli` is the primary user-facing tool, a thin RPC frontend over the daemon; `s5_cli` is a low-level operational CLI (GC, store verify, HTTP import, FS5-on-disk snapshot ops) kept until `vup_cli` reaches parity. `s5_fuse` lives inside the daemon; mounts are driven via the `MountVault` RPC.
 
 ### Typical Data Flow
 
@@ -67,8 +68,9 @@ graph TD
 |-------|-------------|
 | **[s5_core](./s5_core)** | **Protocol Primitives.** `Hash`, `BlobId`, `Store` trait, `RegistryApi` trait. The foundation of the stack. |
 | **[s5_fs](./s5_fs)** | **Filesystem Logic.** Implements `DirV1` snapshots, directory actors, and the high-level `FS5` API. |
-| **[s5_node](./s5_node)** | **Server & Orchestration.** Configures and runs the S5 node, managing stores, networking, and sync. |
-| **[s5_cli](./s5_cli)** | **Command Line Interface.** The primary tool for interacting with S5 (`s5 blobs`, `s5 mount`, etc.). |
+| **[s5_node](./s5_node)** | **Server & Orchestration.** Configures and runs the S5 node, managing stores, networking, mounts, and sync. |
+| **[vup_cli](./vup_cli)** | **Primary Command Line Interface.** Vup Vault — `vup new +<vault>`, `vup +<vault> snap`, `vup +<vault> mount`, etc. Thin RPC frontend over the daemon. |
+| **[s5_cli](./s5_cli)** | **Low-level operational CLI.** GC, verify-local, HTTP import, FS5-on-disk snapshot ops. Will fold into `vup_cli` once it reaches parity. |
 | **[s5_blobs](./s5_blobs)** | **Blob Transport.** Iroh-based protocol for serving and fetching blobs over the network. |
 | **[s5_registry](./s5_registry)** | **Registry Transport.** Iroh-based protocol for syncing mutable registry entries. |
 | **[s5_fuse](./s5_fuse)** | **FUSE Mount.** Mounts an S5 filesystem locally using FUSE. |
@@ -151,10 +153,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ```bash
 # Run the CLI directly
-cargo run -p s5_cli -- --help
+cargo run -p vup_cli -- --help
 
-# Example: Upload a blob (requires a configured peer named "friend")
-cargo run -p s5_cli -- blobs upload --peer friend ./path/to/file
+# Initialise a vault and snapshot some data (daemon auto-starts as needed)
+cargo run -p vup_cli -- new +photos
+cargo run -p vup_cli -- +photos add ~/Pictures
+cargo run -p vup_cli -- +photos snap
 ```
 
 ## License
