@@ -13,13 +13,13 @@
 //! config, opens the meta store + each `[store.<name>]` as a
 //! `LocalStore`, decrypts the vault root, builds a `Snapshot`,
 //! spawns a tokio task that calls `s5_fuse::mount` (or `mount_rw`)
-//! with a oneshot-driven cancellation future, and stores the cancel
-//! sender + join handle under a fresh `mount_id`.
+//! with a `CancellationToken`-driven cancellation future, and stores
+//! the token + join handle under a fresh `mount_id`.
 //!
-//! Unmount: `MountManager::unmount` removes the entry, sends on the
-//! cancel oneshot (which makes the mount task return, which drops
-//! the `MountHandle`, which performs the actual FUSE unmount), and
-//! awaits the join handle.
+//! Unmount: `MountManager::unmount` removes the entry, calls
+//! `cancel.cancel()` (which wakes both the FUSE session and any
+//! attached debounce loop), and awaits the join handle so the actual
+//! `umount(2)` has finished by the time the RPC returns.
 //!
 //! ## rw mounts
 //!
@@ -28,8 +28,9 @@
 //! hands back. On every debounce: fold the overlay into a fresh
 //! snapshot (`flush_overlay`), persist the new vault root, and
 //! submit a `Publish` task to the daemon's executor. The debounce
-//! task also listens on the same cancel oneshot so it tears down
-//! cleanly on unmount.
+//! task listens on a clone of the same `CancellationToken` so it
+//! exits cleanly on unmount instead of leaking once the FUSE session
+//! goes away.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,19 +42,20 @@ use s5_core::blob::BlobStore;
 use s5_core::{BlobsRead, FallbackBlobsRead};
 use s5_fs_v2::snapshot::Snapshot;
 use s5_node_api::config::TaskSpec;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::NodeConfigStore;
 use crate::tasks::TaskExecutor;
 use crate::tasks::vault_persist::{load_vault_root, save_vault_root, vault_root_path};
 
-/// Per-mount state the manager keeps. `cancel` triggers shutdown of
-/// both the FUSE session and (for rw) its attached debounce loop;
-/// `join` is the mount task itself, awaited on unmount so the actual
-/// `umount(2)` has finished by the time the RPC returns.
+/// Per-mount state the manager keeps. `cancel.cancel()` wakes both
+/// the FUSE session and (for rw) its attached debounce loop in a
+/// single shot; `join` is the mount task itself, awaited on unmount
+/// so the actual `umount(2)` has finished by the time the RPC returns.
 struct ActiveMount {
-    cancel: oneshot::Sender<()>,
+    cancel: CancellationToken,
     join: JoinHandle<Result<()>>,
     #[allow(dead_code)] // kept for diagnostics + future ListMounts RPC
     mountpoint: PathBuf,
@@ -109,10 +111,7 @@ impl MountManager {
             resolved.root_plaintext_hash,
         );
 
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let cancel_fut = async move {
-            let _ = cancel_rx.await;
-        };
+        let cancel = CancellationToken::new();
 
         let mountpoint_for_task = mountpoint.clone();
         let join: JoinHandle<Result<()>> = if rw {
@@ -122,10 +121,12 @@ impl MountManager {
                 snapshot,
                 mountpoint_for_task,
                 debounce_ms,
-                cancel_fut,
+                cancel.clone(),
             )
         } else {
+            let cancel_for_task = cancel.clone();
             tokio::spawn(async move {
+                let cancel_fut = async move { cancel_for_task.cancelled().await };
                 s5_fuse::mount(&mountpoint_for_task, snapshot, false, true, cancel_fut)
                     .await
                     .with_context(|| format!("FUSE mount at {}", mountpoint_for_task.display()))
@@ -137,7 +138,7 @@ impl MountManager {
         mounts.insert(
             mount_id,
             ActiveMount {
-                cancel: cancel_tx,
+                cancel,
                 join,
                 mountpoint,
             },
@@ -155,10 +156,12 @@ impl MountManager {
                 .remove(&mount_id)
                 .ok_or_else(|| anyhow!("unknown mount_id {mount_id}"))?
         };
-        // Best effort: sending the cancel triggers the mount task to
-        // return; if it already exited (kernel-side eject) the receiver
-        // is gone and `send` errors — that's fine, we still join below.
-        let _ = active.cancel.send(());
+        // Single signal wakes both the FUSE session and (for rw) the
+        // debounce loop. Awaiting `join` ensures the FUSE session has
+        // finished its `umount(2)` before we return — debounce exit is
+        // best-effort (it may still be processing a flush after cancel
+        // fires; that completes in the background).
+        active.cancel.cancel();
         match active.join.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e.context(format!("mount task for id {mount_id}"))),
@@ -173,7 +176,7 @@ impl MountManager {
         snapshot: Snapshot,
         mountpoint: PathBuf,
         debounce_ms: u64,
-        cancel_fut: impl std::future::Future<Output = ()> + Send + 'static,
+        cancel: CancellationToken,
     ) -> JoinHandle<Result<()>> {
         let executor = self.executor.clone();
         let primary_store = resolved.primary_store.clone();
@@ -184,14 +187,17 @@ impl MountManager {
         tokio::spawn(async move {
             // The on_mount callback fires once the FS is built but
             // before the kernel sees it; we use it to spawn the
-            // debounce task with a clone of the WritableFs.
+            // debounce task with a clone of the WritableFs and the
+            // same cancellation token so unmount tears it down.
             let executor_for_cb = executor.clone();
             let vault_for_cb = vault.clone();
             let recipient_key_names_for_cb = recipient_key_names.clone();
             let recipient_pubkeys_for_cb = recipient_pubkeys.clone();
             let vault_root_file_for_cb = vault_root_file.clone();
+            let cancel_for_debounce = cancel.clone();
             let on_mount = move |fs: s5_fuse::WritableFs| {
                 tokio::spawn(async move {
+                    let cancel_fut = async move { cancel_for_debounce.cancelled().await };
                     s5_fuse::debounce::run(
                         fs,
                         std::time::Duration::from_millis(debounce_ms),
@@ -213,12 +219,13 @@ impl MountManager {
                                 .await
                             }
                         },
-                        std::future::pending::<()>(),
+                        cancel_fut,
                     )
                     .await;
                 });
             };
 
+            let cancel_fut = async move { cancel.cancelled().await };
             s5_fuse::mount_rw(
                 &mountpoint,
                 snapshot,
