@@ -236,8 +236,9 @@ impl S5Client {
         let remote_registry = RemoteRegistry::connect(endpoint.clone(), remote_addr);
         let registry: Arc<dyn s5_core::RegistryApi + Send + Sync> = Arc::new(remote_registry);
 
-        // Create FS5 context with RegistryKey link
-        // The public key from our sync keys becomes the stream key for the FS5 root
+        // Create FS5 context with RegistryKey link.
+        // Legacy s5_fs binding — uses the non-vault PublicKeyEd25519
+        // variant since it predates per-vault namespace tags.
         let stream_key = StreamKey::PublicKeyEd25519(self.keys.sync_keys.public_key);
         let signing_key = SigningKey::new(self.keys.sync_keys.signing_key_bytes);
 

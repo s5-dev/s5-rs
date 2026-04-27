@@ -28,12 +28,18 @@ use s5_core::{RegistryApi, StreamKey, StreamMessage};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-pub const ALPN: &[u8] = b"s5/registry/0";
+/// ALPN bumped to `s5/registry/1` for the v3 wire format change
+/// (`StreamKey::Vault` adds a 16-byte `vault_id` after the pubkey, so
+/// keys are no longer fixed at 32 bytes).
+pub const ALPN: &[u8] = b"s5/registry/1";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetRequest {
-    pub key_type: u8,
-    pub key_data: [u8; 32],
+    /// Full storage key: `[type_tag, key_bytes...]` — produced by
+    /// `StreamKey::storage_key()`. Variable length to accommodate
+    /// `Vault` entries (49 bytes: 1 + 32 + 16) alongside legacy 33-byte
+    /// keys for `Local` / `Blake3HashPin`.
+    pub key: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,8 +54,8 @@ pub struct SetRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
-    pub key_type: u8,
-    pub key_data: [u8; 32],
+    /// Full storage key — see `GetRequest::key`.
+    pub key: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,7 +93,7 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryServer<R> {
     }
 
     async fn handle_get(&self, req: GetRequest) -> GetResponse {
-        let key = match StreamKey::from_bytes(req.key_type, &req.key_data) {
+        let key = match StreamKey::from_storage_key(&req.key) {
             Ok(key) => key,
             Err(err) => {
                 warn!("registry get: invalid key: {err}");
@@ -118,8 +124,7 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryServer<R> {
     }
 
     async fn handle_delete(&self, req: DeleteRequest) -> std::result::Result<(), String> {
-        let key =
-            StreamKey::from_bytes(req.key_type, &req.key_data).map_err(|err| err.to_string())?;
+        let key = StreamKey::from_storage_key(&req.key).map_err(|err| err.to_string())?;
 
         self.registry
             .delete(&key)
@@ -165,11 +170,12 @@ impl Client {
     }
 
     pub async fn get(&self, key: StreamKey) -> Result<Option<StreamMessage>> {
-        let (key_type, key_bytes) = key.to_bytes();
-        let mut key_data = [0u8; 32];
-        key_data.copy_from_slice(key_bytes);
-
-        let response = self.inner.rpc(GetRequest { key_type, key_data }).await?;
+        let response = self
+            .inner
+            .rpc(GetRequest {
+                key: key.storage_key(),
+            })
+            .await?;
 
         if let Some(bytes) = response.message {
             let message = StreamMessage::deserialize(Bytes::from(bytes))
@@ -195,11 +201,13 @@ impl Client {
     }
 
     pub async fn delete(&self, key: StreamKey) -> Result<()> {
-        let (key_type, key_bytes) = key.to_bytes();
-        let mut key_data = [0u8; 32];
-        key_data.copy_from_slice(key_bytes);
-
-        match self.inner.rpc(DeleteRequest { key_type, key_data }).await? {
+        match self
+            .inner
+            .rpc(DeleteRequest {
+                key: key.storage_key(),
+            })
+            .await?
+        {
             Ok(()) => Ok(()),
             Err(err) => Err(anyhow!(err.to_string())),
         }

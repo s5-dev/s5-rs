@@ -6,7 +6,9 @@ use s5_core::stream::RegistryApi;
 use s5_core::{StreamKey, StreamMessage};
 use std::{path::Path, sync::Arc};
 
-const TABLE: TableDefinition<(u8, &[u8]), &[u8]> = TableDefinition::new("registry");
+/// Registry table — key is `StreamKey::storage_key()` (variable length:
+/// 33 bytes for `Local`/`Blake3HashPin`, 49 bytes for `Vault`).
+const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("registry");
 
 /// Simple local `RegistryApi` implementation backed by a Redb database.
 #[derive(Clone)]
@@ -48,12 +50,14 @@ impl RegistryApi for RedbRegistry {
         let db = self.db.clone();
         let key = *key;
 
+        let storage_key = key.storage_key();
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<StreamMessage>> {
             let read_txn = db.begin_read()?;
             let table = read_txn.open_table(TABLE)?;
 
             let maybe_message = table
-                .get(key.to_bytes())?
+                .get(storage_key.as_slice())?
                 .map(|guard| StreamMessage::deserialize(Bytes::copy_from_slice(guard.value())))
                 .transpose()?;
 
@@ -65,22 +69,22 @@ impl RegistryApi for RedbRegistry {
 
     async fn set(&self, message: StreamMessage) -> anyhow::Result<()> {
         let db = self.db.clone();
+        let storage_key = message.key.storage_key();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let write_txn = db.begin_write()?;
             {
                 let mut table = write_txn.open_table(TABLE)?;
-                let key_bytes = message.key.to_bytes();
 
                 // Get the current message from the DB to pass to `should_store`.
                 let existing_message = table
-                    .get(key_bytes)?
+                    .get(storage_key.as_slice())?
                     .map(|guard| StreamMessage::deserialize(Bytes::copy_from_slice(guard.value())))
                     .transpose()?;
 
                 // Check if the new message should be stored.
                 if message.should_store(existing_message.as_ref()) {
-                    table.insert(key_bytes, message.serialize().as_ref())?;
+                    table.insert(storage_key.as_slice(), message.serialize().as_ref())?;
                 }
             }
             write_txn.commit()?;
@@ -92,13 +96,13 @@ impl RegistryApi for RedbRegistry {
 
     async fn delete(&self, key: &StreamKey) -> anyhow::Result<()> {
         let db = self.db.clone();
-        let key = *key;
+        let storage_key = key.storage_key();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let write_txn = db.begin_write()?;
             {
                 let mut table = write_txn.open_table(TABLE)?;
-                table.remove(key.to_bytes())?;
+                table.remove(storage_key.as_slice())?;
             }
             write_txn.commit()?;
             Ok(())

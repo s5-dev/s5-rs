@@ -556,6 +556,10 @@ impl DirActor {
                 initial_hash: dir_ref.hash,
             },
             crate::dir::DirRefType::RegistryKey => {
+                // Legacy s5_fs (v1) registry use — directory hashes are
+                // reused as the registry pubkey field. Uses the non-vault
+                // PublicKeyEd25519 variant since this layer predates the
+                // per-vault namespace tag.
                 let key = StreamKey::PublicKeyEd25519(dir_ref.hash);
                 if let Some(handle) = self.context.registry_dir_handles.get(&key) {
                     return Ok(handle.clone());
@@ -576,6 +580,7 @@ impl DirActor {
                 self.dir_handles.insert(sub_path.to_owned(), handle.clone());
             }
             crate::dir::DirRefType::RegistryKey => {
+                // Legacy s5_fs (v1) registry use — same shape as above.
                 let key = StreamKey::PublicKeyEd25519(dir_ref.hash);
                 self.context
                     .registry_dir_handles

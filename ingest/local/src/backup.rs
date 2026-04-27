@@ -133,7 +133,9 @@ pub async fn backup(
     };
 
     let stats = stats.unwrap_or_else(|| Arc::new(BackupStats::default()));
-    let overlay = Arc::new(WritableOverlay::new(Box::new(prev_snapshot.clone())));
+    let pipeline = Arc::new(prev_snapshot.as_pipeline());
+    let base: Arc<dyn s5_fs_v2::layer::ReadableLayer> = Arc::new(prev_snapshot.clone());
+    let overlay = Arc::new(WritableOverlay::new(base, pipeline));
 
     // Add one_file_system filter if configured.
     if root_dev.is_some() {

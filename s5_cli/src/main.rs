@@ -6,7 +6,6 @@ use directories::ProjectDirs;
 use std::path::PathBuf;
 
 mod cmd;
-mod helpers;
 mod init_config;
 
 #[derive(Parser)]
@@ -37,7 +36,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
-    /// Low-level blob operations against a configured peer
+    /// Low-level local blob store operations (GC, integrity verify)
     Blobs {
         #[command(subcommand)]
         cmd: BlobsCmd,
@@ -129,33 +128,6 @@ enum ImportCmd {
 
 #[derive(Subcommand)]
 enum BlobsCmd {
-    /// Upload a local file as a blob to a peer
-    Upload {
-        /// Name of the peer in the node config (e.g. "paid")
-        #[arg(short, long)]
-        peer: String,
-        /// Local file path to upload
-        path: PathBuf,
-    },
-    /// Download a blob from a peer into a local file
-    Download {
-        /// Name of the peer in the node config (e.g. "paid")
-        #[arg(short, long)]
-        peer: String,
-        /// Blob hash in hex (BLAKE3, 32 bytes)
-        hash: String,
-        /// Output file path to write the blob to
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Delete (unpin) a blob on a peer
-    Delete {
-        /// Name of the peer in the node config (e.g. "paid")
-        #[arg(short, long)]
-        peer: String,
-        /// Blob hash in hex (BLAKE3, 32 bytes)
-        hash: String,
-    },
     /// Perform conservative garbage collection on a local blob store
     /// used by this node. Only deletes blobs that have no pins in the
     /// node registry and are not reachable from the primary FS5 root
@@ -181,38 +153,6 @@ enum BlobsCmd {
 
 #[derive(Subcommand)]
 enum SnapshotsCmd {
-    /// Show the current remote snapshot head for a sync job
-    Head {
-        /// Name of the peer in the node config to query the registry from
-        #[arg(short, long)]
-        peer: String,
-        /// Shared secret used to derive the sync stream key
-        #[arg(long, value_name = "SECRET")]
-        shared_secret: String,
-    },
-    /// Download a raw directory snapshot blob from a peer
-    Download {
-        /// Name of the peer in the node config (e.g. "paid")
-        #[arg(short, long)]
-        peer: String,
-        /// Snapshot blob hash in hex (BLAKE3, 32 bytes)
-        hash: String,
-        /// Output file path to write the snapshot bytes
-        #[arg(long)]
-        out: PathBuf,
-    },
-    /// Restore a directory snapshot into a local FS5 root
-    Restore {
-        /// Local directory that will host `root.fs5.cbor` and metadata blobs
-        #[arg(long, value_name = "PATH")]
-        root: PathBuf,
-        /// Name of the peer in the node config (e.g. "paid")
-        #[arg(short, long)]
-        peer: String,
-        /// Snapshot blob hash in hex (BLAKE3, 32 bytes)
-        #[arg(long)]
-        hash: String,
-    },
     /// List snapshots for the local FS5 root backing this node
     ListFs,
     /// Create a new snapshot for the local FS5 root backing this node

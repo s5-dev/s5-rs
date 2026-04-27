@@ -24,13 +24,7 @@ impl StoreRegistry {
     }
 
     fn key_path(&self, key: &StreamKey) -> String {
-        let (key_type, key_bytes) = key.to_bytes();
-
-        let mut full_key = Vec::with_capacity(33);
-        full_key.push(key_type);
-        full_key.extend_from_slice(key_bytes);
-
-        let hex_key = hex::encode(full_key);
+        let hex_key = hex::encode(key.storage_key());
         format!("{}/{}", self.prefix, hex_key)
     }
 }

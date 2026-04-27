@@ -3,7 +3,6 @@ use bytes::Bytes;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::OsRng;
-use ed25519::signature::Signer;
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::NamedTempFile;
 
@@ -14,7 +13,7 @@ use crate::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use s5_core::PinContext;
-use s5_core::{Hash, MessageType, StreamMessage};
+use s5_core::{Hash, StreamMessage};
 
 use super::{DirActor, DirActorHandle};
 use futures::future::join_all;
@@ -222,23 +221,11 @@ impl DirActor {
                     let current = self.context.registry.get(public_key).await?;
                     let revision = current.as_ref().map_or(0, |entry| entry.revision + 1);
                     let dalek_key = ed25519_dalek::SigningKey::from_bytes(signing_key.as_bytes());
-                    let (key_type, key_bytes) = public_key.to_bytes();
-                    let mut sign_bytes = Vec::with_capacity(1 + 1 + key_bytes.len() + 8 + 1 + 32);
-                    sign_bytes.push(MessageType::Registry as u8);
-                    sign_bytes.push(key_type);
-                    sign_bytes.extend_from_slice(key_bytes);
-                    sign_bytes.extend_from_slice(&revision.to_be_bytes());
-                    sign_bytes.push(0x21);
-                    sign_bytes.extend_from_slice(hash.hash.as_bytes());
-                    let signature = dalek_key.sign(&sign_bytes);
-                    let entry = StreamMessage::new(
-                        MessageType::Registry,
-                        *public_key,
-                        revision,
-                        hash.hash,
-                        signature.to_bytes().to_vec().into_boxed_slice(),
-                        None,
-                    )?;
+                    // Legacy s5_fs (v1) registry-backed dirs use the
+                    // non-vault PublicKeyEd25519 entry shape — they
+                    // predate the per-vault namespace tag.
+                    let entry =
+                        StreamMessage::sign_ed25519_legacy(&dalek_key, hash.hash, revision)?;
                     self.context.registry.set(entry).await?;
                 }
                 Ok(None)
