@@ -78,7 +78,7 @@ impl S5Node {
         // Create iroh endpoint with optional stable secret key
         // Note: passes None for config_dir, so relative paths won't work here
         // Local-only: no relay servers for security
-        let mut builder = Endpoint::empty_builder();
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal);
         if let Some(sec) = identity::load_secret_key(&config.identity, None, &config.key) {
             builder = builder.secret_key(sec);
         }
@@ -316,7 +316,7 @@ pub async fn run_node(
     // Create iroh endpoint first (needed for remote registries)
     // Local-only: no relay servers for security
     let config_dir = config_file_path.parent();
-    let mut builder = Endpoint::empty_builder();
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal);
     if let Some(sec) = identity::load_secret_key(&config.identity, config_dir, &config.key) {
         builder = builder.secret_key(sec);
     }
