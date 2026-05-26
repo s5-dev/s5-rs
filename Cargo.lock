@@ -5964,6 +5964,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "s5_store_packing"
+version = "1.0.0-beta.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "futures",
+ "minicbor",
+ "s5_core",
+ "s5_store_memory",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "s5_store_s3"
 version = "1.0.0-beta.1"
 dependencies = [

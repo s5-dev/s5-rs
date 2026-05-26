@@ -18,6 +18,8 @@ members = [
   "blob_stores/s3",
   "blob_stores/sia",
   "blob_stores/fjall",
+  # Decorating stores (path-agnostic Store wrappers)
+  "stores/packing",
   # Registries
   "registries/redb",
   "registries/store",
@@ -67,6 +69,7 @@ s5_registry_redb = { path = "registries/redb", version = "1.0.0-beta.1" }
 s5_registry_store = { path = "registries/store", version = "1.0.0-beta.1" }
 s5_store_local = { path = "blob_stores/local", version = "1.0.0-beta.1" }
 s5_store_memory = { path = "blob_stores/memory", version = "1.0.0-beta.1" }
+s5_store_packing = { path = "stores/packing", version = "1.0.0-beta.1" }
 s5_store_s3 = { path = "blob_stores/s3", version = "1.0.0-beta.1" }
 s5_store_sia = { path = "blob_stores/sia", version = "1.0.0-beta.1" }
 s5_store_fjall = { path = "blob_stores/fjall", version = "1.0.0-beta.1" }
