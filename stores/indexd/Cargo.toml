@@ -1,0 +1,36 @@
+[package]
+name = "s5_store_indexd"
+version = "1.0.0-beta.1"
+edition = "2024"
+description = "indexd-backed Store for S5: per-path uploads to Sia hosts via sia_storage::Sdk"
+repository = "https://github.com/s5-dev/s5-rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono = "0.4"
+futures.workspace = true
+hex.workspace = true
+s5_core.workspace = true
+serde_json.workspace = true
+sia_core.workspace = true
+sia_storage.workspace = true
+url = "2"
+tokio = { workspace = true, features = ["sync", "rt", "time", "io-util"] }
+tokio-util.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+s5_store_local = { workspace = true }
+s5_store_memory = { workspace = true }
+s5_store_packing = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "end_to_end"
+path = "examples/end_to_end.rs"
