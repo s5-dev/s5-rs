@@ -109,6 +109,30 @@ pub enum BlobLocationType {
 /// Iroh locations, Sia metadata, and various multihash- and wrapper-based
 /// indirections (encryption, compression, etc.).
 ///
+/// # Deprecation notice
+///
+/// **TODO(breaking):** `BlobLocation` is vestigial. It exists to let
+/// `Store::provide()` return network locations for the old blob-exchange
+/// protocol (`s5_blobs`), but this couples a storage concern (Store) to a
+/// network-distribution concern. Most Store impls return empty vec — they
+/// have no idea where a blob lives on the network, nor should they.
+///
+/// The modern architecture separates these:
+/// - **Store** = key-value (path → bytes), no opinions about networks.
+/// - **FS5 snapshots** = content discovery (signed Merkle root → hash set).
+/// - **s5_blobs** = network transport (can layer its own location index).
+///
+/// Migration path:
+/// 1. Move URL/share-link location sharing out of `Store::provide()` and
+///    into a dedicated location registry or the FS5 snapshot layer.
+/// 2. Default `provide()` to return `Ok(vec![])` on the trait (not each impl).
+/// 3. Eventually remove `provide()` from `Store` and this enum can be
+///    slimmed to just the transform variants (Encryption, Compression).
+///
+/// Until then, **do not add new variants.** No `IndexdObject`, no
+/// backend-specific network references. Backends that need to expose
+/// locations should do so through their own higher-level API.
+///
 /// Note that some variants (for example `SiaFile` and
 /// `EncryptionXChaCha20Poly1305Location`) may embed encryption keys or
 /// other secret material. Callers should treat `BlobLocation` values as
@@ -462,7 +486,7 @@ mod tests {
         let loc = BlobLocation::EncryptionXChaCha20Poly1305(EncryptionXChaCha20Poly1305Location {
             inner: Box::new(BlobLocation::Url("test".to_string())),
             key: [0x42; 32],
-            block_size: 1024,
+            block_size: 4096,
         });
         let debug = format!("{:?}", loc);
         assert!(debug.contains("[REDACTED]"));

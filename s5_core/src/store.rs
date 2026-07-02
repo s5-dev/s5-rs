@@ -53,6 +53,11 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
 
     async fn rename(&self, old_path: &str, new_path: &str) -> StoreResult<()>;
 
+    /// **TODO(breaking):** this method is vestigial — see the deprecation
+    /// notice on [`BlobLocation`](crate::blob::location::BlobLocation).
+    /// Most stores should return `Ok(vec![])`. Location sharing belongs in
+    /// a higher layer (FS5 snapshots, dedicated registry), not in the
+    /// key-value Store trait. Eventually remove this method.
     async fn provide(&self, path: &str) -> StoreResult<Vec<BlobLocation>>;
 
     /// Stores a stream to a temporary location and returns the path.
@@ -90,6 +95,23 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
     /// that don't support or need explicit syncing.
     async fn sync(&self) -> StoreResult<()> {
         Ok(())
+    }
+
+    /// Returns the last-modification time of the object at `path`, if the
+    /// backend tracks one.
+    ///
+    /// Used by the periodic cold-store GC as a grace gate: a candidate blob
+    /// is only deleted once its mtime is older than the configured minimum
+    /// age, which makes the live-publisher GC race structurally impossible
+    /// (a blob written by an in-flight revision is far younger than the
+    /// grace period).
+    ///
+    /// The default returns `Ok(None)` — "this backend has no notion of
+    /// mtime". GC treats `None` as **fail-safe**: a candidate whose age
+    /// cannot be established is protected, never deleted. Only stores that
+    /// can answer truthfully (filesystem-backed) should override.
+    async fn modified(&self, _path: &str) -> StoreResult<Option<std::time::SystemTime>> {
+        Ok(None)
     }
 
     /// The substrate this store's data physically lives on, for cheap

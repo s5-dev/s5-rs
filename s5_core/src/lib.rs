@@ -39,12 +39,16 @@
 
 pub mod bao;
 pub mod blob;
+pub mod caching;
 pub mod cbor;
+pub mod crypto;
 pub mod hash;
+pub mod identity;
 pub mod pins;
 // Store trait is available on all platforms
 pub mod store;
 pub mod stream;
+pub mod vaults;
 
 // Test utilities (behind feature flag)
 #[cfg(feature = "testutil")]
@@ -59,6 +63,9 @@ pub use blob::location::BlobLocation;
 // Hash type (always available - protocol type)
 pub use hash::Hash;
 
+// DID-based identity (always available - protocol types)
+pub use identity::{Did, IdentityBundle};
+
 // Stream & Registry protocol types (always available - protocol types)
 pub use stream::types::{MessageType, PublicKeyEd25519};
 pub use stream::{RegistryApi, StreamKey, StreamMessage};
@@ -69,9 +76,13 @@ pub use stream::{RegistryApi, StreamKey, StreamMessage};
 // pub use blob::store::BlobStore;
 pub use blob::cached::CachedBlobsRead;
 pub use blob::fallback::FallbackBlobsRead;
-pub use blob::{BlobsRead, BlobsReadWrite, BlobsWrite};
+pub use blob::{
+    Blobs, BlobsDelete, BlobsList, BlobsRead, BlobsReadWrite, BlobsWrite, HashStream,
+    ReachableStream,
+};
 
 // Storage traits (available on all platforms)
+pub use caching::CachingStore;
 pub use store::{Store, StoreFeatures, StoreResult};
 
 // --- Native-only exports ---
