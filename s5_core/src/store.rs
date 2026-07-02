@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
@@ -90,6 +92,22 @@ pub trait Store: std::fmt::Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// The substrate this store's data physically lives on, for cheap
+    /// cross-store migration ([`migrate`]). `None` (the default) means there is
+    /// no by-reference path, so [`migrate`] falls back to client-mediated byte
+    /// copy. See [`Substrate`].
+    fn migration_substrate(&self) -> Option<Substrate> {
+        None
+    }
+
+    /// If this store can migrate **by reference** (no byte movement) to a store
+    /// on the same [`Substrate`], a handle that drives it; otherwise `None` (the
+    /// default). Consulted by [`migrate`] together with
+    /// [`migration_substrate`](Store::migration_substrate).
+    fn as_reference_migrate(&self) -> Option<&dyn ReferenceMigrate> {
+        None
+    }
+
     /// Create a reflink (copy-on-write) clone of a source file into the store.
     ///
     /// This is used by `BlobStore::import_file` when `supports_reflink` is true.
@@ -117,4 +135,93 @@ pub struct StoreFeatures {
     /// When true, `BlobStore::import_file` will try `Store::reflink_file_to`
     /// before falling back to the TeeStream path.
     pub supports_reflink: bool,
+}
+
+/// Identifies the storage substrate a [`Store`]'s bytes physically live on, so
+/// two stores that share one can [`migrate`] data **by reference** (no byte
+/// movement) instead of routing every byte through the client.
+///
+/// The substrate is the *shared medium*, not the store's address: two different
+/// Sia indexers are different stores but the same [`SiaHosts`](Substrate::SiaHosts)
+/// substrate — the sectors live on the host network, reachable by either — so
+/// one can re-pin the other's objects without moving bytes. This is the
+/// "your data outlives any single provider" property of a decentralized
+/// substrate, made into an interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Substrate {
+    /// Sia hosts on a given network (e.g. `"sia-mainnet"`). Any indexer on the
+    /// same network can reference the same sectors.
+    SiaHosts { network: String },
+}
+
+impl Substrate {
+    /// Can a store on `self`'s substrate transfer **by reference** to a store on
+    /// `other`'s? Currently exact-match; refine per-variant as substrates are
+    /// added (e.g. S3 same-region copy, mutual SFTP reachability).
+    pub fn can_reference_migrate_to(&self, other: &Substrate) -> bool {
+        self == other
+    }
+}
+
+/// By-reference migration between two stores on the same [`Substrate`] — the
+/// cheap path [`migrate`] uses. The exported handle is type-erased and
+/// substrate-specific (e.g. an opened Sia object holding the data key, kept
+/// strictly in-process) and is consumed by `import_ref` on a same-substrate
+/// store. Stores expose this via [`Store::as_reference_migrate`].
+#[async_trait]
+pub trait ReferenceMigrate: Send + Sync {
+    /// Export the entry at `path` as an opaque, substrate-specific handle.
+    async fn export_ref(&self, path: &str) -> StoreResult<Box<dyn Any + Send>>;
+
+    /// Import a handle exported by a same-substrate store, recording it at
+    /// `path`. An unexpected handle type is an error (the substrates were
+    /// mislabeled).
+    async fn import_ref(&self, path: &str, handle: Box<dyn Any + Send>) -> StoreResult<()>;
+}
+
+/// Outcome of [`migrate`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Entries moved **by reference** (no byte copy).
+    pub by_reference: u64,
+    /// Entries moved by client-mediated byte copy (the fallback).
+    pub by_copy: u64,
+}
+
+/// Migrate every entry from `src` to `dst`.
+///
+/// If both stores sit on the same migratable [`Substrate`] (and both expose
+/// [`Store::as_reference_migrate`]), entries move **by reference** — no byte
+/// movement (e.g. two Sia indexers re-pinning the same sectors on their hosts).
+/// Otherwise each entry is **copied through the client** (a streamed read +
+/// write), which always works but routes every byte through the caller.
+pub async fn migrate(src: &dyn Store, dst: &dyn Store) -> StoreResult<MigrationReport> {
+    use futures::StreamExt;
+
+    let by_ref = match (src.migration_substrate(), dst.migration_substrate()) {
+        (Some(s), Some(t)) if s.can_reference_migrate_to(&t) => {
+            src.as_reference_migrate().zip(dst.as_reference_migrate())
+        }
+        _ => None,
+    };
+
+    let mut report = MigrationReport::default();
+    let mut paths = src.list().await?;
+    while let Some(path) = paths.next().await {
+        let path = path?;
+        match by_ref {
+            Some((s, d)) => {
+                let handle = s.export_ref(&path).await?;
+                d.import_ref(&path, handle).await?;
+                report.by_reference += 1;
+            }
+            None => {
+                let reader = src.open_read_stream(&path, 0, None).await?;
+                dst.put_stream(&path, reader).await?;
+                report.by_copy += 1;
+            }
+        }
+    }
+    Ok(report)
 }

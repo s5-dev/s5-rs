@@ -5164,17 +5164,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "priority-queue"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93980406f12d9f8140ed5abe7155acb10bb1e69ea55c88960b9c2f117445ef96"
-dependencies = [
- "equivalent",
- "indexmap 2.14.0",
- "serde",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5732,7 +5721,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2 0.10.9",
- "sysinfo",
+ "sysinfo 0.37.2",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6290,7 +6279,6 @@ dependencies = [
 name = "s5_store_indexd"
 version = "1.0.0-beta.1"
 dependencies = [
- "age",
  "anyhow",
  "async-trait",
  "blake3",
@@ -6298,15 +6286,18 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "rand 0.10.1",
  "s5_core",
  "s5_store_local",
  "s5_store_memory",
+ "s5_store_packing",
+ "serde_json",
  "sia_core",
  "sia_storage",
- "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -6950,9 +6941,9 @@ dependencies = [
 
 [[package]]
 name = "sia_storage"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23ea807adea384af7d27da8c63c3bd23fe7808989ca9b0615bd50fb0664ed2e0"
+checksum = "abce6316361e955422cb24022d01b99127b15416bda48dc6887407e8aca109bd"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -6969,9 +6960,7 @@ dependencies = [
  "instant",
  "js-sys",
  "log",
- "priority-queue",
  "rand 0.10.1",
- "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6979,6 +6968,7 @@ dependencies = [
  "sia_core",
  "sia_mux",
  "sia_reed_solomon",
+ "sysinfo 0.39.5",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -7290,6 +7280,20 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.39.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c8bd2130a9b60bee2581bf82cfe89ee836424d1f37dcfa4ce21509611684673"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows 0.62.2",
 ]
 
 [[package]]

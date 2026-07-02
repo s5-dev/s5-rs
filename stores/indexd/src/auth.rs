@@ -1,54 +1,74 @@
-//! App-registration flow + at-rest AppKey storage.
+//! App registration against an indexd service.
 //!
-//! Two pieces:
+//! Two entry points, both filesystem-free — persisting the returned
+//! AppKey is the caller's concern (in S5 it goes into the node's
+//! age-encrypted `stores` vault — the warm, availability tier):
 //!
-//! 1. **`register_via_browser`** — the OAuth-style enrollment dance
-//!    (matches the upstream `Builder::request_connection` /
-//!    `wait_for_approval` / `register` chain, plus an
-//!    `on_response_url` hook so the caller can display the link
-//!    and/or shell out to a browser).
-//! 2. **`AppKeyVault`** — a thin file-backed AppKey store. When
-//!    given an `AgeRecipient`, it writes the 32-byte AppKey export
-//!    age-encrypted (matching the pattern used by s5_node's identity
-//!    master key — `dev/s5/s5_node/src/identity_vault.rs:90-181`).
-//!    Without recipients, it falls back to a plaintext file with
-//!    `0600` permissions and emits a warning.
+//! 1. [`register`] — drives the OAuth-style enrollment (the upstream
+//!    `Builder::request_connection` / `wait_for_approval` / `register`
+//!    chain) and returns the 32-byte AppKey export to persist.
+//! 2. [`connect`] — checks whether a previously-exported AppKey is
+//!    still recognised by the indexer.
+//!
+//! The registration mnemonic is derived from a **caller-supplied 32-byte
+//! secret** via [`derive_indexd_mnemonic`]. In S5 that secret is the node's
+//! **managed storage secret** — `blake3::derive_key("s5/storage/indexd/v1",
+//! stores_seed ‖ label)` (`docs/reference/mnemonic-derivation.md` § Layer C)
+//! — **not** the cold identity master, which only *anchors* the vaults.
+//! Per-account / per-indexer scoping lives in that secret (distinct labels →
+//! distinct secrets → distinct AppKeys), so this layer folds in nothing
+//! else. The mnemonic stays the one derivation input the indexer never sees,
+//! keeping the AppKey — and the object data key it unwraps — underivable by
+//! the indexer (see the module docs in `lib.rs`).
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result, anyhow};
-use sia_storage::{AppKey, AppMetadata, Builder, Sdk};
+use anyhow::{Result, anyhow};
+use sia_storage::{AppKey, AppMetadata, Builder, Hash256};
 use zeroize::Zeroize;
 
-/// Mnemonic input to `Builder::register`. Static across all S5
-/// installations on purpose: per-user differentiation is supplied by
-/// indexd's per-user `user_secret` (returned by the OAuth approval
-/// step), so `derive_app_key(this_mnemonic, app_id, user_secret)`
-/// already produces a unique AppKey per user. Recoverability is the
-/// same as the spec's "re-OAuth fetches the same user_secret"
-/// recovery path (§8): the AppKey is determined by indexd's
-/// per-account state, not by anything we have to remember.
-///
-/// The chosen value is the canonical BIP-39 12-word zero-entropy
-/// phrase ([0u8; 16] + valid checksum byte). Picking a constant
-/// keeps the implementation deterministic without dragging in a
-/// BIP-39 wordlist of our own.
-pub const S5_INDEXD_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+/// Domain tag for deriving the indexd registration mnemonic from the
+/// caller-supplied storage secret. Bumping the `/v1` suffix re-keys the
+/// AppKey and orphans existing data — treat it as frozen once any non-mock
+/// write has happened.
+const S5_INDEXD_MNEMONIC_DOMAIN: &str = "s5/indexd-app-mnemonic/v1";
 
-const AGE_V1_HEADER: &[u8] = b"age-encryption.org/v1";
+/// Derive the BIP-39 mnemonic fed to `Builder::register` from a 32-byte
+/// storage secret.
+///
+/// The AppKey is `derive_app_key(mnemonic, app_id, user_secret)`. `app_id`
+/// is a public constant and `user_secret` is held by the indexer, so the
+/// mnemonic is the **only** derivation input the indexer never sees. In S5,
+/// `secret` is the node's **managed storage secret**
+/// (`blake3::derive_key("s5/storage/indexd/v1", stores_seed ‖ label)`,
+/// `mnemonic-derivation.md` § Layer C), which keeps the AppKey — and the
+/// object `data_key` it unwraps — underivable by the indexer, while staying
+/// re-derivable from the paper mnemonic for recovery.
+///
+/// Per-account / per-indexer scoping is already baked into `secret` by that
+/// upstream derivation (distinct labels → distinct secrets), so this
+/// function folds in nothing else. Deterministic: the same `secret` always
+/// yields the same mnemonic, so re-registration (re-OAuth returns the same
+/// `user_secret`) re-derives the same AppKey.
+pub fn derive_indexd_mnemonic(secret: &[u8; 32]) -> String {
+    let mut derived = blake3::derive_key(S5_INDEXD_MNEMONIC_DOMAIN, secret);
+    let mut entropy = [0u8; 16];
+    entropy.copy_from_slice(&derived[..16]);
+    derived.zeroize();
+    // Reuse sia_core's own encoder so the phrase round-trips exactly back to
+    // `entropy` through `Seed::new` inside `Builder::register`.
+    let phrase = sia_core::seed::Seed::from_seed(entropy).to_string();
+    entropy.zeroize();
+    phrase
+}
 
 /// Identifier the indexer ties to S5 registrations. The `id` is the
 /// load-bearing field — it's the AppID derived from
 /// [`crate::S5_INDEXD_APP_ID_PREIMAGE`] and salts the AppKey HKDF, so
-/// once any non-mock write happens it must not change. The other
-/// fields (`name`, `description`, `service_url`, …) are
-/// presentational; they appear in the OAuth approval dialog and can
-/// be edited safely.
+/// once any non-mock write happens it must not change. The other fields
+/// (`name`, `description`, `service_url`, …) are presentational; they
+/// appear in the OAuth approval dialog and can be edited safely.
 pub fn app_metadata() -> AppMetadata {
     AppMetadata {
-        id: sia_storage::Hash256::from(crate::app_id_bytes()),
+        id: Hash256::from(crate::app_id_bytes()),
         name: "S5",
         description: "Content-addressed personal backup, sync, and archive built on Sia.",
         service_url: "https://s5.pro",
@@ -57,162 +77,52 @@ pub fn app_metadata() -> AppMetadata {
     }
 }
 
-/// One age recipient (public key) the AppKey file should be encrypted
-/// to. Multi-recipient lists are accepted so a node and a recovery
-/// agent can both decrypt.
-#[derive(Clone, Debug)]
-pub struct AgeRecipient(pub String);
-
-/// File-backed AppKey store using the same age-encrypted pattern that
-/// `s5_node` uses for its master signing key. Each call serializes
-/// the 32-byte AppKey export plus a 1-byte version prefix.
-#[derive(Debug, Clone)]
-pub struct AppKeyVault {
-    path: PathBuf,
-    recipients: Vec<AgeRecipient>,
-    identity_files: Vec<PathBuf>,
-}
-
-impl AppKeyVault {
-    /// Construct a vault rooted at `path`.
-    ///
-    /// `recipients` — age public keys the AppKey is encrypted to.
-    /// Empty means plaintext storage (insecure, warned at write).
-    ///
-    /// `identity_files` — age secret-key files used to decrypt on
-    /// read. Tried in order; first one that opens wins.
-    pub fn new(
-        path: impl Into<PathBuf>,
-        recipients: Vec<AgeRecipient>,
-        identity_files: Vec<PathBuf>,
-    ) -> Self {
-        Self {
-            path: path.into(),
-            recipients,
-            identity_files,
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Does the vault file already exist on disk?
-    pub fn exists(&self) -> bool {
-        self.path.exists()
-    }
-
-    /// Read + decrypt the stored AppKey. `Ok(None)` if the file does
-    /// not exist; error if the file exists but cannot be decoded.
-    pub fn load(&self) -> Result<Option<AppKey>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let raw = std::fs::read(&self.path)
-            .with_context(|| format!("reading appkey vault {}", self.path.display()))?;
-
-        let mut plaintext: Vec<u8> = if raw.starts_with(AGE_V1_HEADER) {
-            if self.identity_files.is_empty() {
-                return Err(anyhow!(
-                    "appkey vault {} is age-encrypted but no identity_files were configured",
-                    self.path.display()
-                ));
-            }
-            age_decrypt(&raw, &self.identity_files)?
-        } else {
-            raw
-        };
-
-        let bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
-            anyhow!(
-                "appkey vault {}: wrong size after decrypt",
-                self.path.display()
-            )
-        })?;
-        plaintext.zeroize();
-        Ok(Some(AppKey::import(bytes)))
-    }
-
-    /// Encrypt + write the AppKey. Overwrites any existing file. On
-    /// Unix, sets `0600` permissions to limit accidental exposure.
-    pub fn store(&self, key: &AppKey) -> Result<()> {
-        let mut export = key.export();
-        let bytes_to_write: Vec<u8> = if self.recipients.is_empty() {
-            tracing::warn!(
-                path = %self.path.display(),
-                "appkey vault has no age recipients configured — writing AppKey as plaintext. \
-                 Configure an age public key to enable at-rest encryption."
-            );
-            export.to_vec()
-        } else {
-            age_encrypt(&export, &self.recipients)?
-        };
-        export.zeroize();
-
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent dir {}", parent.display()))?;
-        }
-        std::fs::write(&self.path, &bytes_to_write)
-            .with_context(|| format!("writing appkey vault {}", self.path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
-    }
-
-    /// Remove the stored AppKey, if any. Idempotent.
-    pub fn clear(&self) -> Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow!(
-                "removing appkey vault {}: {e}",
-                self.path.display()
-            )),
-        }
-    }
-}
-
-/// Acquire an SDK against `indexer_url`, reusing a cached AppKey if
-/// present and otherwise driving the browser-OAuth enrollment.
-///
-/// `on_response_url` is invoked once with the URL the user must visit
-/// to authorise the application. The function then blocks on
-/// `wait_for_approval`. After approval, the static
-/// [`S5_INDEXD_MNEMONIC`] is fed to `Builder::register` — per-user
-/// differentiation in the derived AppKey comes from indexd's
-/// `user_secret`, not the mnemonic input.
-///
-/// On success the AppKey is written to `vault`.
-pub async fn connect_or_register<URL>(
+/// Is a previously-exported `app_key` still recognised by the indexer
+/// at `indexer_url`? Network-only; no filesystem.
+pub async fn connect(
     indexer_url: &str,
-    vault: &AppKeyVault,
+    app_key: [u8; 32],
+    metadata: Option<AppMetadata>,
+) -> Result<bool> {
+    let builder = Builder::new(indexer_url, metadata.unwrap_or_else(app_metadata))
+        .map_err(|e| anyhow!("Builder::new({indexer_url}): {e:?}"))?;
+    let key = AppKey::import(app_key);
+    Ok(builder
+        .connected(&key)
+        .await
+        .map_err(|e| anyhow!("Builder::connected: {e:?}"))?
+        .is_some())
+}
+
+/// Run one interactive OAuth registration round against `indexer_url`
+/// and return the resulting 32-byte AppKey export.
+///
+/// Network + callback only — **no filesystem**. `on_response_url` is
+/// invoked once with the URL the user must visit to authorise the
+/// application; the function then blocks on `wait_for_approval`. After
+/// approval, the mnemonic derived from `secret` via
+/// [`derive_indexd_mnemonic`] is fed to `Builder::register`, keeping the
+/// AppKey underivable by the indexer (end-to-end confidentiality).
+///
+/// `secret` is the node's 32-byte managed storage secret (already scoped
+/// per indexer/account via `stores_seed ‖ label`); it must never be
+/// transmitted to the indexer. The same `secret` reproduces the same AppKey
+/// across devices and re-registrations.
+///
+/// The caller owns the returned bytes and is responsible for persisting
+/// them (e.g. in the node's age-encrypted `stores` vault — the warm,
+/// availability-tier vault that holds storage credentials).
+pub async fn register<URL>(
+    indexer_url: &str,
+    secret: &[u8; 32],
+    metadata: Option<AppMetadata>,
     on_response_url: URL,
-) -> Result<Sdk>
+) -> Result<[u8; 32]>
 where
     URL: FnOnce(&str),
 {
-    let builder = Builder::new(indexer_url, app_metadata())
+    let builder = Builder::new(indexer_url, metadata.unwrap_or_else(app_metadata))
         .map_err(|e| anyhow!("Builder::new({indexer_url}): {e:?}"))?;
-
-    if let Some(key) = vault.load()? {
-        if let Some(sdk) = builder
-            .connected(&key)
-            .await
-            .map_err(|e| anyhow!("Builder::connected: {e:?}"))?
-        {
-            return Ok(sdk);
-        }
-        tracing::warn!(
-            "cached AppKey at {} no longer recognised by indexer; re-registering",
-            vault.path().display()
-        );
-    }
 
     let pending = builder
         .request_connection()
@@ -225,67 +135,14 @@ where
         .await
         .map_err(|e| anyhow!("Builder::wait_for_approval: {e:?}"))?;
 
+    let mut mnemonic = derive_indexd_mnemonic(secret);
     let sdk = approved
-        .register(S5_INDEXD_MNEMONIC)
+        .register(&mnemonic)
         .await
         .map_err(|e| anyhow!("Builder::register: {e:?}"))?;
+    mnemonic.zeroize();
 
-    vault.store(sdk.app_key())?;
-    Ok(sdk)
-}
-
-// --- age helpers, inlined from s5_node's pattern --------------------
-
-fn age_encrypt(plaintext: &[u8], recipients: &[AgeRecipient]) -> Result<Vec<u8>> {
-    if recipients.is_empty() {
-        return Err(anyhow!("no age recipients"));
-    }
-    let parsed: Vec<age::x25519::Recipient> = recipients
-        .iter()
-        .map(|r| {
-            r.0.parse::<age::x25519::Recipient>()
-                .map_err(|e| anyhow!("invalid age recipient '{}': {}", r.0, e))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let encryptor =
-        age::Encryptor::with_recipients(parsed.iter().map(|r| r as &dyn age::Recipient))
-            .map_err(|e| anyhow!("age encryptor: {e}"))?;
-    let mut ciphertext = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut ciphertext)
-        .map_err(|e| anyhow!("age wrap_output: {e}"))?;
-    writer
-        .write_all(plaintext)
-        .context("write age ciphertext")?;
-    writer.finish().context("finish age encryption")?;
-    Ok(ciphertext)
-}
-
-fn age_decrypt(ciphertext: &[u8], identity_files: &[PathBuf]) -> Result<Vec<u8>> {
-    for path in identity_files {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading identity file {}", path.display()))?;
-        let id_file = age::IdentityFile::from_buffer(std::io::BufReader::new(content.as_bytes()))
-            .with_context(|| format!("parsing identity file {}", path.display()))?;
-        let identities = id_file
-            .into_identities()
-            .map_err(|e| anyhow!("loading identities from {}: {e}", path.display()))?;
-        let decryptor =
-            age::Decryptor::new(ciphertext).map_err(|e| anyhow!("age decryptor: {e}"))?;
-        let identity_refs: Vec<&dyn age::Identity> =
-            identities.iter().map(|i| i.as_ref()).collect();
-        if let Ok(mut reader) = decryptor.decrypt(identity_refs.into_iter()) {
-            let mut plaintext = Vec::new();
-            reader
-                .read_to_end(&mut plaintext)
-                .context("read age plaintext")?;
-            return Ok(plaintext);
-        }
-    }
-    Err(anyhow!(
-        "none of {} identity file(s) could decrypt the appkey vault",
-        identity_files.len()
-    ))
+    Ok(sdk.app_key().export())
 }
 
 #[cfg(test)]
@@ -293,63 +150,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vault_roundtrip_plaintext() {
-        let tmp = tempdir_path();
-        let vault = AppKeyVault::new(tmp.join("appkey.bin"), Vec::new(), Vec::new());
+    fn indexd_mnemonic_is_deterministic_and_secret() {
+        let seed_a = [7u8; 32];
+        let seed_b = [8u8; 32];
 
-        let key = AppKey::import([7u8; 32]);
-        vault.store(&key).unwrap();
-        let loaded = vault.load().unwrap().expect("must be present");
-        assert_eq!(loaded.export(), [7u8; 32]);
-
-        vault.clear().unwrap();
-        assert!(vault.load().unwrap().is_none());
-    }
-
-    #[test]
-    fn vault_roundtrip_age_encrypted() {
-        let tmp = tempdir_path();
-        let identity = age::x25519::Identity::generate();
-        let recipient = identity.to_public().to_string();
-        let identity_file = tmp.join("id.txt");
-        std::fs::write(&identity_file, identity.to_string().expose_secret()).unwrap();
-
-        let vault = AppKeyVault::new(
-            tmp.join("appkey.age"),
-            vec![AgeRecipient(recipient)],
-            vec![identity_file],
+        let a1 = derive_indexd_mnemonic(&seed_a);
+        let a2 = derive_indexd_mnemonic(&seed_a);
+        assert_eq!(a1, a2, "same secret must yield the same mnemonic");
+        assert_ne!(
+            a1,
+            derive_indexd_mnemonic(&seed_b),
+            "a different secret must yield a different mnemonic"
         );
 
-        let key = AppKey::import([13u8; 32]);
-        vault.store(&key).unwrap();
-        // The file should not be plaintext.
-        let raw = std::fs::read(vault.path()).unwrap();
-        assert!(raw.starts_with(AGE_V1_HEADER), "should be age-wrapped");
-        let loaded = vault.load().unwrap().expect("must decrypt");
-        assert_eq!(loaded.export(), [13u8; 32]);
-    }
+        // A valid 12-word BIP-39 phrase that round-trips through sia_core.
+        sia_core::seed::Seed::new(&a1).expect("derived phrase must be a valid BIP-39 mnemonic");
+        assert_eq!(a1.split_whitespace().count(), 12);
 
-    fn tempdir_path() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "s5-indexd-auth-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    /// `age::x25519::Identity::to_string` returns a
-    /// `secrecy::SecretString`; pull the inner string for test
-    /// I/O. Naming the trait inline keeps it within the test scope.
-    trait ExposeSecret {
-        fn expose_secret(&self) -> String;
-    }
-    impl ExposeSecret for age::secrecy::SecretString {
-        fn expose_secret(&self) -> String {
-            age::secrecy::ExposeSecret::<str>::expose_secret(self).to_string()
-        }
+        // The derived phrase must never be the trivial all-zeros BIP-39 seed:
+        // it is publicly known, so anyone could reconstruct the AppKey from it.
+        let zero_phrase = "abandon abandon abandon abandon abandon abandon \
+                           abandon abandon abandon abandon abandon about";
+        assert_ne!(a1, zero_phrase, "derived phrase must not be the all-zeros seed");
     }
 }
