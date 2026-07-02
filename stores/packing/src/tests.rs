@@ -111,7 +111,7 @@ async fn members_are_sorted_by_path_hash_in_pack() {
             (key, offset)
         })
         .collect();
-    keys_and_offsets.sort_by(|a, b| a.0.cmp(&b.0));
+    keys_and_offsets.sort_by_key(|&(key, _)| key);
     let offsets: Vec<u32> = keys_and_offsets.iter().map(|(_, o)| *o).collect();
     let mut sorted = offsets.clone();
     sorted.sort();

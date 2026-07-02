@@ -171,6 +171,9 @@ mod tests {
         // it is publicly known, so anyone could reconstruct the AppKey from it.
         let zero_phrase = "abandon abandon abandon abandon abandon abandon \
                            abandon abandon abandon abandon abandon about";
-        assert_ne!(a1, zero_phrase, "derived phrase must not be the all-zeros seed");
+        assert_ne!(
+            a1, zero_phrase,
+            "derived phrase must not be the all-zeros seed"
+        );
     }
 }
