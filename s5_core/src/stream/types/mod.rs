@@ -95,7 +95,9 @@ pub const MAX_VAULT_PAYLOAD_LEN: usize = u8::MAX as usize;
 /// (v3): `SIG = ed25519(SIG_DOMAIN_TAG_V3 || PUBKEY || VAULT_ID || REVISION || PAYLOAD)`.
 pub const SIG_DOMAIN_TAG_V3: &[u8] = b"s5-reg-v3:";
 
-/// A type alias for a 32-byte Ed25519 public key.
+/// A type alias for a 32-byte Ed25519 public key — used generically
+/// across identity (`Did`, the four-key signing/ACL keys) and registry
+/// (`StreamKey::Vault.pubkey`). Not tied to any particular usage.
 pub type PublicKeyEd25519 = [u8; KEY_SIZE];
 
 /// Represents the key for a stream or registry entry.
@@ -114,26 +116,19 @@ pub enum StreamKey {
     Local([u8; KEY_SIZE]),
 
     /// An Ed25519-signed registry entry scoped to a specific vault.
-    /// `pubkey` is the device's ed25519 transport key (reused across every
-    /// vault that device writes to); `vault_id` is the 16-byte per-vault
-    /// namespace tag derived from the vault root's `KEY_SLOT_RECOVERY`
-    /// slot (see `docs/reference/snapshot-publication.md` § Vault ID
-    /// derivation). Lookup is by the pair `(pubkey, vault_id)`.
-    /// Entries must be signed with the corresponding private key.
+    /// `pubkey` is the device's per-identity ed25519 **signing key** (one
+    /// of the four per-device keys in `docs/reference/identity-model.md`;
+    /// distinct from the iroh transport key); `vault_id` is the 16-byte
+    /// per-vault namespace tag derived from the vault root's
+    /// `KEY_SLOT_RECOVERY` slot (see `docs/reference/snapshot-publication.md`
+    /// § Vault ID derivation). Lookup is by the pair `(pubkey, vault_id)`.
+    /// Entries must be signed with the corresponding private signing key;
+    /// `StreamMessage::new` verifies the signature cryptographically (F01,
+    /// `docs/reference/acl-and-revocation.md §1`).
     Vault {
-        pubkey: PublicKeyEd25519,
+        pubkey: [u8; KEY_SIZE],
         vault_id: [u8; VAULT_ID_SIZE],
     },
-
-    /// A non-vault Ed25519-signed registry entry. Used by legacy
-    /// callers (s5_fs DirActor, the Flutter/WASM bindings) that pre-date
-    /// the per-vault namespace tag. Wire format keeps the v2 layout
-    /// (no LEN/PAYLOAD framing, raw 32-byte HASH field) so existing
-    /// data is read back unchanged.
-    ///
-    /// **Not for new code.** New ed25519-signed registry use should be
-    /// `Vault { pubkey, vault_id }`.
-    PublicKeyEd25519(PublicKeyEd25519),
 
     /// A 32-byte BLAKE3 hash, used for pin metadata.
     /// For this key type, larger inline payloads are allowed so that
@@ -192,8 +187,11 @@ pub struct StreamMessage {
     pub hash: Hash,
 
     /// The Ed25519 signature proving ownership of the key.
-    /// - For `StreamKey::Local`, this MUST be empty.
-    /// - For `StreamKey::PublicKeyEd25519`, this MUST be a valid 64-byte signature.
+    /// - For `StreamKey::Vault`, this MUST be a valid 64-byte signature
+    ///   over the canonical v3 signing input (verified by
+    ///   `StreamMessage::new`).
+    /// - For `StreamKey::Local` and `StreamKey::Blake3HashPin`, this
+    ///   MUST be empty.
     pub signature: Box<[u8]>,
 
     /// Optional inline data. If `Some`, contains the actual data (max 1024 bytes).
@@ -249,11 +247,6 @@ impl StreamKey {
     /// Identifier for the `Local` variant.
     pub const LOCAL_ID: u8 = 0x00;
 
-    /// Identifier for the `PublicKeyEd25519` variant — non-vault
-    /// ed25519-signed entry. Kept at the legacy v2 wire byte so existing
-    /// data round-trips.
-    pub const PUBLIC_KEY_ED25519_ID: u8 = 0x01;
-
     /// Identifier for the `Vault` variant — ed25519 vault entry. The `0xed`
     /// value is mnemonic for "ed25519".
     pub const VAULT_ID_KEYTYPE: u8 = 0xed;
@@ -272,12 +265,6 @@ impl StreamKey {
             StreamKey::Local(data) => {
                 let mut buf = Vec::with_capacity(1 + KEY_SIZE);
                 buf.push(Self::LOCAL_ID);
-                buf.extend_from_slice(data);
-                buf
-            }
-            StreamKey::PublicKeyEd25519(data) => {
-                let mut buf = Vec::with_capacity(1 + KEY_SIZE);
-                buf.push(Self::PUBLIC_KEY_ED25519_ID);
                 buf.extend_from_slice(data);
                 buf
             }
@@ -315,15 +302,6 @@ impl StreamKey {
                             actual: rest.len(),
                         })?;
                 Ok(StreamKey::Local(arr))
-            }
-            Self::PUBLIC_KEY_ED25519_ID => {
-                let arr: [u8; KEY_SIZE] =
-                    rest.try_into()
-                        .map_err(|_| StreamKeyDeserializeError::InvalidLength {
-                            expected: KEY_SIZE,
-                            actual: rest.len(),
-                        })?;
-                Ok(StreamKey::PublicKeyEd25519(arr))
             }
             Self::VAULT_ID_KEYTYPE => {
                 if rest.len() != KEY_SIZE + VAULT_ID_SIZE {
@@ -366,15 +344,6 @@ impl StreamKey {
                         })?;
                 Ok(StreamKey::Local(arr))
             }
-            Self::PUBLIC_KEY_ED25519_ID => {
-                let arr: [u8; KEY_SIZE] =
-                    data.try_into()
-                        .map_err(|_| StreamKeyDeserializeError::InvalidLength {
-                            expected: KEY_SIZE,
-                            actual: data.len(),
-                        })?;
-                Ok(StreamKey::PublicKeyEd25519(arr))
-            }
             Self::VAULT_ID_KEYTYPE => {
                 if data.len() != KEY_SIZE + VAULT_ID_SIZE {
                     return Err(StreamKeyDeserializeError::InvalidLength {
@@ -410,7 +379,6 @@ impl StreamKey {
     pub fn signature_len(&self) -> usize {
         match &self {
             Self::Local(_) => 0,
-            Self::PublicKeyEd25519(_) => SIGNATURE_SIZE,
             Self::Vault { .. } => SIGNATURE_SIZE,
             Self::Blake3HashPin(_) => 0,
         }
@@ -428,7 +396,6 @@ impl StreamKey {
     pub fn keytype_byte(&self) -> u8 {
         match self {
             StreamKey::Local(_) => Self::LOCAL_ID,
-            StreamKey::PublicKeyEd25519(_) => Self::PUBLIC_KEY_ED25519_ID,
             StreamKey::Vault { .. } => Self::VAULT_ID_KEYTYPE,
             StreamKey::Blake3HashPin(_) => Self::BLAKE3_HASH_PIN_ID,
         }
@@ -452,22 +419,22 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-/// Build the canonical signing input for a v3 vault registry entry and
-/// sign it. Returns the 64-byte ed25519 signature.
+/// Build the canonical signing input for a v3 vault registry entry.
 ///
-/// Signing input:
 /// `SIG_DOMAIN_TAG_V3 || pub_key(32) || vault_id(16) || revision(8 BE) || PAYLOAD`
 ///
 /// where `PAYLOAD = MULTIHASH_BLAKE3 (1) || hash(32) || data` — the
-/// exact same bytes that go on the wire after the LEN field.
-fn sign_vault_registry_payload(
-    signing_key: &SigningKey,
+/// exact same bytes that go on the wire after the LEN field. Shared by
+/// the signer (`sign_vault_registry_payload`) and the verifier
+/// (`verify_ed25519_signature` via `StreamMessage::new`), so both
+/// provably compute the same bytes.
+fn build_vault_registry_signing_input(
     pub_key: &[u8; KEY_SIZE],
     vault_id: &[u8; VAULT_ID_SIZE],
     revision: u64,
     hash: &[u8; HASH_SIZE],
     inline_data: &[u8],
-) -> [u8; SIGNATURE_SIZE] {
+) -> Vec<u8> {
     let mut sign_bytes = Vec::with_capacity(
         SIG_DOMAIN_TAG_V3.len() + KEY_SIZE + VAULT_ID_SIZE + 8 + 1 + HASH_SIZE + inline_data.len(),
     );
@@ -478,7 +445,42 @@ fn sign_vault_registry_payload(
     sign_bytes.push(MULTIHASH_BLAKE3);
     sign_bytes.extend_from_slice(hash);
     sign_bytes.extend_from_slice(inline_data);
+    sign_bytes
+}
+
+/// Sign the canonical v3 vault registry signing input. Thin wrapper
+/// around `build_vault_registry_signing_input` + `signing_key.sign`.
+fn sign_vault_registry_payload(
+    signing_key: &SigningKey,
+    pub_key: &[u8; KEY_SIZE],
+    vault_id: &[u8; VAULT_ID_SIZE],
+    revision: u64,
+    hash: &[u8; HASH_SIZE],
+    inline_data: &[u8],
+) -> [u8; SIGNATURE_SIZE] {
+    let sign_bytes =
+        build_vault_registry_signing_input(pub_key, vault_id, revision, hash, inline_data);
     signing_key.sign(&sign_bytes).to_bytes()
+}
+
+/// Verify an ed25519 signature over `signing_input` against `pub_key`.
+/// Used by `StreamMessage::new` to enforce cryptographic authenticity
+/// of v3 vault and legacy ed25519 registry entries (F01 — closes the
+/// length-only-validation hole, see `acl-and-revocation.md §1`).
+fn verify_ed25519_signature(
+    pub_key: &[u8; KEY_SIZE],
+    signature: &[u8],
+    signing_input: &[u8],
+) -> Result<(), StreamMessageError> {
+    let verifying_key =
+        VerifyingKey::from_bytes(pub_key).map_err(|_| StreamMessageError::InvalidSignature)?;
+    let sig_array: &[u8; SIGNATURE_SIZE] = signature
+        .try_into()
+        .map_err(|_| StreamMessageError::InvalidSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(sig_array);
+    verifying_key
+        .verify_strict(signing_input, &sig)
+        .map_err(|_| StreamMessageError::InvalidSignature)
 }
 
 impl StreamMessage {
@@ -490,8 +492,10 @@ impl StreamMessage {
     ///   inline data`) must fit in `MAX_VAULT_PAYLOAD_LEN` (255 B).
     /// - For non-vault keys with `enforce_inline_limit`, inline data
     ///   must not exceed `MAX_INLINE_DATA_SIZE` (1024 B).
-    ///
-    /// Note: This function does not perform cryptographic verification.
+    /// - For `StreamKey::Vault`, the signature is cryptographically
+    ///   verified against the embedded pubkey over the canonical
+    ///   v3 signing input (F01 — every receive path funnels through
+    ///   here, so this is the single chokepoint).
     pub fn new(
         type_id: MessageType,
         key: StreamKey,
@@ -514,6 +518,9 @@ impl StreamMessage {
             });
         }
 
+        // Structural payload-size checks first — cheap, key-shape-driven,
+        // and they bound the inline_data that F01 verification will sign
+        // over below.
         match &key {
             StreamKey::Vault { .. } => {
                 let data_len = data.as_ref().map_or(0, |d| d.len());
@@ -540,6 +547,28 @@ impl StreamMessage {
             }
         }
 
+        // F01: cryptographic verification. After the structural checks
+        // above we know the signature is present at the right length and
+        // the inline data fits the wire format; here we verify the
+        // signature under the embedded pubkey using the exact same
+        // builder the signer used, so signer/verifier bytes cannot drift.
+        match &key {
+            StreamKey::Vault { pubkey, vault_id } => {
+                let inline_data = data.as_deref().unwrap_or(&[]);
+                let sign_bytes = build_vault_registry_signing_input(
+                    pubkey,
+                    vault_id,
+                    revision,
+                    hash.as_bytes(),
+                    inline_data,
+                );
+                verify_ed25519_signature(pubkey, &signature, &sign_bytes)?;
+            }
+            StreamKey::Local(_) | StreamKey::Blake3HashPin(_) => {
+                // No signature path — already enforced above to be empty.
+            }
+        }
+
         Ok(Self {
             type_id,
             key,
@@ -548,44 +577,6 @@ impl StreamMessage {
             signature,
             data,
         })
-    }
-
-    /// Create a signed Ed25519 *non-vault* registry entry — for the
-    /// legacy s5_fs DirActor path that uses
-    /// [`StreamKey::PublicKeyEd25519`]. New code should use
-    /// [`Self::sign_ed25519_registry`] instead, which produces a v3
-    /// vault entry with `VAULT_ID` framing.
-    ///
-    /// Signing bytes (no domain tag — matches the pre-v3 layout for
-    /// data round-trip):
-    /// `[Registry(0x5c), 0x01 (PublicKeyEd25519), pub_key(32),
-    ///   revision(8 BE), 0x21 (Multihash Blake3), hash(32)]`
-    pub fn sign_ed25519_legacy(
-        signing_key: &SigningKey,
-        hash: Hash,
-        revision: u64,
-    ) -> Result<Self, StreamMessageError> {
-        let verifying_key: VerifyingKey = signing_key.into();
-        let pub_key_bytes = verifying_key.to_bytes();
-
-        let mut sign_bytes = Vec::with_capacity(1 + 1 + KEY_SIZE + 8 + 1 + HASH_SIZE);
-        sign_bytes.push(MessageType::Registry as u8);
-        sign_bytes.push(StreamKey::PUBLIC_KEY_ED25519_ID);
-        sign_bytes.extend_from_slice(&pub_key_bytes);
-        sign_bytes.extend_from_slice(&revision.to_be_bytes());
-        sign_bytes.push(MULTIHASH_BLAKE3);
-        sign_bytes.extend_from_slice(hash.as_bytes());
-
-        let signature = signing_key.sign(&sign_bytes);
-
-        Self::new(
-            MessageType::Registry,
-            StreamKey::PublicKeyEd25519(pub_key_bytes),
-            revision,
-            hash,
-            signature.to_bytes().to_vec().into_boxed_slice(),
-            None,
-        )
     }
 
     /// Create a signed Ed25519 vault registry entry (v3).
@@ -609,16 +600,36 @@ impl StreamMessage {
         hash: Hash,
         revision: u64,
     ) -> Result<Self, StreamMessageError> {
+        Self::sign_ed25519_registry_with_data(signing_key, vault_id, hash, revision, None)
+    }
+
+    /// Create a signed v3 vault registry entry with optional inline data.
+    ///
+    /// Identical to [`Self::sign_ed25519_registry`] except the inline
+    /// `data` (if any) is signed over alongside the hash — matching the
+    /// v3 wire format (PAYLOAD = `MULTIHASH_BLAKE3 || hash || data`) and
+    /// the verifier in [`Self::new`]. `data` must fit within
+    /// `MAX_VAULT_PAYLOAD_LEN - 1 - HASH_SIZE` bytes (the structural
+    /// check inside `new` enforces this and returns
+    /// `VaultPayloadTooLarge` if exceeded).
+    pub fn sign_ed25519_registry_with_data(
+        signing_key: &SigningKey,
+        vault_id: [u8; VAULT_ID_SIZE],
+        hash: Hash,
+        revision: u64,
+        data: Option<Bytes>,
+    ) -> Result<Self, StreamMessageError> {
         let verifying_key: VerifyingKey = signing_key.into();
         let pub_key_bytes = verifying_key.to_bytes();
 
+        let inline_data = data.as_deref().unwrap_or(&[]);
         let signature = sign_vault_registry_payload(
             signing_key,
             &pub_key_bytes,
             &vault_id,
             revision,
             hash.as_bytes(),
-            &[],
+            inline_data,
         );
 
         Self::new(
@@ -630,7 +641,7 @@ impl StreamMessage {
             revision,
             hash,
             signature.into(),
-            None,
+            data,
         )
     }
 
@@ -707,7 +718,6 @@ impl StreamMessage {
         buf.put_u8(self.key.keytype_byte());
         match &self.key {
             StreamKey::Local(data) => buf.put_slice(data),
-            StreamKey::PublicKeyEd25519(data) => buf.put_slice(data),
             StreamKey::Blake3HashPin(data) => buf.put_slice(data),
             StreamKey::Vault { .. } => unreachable!("dispatched via serialize_vault"),
         }

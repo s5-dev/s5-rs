@@ -67,7 +67,14 @@ impl BlobId {
 
     pub fn parse(str: &str) -> Result<Self, BlobIdError> {
         let (_, bytes) = multibase::decode(str)?;
+        Self::from_bytes(&bytes)
+    }
 
+    /// Decode a `BlobId` from its raw (un-multibased) byte form — the inverse
+    /// of [`to_bytes`](Self::to_bytes). `parse` is this preceded by a
+    /// multibase decode; callers that already hold the bytes (e.g. a BlobId
+    /// recovered from another binary field) use this directly.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlobIdError> {
         if bytes.len() < 35 {
             return Err(BlobIdError::InvalidLength(bytes.len()));
         }

@@ -201,15 +201,14 @@ mod tests {
         );
         assert_eq!(msg.unwrap_err(), StreamMessageError::SignatureRequired);
 
-        // Vault key with proper signature should succeed
-        let msg = StreamMessage::new(
-            MessageType::Registry,
-            vault_key(0),
-            1,
-            [0; HASH_SIZE].into(),
-            Box::new([0; SIGNATURE_SIZE]), // 64-byte signature
-            None,
-        );
+        // Vault key with a real signature should succeed. (F01 rejects
+        // any not-actually-verifying signature — see the dedicated
+        // `new_rejects_v3_vault_entry_with_*` tests below.)
+        use crate::Hash;
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[1u8; 32]);
+        let hash: Hash = [0u8; HASH_SIZE].into();
+        let msg = StreamMessage::sign_ed25519_registry(&signing, [0; VAULT_ID_SIZE], hash, 1);
         assert!(msg.is_ok());
 
         // Data too large should fail for Local keys
@@ -241,15 +240,19 @@ mod tests {
 
     #[test]
     fn test_message_serialization_roundtrip() {
-        let original = StreamMessage::new(
-            MessageType::Registry,
-            StreamKey::Vault {
-                pubkey: [42; KEY_SIZE],
-                vault_id: [0xCD; VAULT_ID_SIZE],
-            },
+        // F01: deserialize funnels through `new` which now verifies the
+        // signature, so the round-trip must start from a properly-signed
+        // message. Uses `sign_ed25519_registry_with_data` to cover the
+        // inline-data path.
+        use crate::Hash;
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let hash: Hash = [0xAB; HASH_SIZE].into();
+        let original = StreamMessage::sign_ed25519_registry_with_data(
+            &signing,
+            [0xCD; VAULT_ID_SIZE],
+            hash,
             0xDEADBEEF,
-            [0xAB; HASH_SIZE].into(),
-            Box::new([0xFF; SIGNATURE_SIZE]),
             Some(Bytes::from(vec![1, 2, 3, 4])),
         )
         .unwrap();
@@ -335,22 +338,28 @@ mod tests {
         // (or a dedicated "merge from peer" code path) rather than
         // `should_store` — which would correctly reject same-rev
         // overwrites coming from local code paths.
-        let node_a_msg = StreamMessage::new(
-            MessageType::Registry,
-            vault_key(1),
+        // Same signing key + vault_id ⇒ same `(pubkey, vault_id)` for both
+        // messages; the ordering/CAS behaviour we test is purely about
+        // `(revision, hash, data)`. F01 requires real sigs to construct.
+        use crate::Hash;
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[1u8; 32]);
+        let vault_id = [0u8; VAULT_ID_SIZE];
+        let hash_a: Hash = [0x00; HASH_SIZE].into();
+        let hash_b: Hash = [0xFF; HASH_SIZE].into();
+        let node_a_msg = StreamMessage::sign_ed25519_registry_with_data(
+            &signing,
+            vault_id,
+            hash_a,
             100,
-            [0x00; HASH_SIZE].into(),
-            Box::new([0xAA; SIGNATURE_SIZE]),
             Some(Bytes::from(b"Node A data".to_vec())),
         )
         .unwrap();
-
-        let node_b_msg = StreamMessage::new(
-            MessageType::Registry,
-            vault_key(1),
+        let node_b_msg = StreamMessage::sign_ed25519_registry_with_data(
+            &signing,
+            vault_id,
+            hash_b,
             100,
-            [0xFF; HASH_SIZE].into(),
-            Box::new([0xBB; SIGNATURE_SIZE]),
             Some(Bytes::from(b"Node B data".to_vec())),
         )
         .unwrap();
@@ -404,25 +413,24 @@ mod tests {
     /// hash-only payload (33 bytes → LEN = 0x21).
     #[test]
     fn vault_registry_wire_layout_matches_spec() {
+        use crate::Hash;
         use crate::stream::types::{
             MAX_VAULT_PAYLOAD_LEN, MULTIHASH_BLAKE3, SIG_DOMAIN_TAG_V3, VAULT_ID_SIZE,
         };
+        use ed25519_dalek::{SigningKey, VerifyingKey};
 
-        let pubkey = [0xAAu8; KEY_SIZE];
+        // Real signature now required (F01). The wire layout the test
+        // pins is independent of the sig bytes themselves — we assert
+        // position and length, not content.
+        let signing = SigningKey::from_bytes(&[0xAAu8; 32]);
+        let vk: VerifyingKey = (&signing).into();
+        let pubkey = vk.to_bytes();
         let vault_id = [0xBBu8; VAULT_ID_SIZE];
         let hash_bytes = [0xCCu8; HASH_SIZE];
-        let sig_bytes = [0xDDu8; SIGNATURE_SIZE];
+        let hash: Hash = hash_bytes.into();
         let revision: u64 = 0x0102_0304_0506_0708;
 
-        let msg = StreamMessage::new(
-            MessageType::Registry,
-            StreamKey::Vault { pubkey, vault_id },
-            revision,
-            hash_bytes.into(),
-            Box::new(sig_bytes),
-            None,
-        )
-        .unwrap();
+        let msg = StreamMessage::sign_ed25519_registry(&signing, vault_id, hash, revision).unwrap();
 
         let bytes = msg.serialize();
 
@@ -459,8 +467,14 @@ mod tests {
             &hash_bytes,
             "PAYLOAD hash[32]"
         );
+        // SIG occupies the final 64 bytes — assert position+length only;
+        // content is the real ed25519 sig, not test-supplied bytes.
         let sig_off = payload_off + 33;
-        assert_eq!(&bytes[sig_off..sig_off + SIGNATURE_SIZE], &sig_bytes, "SIG");
+        assert_eq!(
+            bytes[sig_off..].len(),
+            SIGNATURE_SIZE,
+            "SIG occupies the final SIGNATURE_SIZE bytes"
+        );
 
         // And the canonical signing-bytes layout (for SIG verification).
         let mut expected_sign = Vec::new();
@@ -478,18 +492,20 @@ mod tests {
     /// Round-trip a vault entry with inline data (LEN > 33).
     #[test]
     fn vault_registry_round_trip_with_inline_data() {
-        let pubkey = [0x11u8; KEY_SIZE];
+        use crate::Hash;
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&[0x11u8; 32]);
         let vault_id = [0x22u8; 16];
         let hash_bytes = [0x33u8; HASH_SIZE];
-        let sig_bytes = [0x44u8; SIGNATURE_SIZE];
+        let hash: Hash = hash_bytes.into();
         let inline = Bytes::from(vec![0x55u8; 64]);
 
-        let msg = StreamMessage::new(
-            MessageType::Registry,
-            StreamKey::Vault { pubkey, vault_id },
+        let msg = StreamMessage::sign_ed25519_registry_with_data(
+            &signing,
+            vault_id,
+            hash,
             7,
-            hash_bytes.into(),
-            Box::new(sig_bytes),
             Some(inline.clone()),
         )
         .unwrap();
@@ -549,5 +565,105 @@ mod tests {
 
         let err = StreamMessage::deserialize(Bytes::from(bytes)).unwrap_err();
         assert!(matches!(err, StreamMessageError::UnknownMultihashTag(0xff)));
+    }
+
+    // ---- F01: cryptographic signature verification ----
+    //
+    // The signing helper `sign_ed25519_registry` produces correctly-signed
+    // v3 vault messages; these tests assert that `new` REJECTS messages
+    // whose signature does not verify under the embedded pubkey. Closes
+    // the F01 hole where length-only validation made every downstream ACL
+    // decision hollow (`acl-and-revocation.md §1`).
+
+    #[test]
+    fn new_rejects_v3_vault_entry_with_tampered_signature() {
+        use crate::Hash;
+        use crate::stream::types::MessageType;
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let hash: Hash = [0x11u8; HASH_SIZE].into();
+        let vault_id = [0xAB; VAULT_ID_SIZE];
+
+        let signed = StreamMessage::sign_ed25519_registry(&signing, vault_id, hash, 1).unwrap();
+        let mut tampered = signed.signature.to_vec();
+        tampered[0] ^= 0x01; // flip one bit
+
+        let err = StreamMessage::new(
+            MessageType::Registry,
+            signed.key,
+            signed.revision,
+            signed.hash,
+            tampered.into_boxed_slice(),
+            signed.data.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(err, StreamMessageError::InvalidSignature);
+    }
+
+    #[test]
+    fn new_rejects_v3_vault_entry_with_pubkey_mismatch() {
+        use crate::Hash;
+        use crate::stream::types::MessageType;
+        use ed25519_dalek::{SigningKey, VerifyingKey};
+
+        let signer = SigningKey::from_bytes(&[1u8; 32]);
+        let other = SigningKey::from_bytes(&[2u8; 32]);
+        let hash: Hash = [0x22u8; HASH_SIZE].into();
+        let vault_id = [0xCD; VAULT_ID_SIZE];
+
+        // Real signature under `signer`, but present `other`'s pubkey on
+        // the vault key — verifier must reject (signing bytes embed pubkey
+        // AND verification runs against the presented key).
+        let signed = StreamMessage::sign_ed25519_registry(&signer, vault_id, hash, 1).unwrap();
+        let other_pk: VerifyingKey = (&other).into();
+        let wrong_key = StreamKey::Vault {
+            pubkey: other_pk.to_bytes(),
+            vault_id,
+        };
+
+        let err = StreamMessage::new(
+            MessageType::Registry,
+            wrong_key,
+            signed.revision,
+            signed.hash,
+            signed.signature.clone(),
+            signed.data.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(err, StreamMessageError::InvalidSignature);
+    }
+
+    #[test]
+    fn new_accepts_legitimately_signed_v3_vault_entry() {
+        use crate::Hash;
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let hash: Hash = [0x44u8; HASH_SIZE].into();
+        let vault_id = [0xEF; VAULT_ID_SIZE];
+        // Round-trip via the helper — signer self-check must succeed.
+        let msg = StreamMessage::sign_ed25519_registry(&signing, vault_id, hash, 7).unwrap();
+        assert_eq!(msg.revision, 7);
+        assert_eq!(msg.hash, hash);
+    }
+
+    #[test]
+    fn new_accepts_local_key_with_no_signature() {
+        use crate::Hash;
+        use crate::stream::types::MessageType;
+
+        // Local keys carry no signature; F01 verification must not touch
+        // them. Regression guard.
+        let hash: Hash = [0u8; HASH_SIZE].into();
+        let msg = StreamMessage::new(
+            MessageType::Stream,
+            StreamKey::Local([0; KEY_SIZE]),
+            1,
+            hash,
+            Box::new([]),
+            None,
+        );
+        assert!(msg.is_ok());
     }
 }

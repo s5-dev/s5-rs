@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use crate::{
     BlobId, Hash,
     blob::location::BlobLocation,
-    blob::{BlobsRead, BlobsWrite},
+    blob::{
+        BlobResult, BlobsDelete, BlobsList, BlobsRead, BlobsWrite, HashStream, ReachableStream,
+    },
     store::{Store, StoreFeatures, StoreResult},
 };
 
@@ -57,9 +59,23 @@ impl BlobStore {
     /// Create a `BlobStore` from an already-Arc'd `Store`, using it for
     /// both blob data and outboard data.
     pub fn from_arc(store: Arc<dyn Store>) -> Self {
+        Self::from_arc_with_outboard(store, true)
+    }
+
+    /// Create a `BlobStore` from an already-Arc'd `Store`, choosing at
+    /// runtime whether to also write Bao outboard data alongside blobs.
+    /// `with_outboard = false` is identical to [`Self::without_outboard`]
+    /// but takes the same already-shared Arc the caller is using for the
+    /// main store.
+    pub fn from_arc_with_outboard(store: Arc<dyn Store>, with_outboard: bool) -> Self {
+        let outboard_store = if with_outboard {
+            Some(store.clone())
+        } else {
+            None
+        };
         Self {
-            store: store.clone(),
-            outboard_store: Some(store),
+            store,
+            outboard_store,
         }
     }
 
@@ -136,6 +152,13 @@ impl BlobStore {
         read::size(&self.store, hash).await
     }
 
+    /// Last-modification time of the blob's backing object, if the store
+    /// tracks one (see [`Store::modified`]). `None` for stores without an
+    /// mtime notion. Used by the cold-store GC age gate.
+    pub async fn modified(&self, hash: Hash) -> StoreResult<Option<std::time::SystemTime>> {
+        self.store.modified(&self.blob_path_for_hash(hash)).await
+    }
+
     pub async fn contains(&self, hash: Hash) -> StoreResult<bool> {
         read::contains(&self.store, hash).await
     }
@@ -205,19 +228,18 @@ impl BlobStore {
         import::import_file(&self.store, &self.outboard_store, path, on_progress).await
     }
 
-    /// Returns all blob hashes currently stored under the `blob3/` prefix.
+    /// All blob hashes currently stored under the `blob3/` prefix, collected.
+    ///
+    /// Convenience over the streaming [`BlobsList::list_hashes`] for callers
+    /// that want the whole set in memory (tests, small stores, the
+    /// cold-recovery pack-hash list). Drains that one streaming walk — it is
+    /// not a second enumeration path.
     pub async fn list_hashes(&self) -> StoreResult<Vec<Hash>> {
-        let features = self.store.features();
+        let mut stream = <Self as BlobsList>::list_hashes(self).await?;
         let mut hashes = Vec::new();
-        let mut stream = self.store.list().await?;
-
         while let Some(item) = stream.next().await {
-            let path = item?;
-            if let Some(hash) = Self::hash_from_blob_path(&path, &features)? {
-                hashes.push(hash);
-            }
+            hashes.push(item?);
         }
-
         Ok(hashes)
     }
 
@@ -245,7 +267,8 @@ impl BlobsRead for BlobStore {
     }
 
     async fn blob_download(&self, hash: Hash) -> StoreResult<Bytes> {
-        self.read_as_bytes(hash, 0, None).await
+        let bytes = self.read_as_bytes(hash, 0, None).await?;
+        super::verify_bytes(hash, bytes)
     }
 
     async fn blob_download_slice(
@@ -254,11 +277,18 @@ impl BlobsRead for BlobStore {
         offset: u64,
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
-        self.read_as_bytes(hash, offset, max_len).await
+        let bytes = self.read_as_bytes(hash, offset, max_len).await?;
+        if offset == 0 && max_len.is_none() {
+            super::verify_bytes(hash, bytes)
+        } else {
+            Ok(bytes)
+        }
     }
 
     async fn blob_read(&self, hash: Hash) -> StoreResult<Box<dyn AsyncRead + Send + Unpin>> {
-        self.read_stream(hash).await
+        // Streamed full reads verify at EOF (BlobsRead contract).
+        let inner = self.read_stream(hash).await?;
+        Ok(Box::new(super::VerifyingReader::new(hash, inner)))
     }
 }
 
@@ -308,16 +338,71 @@ impl BlobsWrite for BlobStore {
     }
 }
 
+#[async_trait::async_trait]
+impl BlobsDelete for BlobStore {
+    async fn blob_delete(&self, hash: Hash) -> BlobResult<()> {
+        // `BlobStore::delete` is already idempotent for missing blobs at
+        // the `Store::delete` layer (LocalStore returns Ok on ENOENT);
+        // it also tries to remove the outboard sidecar if configured.
+        self.delete(hash).await
+    }
+
+    async fn blob_retain(&self, reachable: ReachableStream) -> BlobResult<()> {
+        let mut reach = std::collections::HashSet::new();
+        let mut stream = reachable;
+        while let Some(h) = futures::StreamExt::next(&mut stream).await {
+            reach.insert(h);
+        }
+
+        // Stream the full inventory rather than materializing it: we only need
+        // to hold the reachable set, deleting each unreachable hash as it
+        // arrives (the inventory can dwarf the reachable set at TiB scale).
+        let mut all = <Self as BlobsList>::list_hashes(self).await?;
+        while let Some(hash) = futures::StreamExt::next(&mut all).await {
+            let hash = hash?;
+            if !reach.contains(&hash) {
+                self.delete(hash).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobsList for BlobStore {
+    /// Walk the backing store's listing, decoding each `blob3/` path back to
+    /// its `Hash` and skipping non-blob entries (outboards, foreign paths)
+    /// lazily. This is the single enumeration path; the inherent
+    /// [`BlobStore::list_hashes`] just collects it.
+    async fn list_hashes(&self) -> BlobResult<HashStream> {
+        let features = self.store.features();
+        let inner = self.store.list().await?;
+        // `StoreFeatures` is `Copy`, so the closure captures it by value; the
+        // decode is synchronous, so `tokio_stream`'s sync `filter_map` fits.
+        let stream = inner.filter_map(move |item| match item {
+            Ok(path) => match Self::hash_from_blob_path(&path, &features) {
+                Ok(Some(hash)) => Some(Ok(hash)),
+                Ok(None) => None, // non-blob path (outboard / foreign): skip
+                Err(e) => Some(Err(anyhow::Error::from(e))),
+            },
+            Err(e) => Some(Err(anyhow::Error::from(e))),
+        });
+        let boxed: HashStream = Box::new(stream);
+        Ok(boxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::{io, sync::Mutex};
+    use std::{collections::HashMap, io, sync::Mutex};
 
     #[derive(Debug, Clone)]
     struct TestStore {
         features: StoreFeatures,
         entries: std::sync::Arc<Mutex<Vec<String>>>,
+        files: std::sync::Arc<Mutex<HashMap<String, Bytes>>>,
     }
 
     impl TestStore {
@@ -327,9 +412,14 @@ mod tests {
                 Self {
                     features,
                     entries: entries.clone(),
+                    files: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 },
                 entries,
             )
+        }
+
+        fn insert_bytes(&self, path: String, bytes: Bytes) {
+            self.files.lock().unwrap().insert(path, bytes);
         }
     }
 
@@ -352,7 +442,8 @@ mod tests {
         }
 
         async fn put_bytes(&self, _path: &str, _bytes: Bytes) -> StoreResult<()> {
-            unimplemented!("put_bytes not used in tests");
+            self.files.lock().unwrap().insert(_path.to_string(), _bytes);
+            Ok(())
         }
 
         async fn open_read_stream(
@@ -368,11 +459,20 @@ mod tests {
 
         async fn open_read_bytes(
             &self,
-            _path: &str,
-            _offset: u64,
-            _max_len: Option<u64>,
+            path: &str,
+            offset: u64,
+            max_len: Option<u64>,
         ) -> StoreResult<Bytes> {
-            unimplemented!("open_read_bytes not used in tests");
+            let files = self.files.lock().unwrap();
+            let bytes = files.get(path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no such key: {path}"))
+            })?;
+            let start = std::cmp::min(offset as usize, bytes.len());
+            let remaining = bytes.len() - start;
+            let len = max_len
+                .map(|max| std::cmp::min(max as usize, remaining))
+                .unwrap_or(remaining);
+            Ok(bytes.slice(start..start + len))
         }
 
         async fn size(&self, _path: &str) -> StoreResult<u64> {
@@ -436,6 +536,45 @@ mod tests {
         expected.sort();
 
         assert_eq!(hashes, expected);
+    }
+
+    #[tokio::test]
+    async fn blob_download_verifies_full_blob_hash() {
+        let features = StoreFeatures {
+            supports_rename: true,
+            case_sensitive: true,
+            recommended_max_dir_size: u64::MAX,
+            ..Default::default()
+        };
+        let (store, _) = TestStore::new(features);
+        let blob_store = BlobStore::without_outboard(store.clone());
+
+        let bytes = Bytes::from_static(b"clean");
+        let hash = Hash::new(&bytes);
+        store.insert_bytes(blob_store.blob_path_for_hash(hash), bytes.clone());
+
+        assert_eq!(blob_store.blob_download(hash).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn blob_download_rejects_wrong_bytes_under_hash() {
+        let features = StoreFeatures {
+            supports_rename: true,
+            case_sensitive: true,
+            recommended_max_dir_size: u64::MAX,
+            ..Default::default()
+        };
+        let (store, _) = TestStore::new(features);
+        let blob_store = BlobStore::without_outboard(store.clone());
+
+        let expected_hash = Hash::new(b"expected");
+        store.insert_bytes(
+            blob_store.blob_path_for_hash(expected_hash),
+            Bytes::from_static(b"corrupt"),
+        );
+
+        let err = blob_store.blob_download(expected_hash).await.unwrap_err();
+        assert!(err.to_string().contains("blob integrity check failed for"));
     }
 
     #[tokio::test]

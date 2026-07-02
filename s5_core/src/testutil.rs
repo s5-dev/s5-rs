@@ -43,7 +43,7 @@ pub struct StoreTests<'a, S> {
 impl<'a, S: Store> StoreTests<'a, S> {
     /// Create a new test suite for the given store.
     pub fn new(store: &'a S) -> Self {
-        let prefix = format!("_test_{}/", rand::rng().random::<u32>());
+        let prefix = format!("_test_{}/", rand::rng().next_u32());
         Self { store, prefix }
     }
 
@@ -305,7 +305,7 @@ impl<'a, S: Store> StoreTests<'a, S> {
 /// Generate random bytes for testing.
 pub fn random_bytes(len: usize) -> Bytes {
     let mut data = vec![0u8; len];
-    rand::rng().fill(&mut data[..]);
+    rand::rng().fill_bytes(&mut data[..]);
     Bytes::from(data)
 }
 
