@@ -121,6 +121,17 @@ impl WritableOverlay {
         std::mem::take(&mut *self.entries.write().expect("overlay lock poisoned"))
     }
 
+    /// Returns the pending diff as a standalone [`MapLayer`] (a CLONE of
+    /// the overlay's entries — the overlay is left intact). This is what
+    /// to pass `merge_and_persist` as `changes`: it scans as the sparse
+    /// diff ONLY, whereas passing the overlay (`&*self`) scans as base ∪
+    /// diff and defeats the merge's structural incremental path. Use
+    /// [`take`](Self::take) when the overlay is about to be discarded (no
+    /// clone); use this when it must survive the merge.
+    pub fn diff_layer(&self) -> crate::layer::MapLayer {
+        crate::layer::MapLayer::new(self.entries.read().expect("overlay lock poisoned").clone())
+    }
+
     /// Returns the base layer (an `Arc<dyn ReadableLayer>` clone). Held
     /// as `Arc` so callers that need to compose it (e.g. `WritableFs`'s
     /// `flush_overlay` passing it to `merge_and_persist`) don't have
@@ -153,8 +164,15 @@ impl WritableOverlay {
         store: &dyn BlobsWrite,
     ) -> anyhow::Result<Option<(Hash, [u8; 32], MergeStats)>> {
         let chunk_mask = self.base.chunk_mask().await;
+        // Pass the DIFF, not `self`. `WritableOverlay::scan` returns base ∪
+        // diff, so passing `self` here would make `merge_and_persist`
+        // collect the whole tree as "changes" and fall back to a full
+        // O(corpus) re-fold (the structural incremental path bails on a
+        // large change ratio). The diff-only layer keeps the merge
+        // incremental. See CUTOVER 2026-06-17 session 5.
+        let diff = self.diff_layer();
         self.pipeline
-            .merge_and_persist(self.base.as_ref(), chunk_mask, self, store)
+            .merge_and_persist(self.base.as_ref(), chunk_mask, &diff, store)
             .await
     }
 }

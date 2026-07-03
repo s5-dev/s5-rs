@@ -66,6 +66,12 @@ use crate::node::{BlobPipeline, CompressionStrategy, EncryptionStrategy};
 /// override this (code-heavy archives, cold-storage vaults with abundant
 /// CPU).
 pub(crate) const ZSTD_LEVEL: i32 = 1;
+// TODO(compression/upload-bound): revisit the level for slow/expensive backends.
+// L1 is tuned for local CPU + mixed data (see above), but when the UPLOAD is the
+// bottleneck (e.g. ~2.8 MB/s to Sia) a higher level trades cheap local CPU for
+// fewer bytes over the wire — often a net-faster snap. Consider a
+// backend-/content-adaptive level (higher for remote erasure-coded stores, L1
+// for local), set on the vault like the other pipeline defaults.
 
 // ---------------------------------------------------------------------------
 // KDF Constants
@@ -90,7 +96,18 @@ fn derive_blob_key(kdf_context: &str, master_secret: &[u8; 32], hash: &[u8; 32])
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(master_secret);
     input[32..].copy_from_slice(hash);
-    blake3::derive_key(kdf_context, &input)
+    s5_core::crypto::derive_secret(kdf_context, &input)
+}
+
+/// The per-blob ChaCha20 key a `DeterministicChaCha20` **leaf** uses:
+/// `derive_blob_key(KDF_LEAF, master, plaintext_hash)`.
+///
+/// The D21 `copy` mechanism ([`crate::copy`]) inlines *this* value (never
+/// the master) so a destination reader can decrypt a reused leaf ciphertext
+/// through `ExplicitKeyChaCha20` without ever learning the source master
+/// data key.
+pub(crate) fn leaf_blob_key(master: &[u8; 32], plaintext_hash: &[u8; 32]) -> [u8; 32] {
+    derive_blob_key(KDF_LEAF, master, plaintext_hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +169,15 @@ fn padded_len(len: usize, block_size: u32) -> usize {
 /// Applies ChaCha20 keystream to data (encrypt or decrypt — symmetric).
 ///
 /// Uses nonce = 0 because each blob has a unique derived key.
+//
+// TODO(privacy/opt-in max-privacy vault): nonce=0 + per-blob-derived-key is
+// DETERMINISTIC (convergent) — identical plaintext → identical ciphertext within
+// a vault, which is exactly what enables cross-device dedup. For a rare
+// high-sensitivity vault, offer a per-vault "max privacy" mode: a new
+// `EncryptionStrategy` variant with a random nonce, so equal plaintexts encrypt
+// differently (no equality leakage) at the cost of convergent dedup. Convergent
+// stays the default (right for backups); this is the escape hatch — "powerful
+// when needed".
 fn apply_chacha20(key: &[u8; 32], data: &mut [u8]) {
     use chacha20::ChaCha20;
     use chacha20::cipher::{KeyIvInit, StreamCipher};
@@ -185,9 +211,6 @@ pub(crate) struct PipelineEncodeResult {
 ///
 /// `keys` is the key map from `TraversalContext.keys`.
 ///
-/// `dictionary` is the raw decompressed content of the preceding D-chunk for
-/// `ZstdDictFromPrecedingEntry` compression (pass `None` for D-chunks and non-dict strategies).
-///
 /// The "skip compression when unhelpful" policy is read from
 /// `pipeline.skip_when_unhelpful` — when set, compression is skipped if
 /// the compressed+padded size is not smaller than the uncompressed+padded
@@ -199,7 +222,6 @@ pub(crate) fn pipeline_encode(
     plaintext_hash: &[u8; 32],
     kdf_context: &str,
     keys: Option<&BTreeMap<u8, [u8; 32]>>,
-    dictionary: Option<&[u8]>,
 ) -> anyhow::Result<PipelineEncodeResult> {
     let Some(pipeline) = pipeline else {
         // No pipeline = no transforms, pass through.
@@ -215,7 +237,7 @@ pub(crate) fn pipeline_encode(
     let skip_when_unhelpful = pipeline.skip_when_unhelpful.unwrap_or(false);
     let block_size = pipeline.padding.as_ref().map(|p| p.block_size).unwrap_or(1);
     let (compressed, compression_skipped) = {
-        let raw = compress_bytes(plaintext, &pipeline.compression, dictionary)?;
+        let raw = compress_bytes(plaintext, &pipeline.compression)?;
         if skip_when_unhelpful && !plaintext.is_empty() {
             // Compare padded sizes: only keep compression if it actually
             // reduces the stored (post-padding) size.
@@ -249,6 +271,17 @@ pub(crate) fn pipeline_encode(
             apply_chacha20(&key, &mut data);
             Bytes::from(data)
         }
+        Some((EncryptionStrategy::ExplicitKeyChaCha20, key_slot)) => {
+            // The slot's 32 bytes ARE the ChaCha20 key — no KDF, no
+            // plaintext_hash mixing (see [`crate::copy`]).
+            let keys = keys.ok_or_else(|| anyhow::anyhow!("encryption requested but no keys"))?;
+            let key = keys.get(key_slot).ok_or_else(|| {
+                anyhow::anyhow!("explicit key slot 0x{key_slot:02x} not found in key map")
+            })?;
+            let mut data = padded;
+            apply_chacha20(key, &mut data);
+            Bytes::from(data)
+        }
         Some((EncryptionStrategy::Plaintext, _)) | None => Bytes::from(padded),
     };
 
@@ -265,9 +298,6 @@ pub(crate) fn pipeline_encode(
 /// `plaintext_size` is used to truncate padding zeros before decompression.
 ///
 /// `kdf_context` differentiates leaf vs node encryption (e.g. `KDF_LEAF` or `KDF_META`).
-///
-/// `dictionary` is the raw decompressed content of the preceding D-chunk for
-/// `ZstdDictFromPrecedingEntry` decompression (pass `None` for D-chunks and non-dict strategies).
 pub(crate) fn pipeline_decode(
     stored: Bytes,
     pipeline: Option<&BlobPipeline>,
@@ -275,7 +305,6 @@ pub(crate) fn pipeline_decode(
     plaintext_size: u64,
     kdf_context: &str,
     keys: Option<&BTreeMap<u8, [u8; 32]>>,
-    dictionary: Option<&[u8]>,
 ) -> anyhow::Result<Bytes> {
     let Some(pipeline) = pipeline else {
         // No pipeline = no transforms, pass through.
@@ -294,6 +323,20 @@ pub(crate) fn pipeline_decode(
             let key = derive_blob_key(kdf_context, master_secret, plaintext_hash);
             let mut data = stored.to_vec();
             apply_chacha20(&key, &mut data);
+            data
+        }
+        Some((EncryptionStrategy::ExplicitKeyChaCha20, key_slot)) => {
+            // The slot's 32 bytes ARE the ChaCha20 key. Deliberately does
+            // NOT consult `plaintext_hash` (that is the whole point of the
+            // `copy` inline: the dest reader has no source master to KDF
+            // from). Integrity is still checked one layer up in
+            // `export_leaf` via `blake3(plaintext) == plaintext_hash`.
+            let keys = keys.ok_or_else(|| anyhow::anyhow!("decryption requested but no keys"))?;
+            let key = keys.get(key_slot).ok_or_else(|| {
+                anyhow::anyhow!("explicit key slot 0x{key_slot:02x} not found in key map")
+            })?;
+            let mut data = stored.to_vec();
+            apply_chacha20(key, &mut data);
             data
         }
         Some((EncryptionStrategy::Plaintext, _)) | None => stored.to_vec(),
@@ -336,7 +379,7 @@ pub(crate) fn pipeline_decode(
                 }
             }
         }
-        Some(compression) => decompress_bytes_raw(&decrypted, compression, dictionary)?,
+        Some(compression) => decompress_bytes_raw(&decrypted, compression)?,
         None => {
             // No compression — truncate to plaintext_size to remove padding.
             if plaintext_size == 0 {
@@ -362,15 +405,13 @@ pub(crate) fn pipeline_decode(
 /// Decompresses bytes using the given compression strategy.
 ///
 /// Internal: works on raw byte slices (after decrypt, potentially with trailing padding).
-/// `dictionary` is the raw decompressed content of the preceding D-chunk, if applicable.
-fn decompress_bytes_raw(
-    bytes: &[u8],
-    compression: &CompressionStrategy,
-    dictionary: Option<&[u8]>,
-) -> anyhow::Result<Bytes> {
+fn decompress_bytes_raw(bytes: &[u8], compression: &CompressionStrategy) -> anyhow::Result<Bytes> {
     match compression {
         CompressionStrategy::Uncompressed => Ok(Bytes::copy_from_slice(bytes)),
-        CompressionStrategy::Zstd => {
+        // `Zstd` and `ZstdLevel { .. }` decode identically — zstd's
+        // decoder reads compression metadata from the frame header, so
+        // the encoder-side level is not needed at decode time.
+        CompressionStrategy::Zstd | CompressionStrategy::ZstdLevel { .. } => {
             // Use streaming Decoder in single_frame mode: reads exactly one
             // zstd frame and stops. Without single_frame(), read_to_end
             // tries to concatenate multiple frames and chokes on trailing
@@ -385,30 +426,13 @@ fn decompress_bytes_raw(
                 .map_err(|e| anyhow::anyhow!("zstd decompression failed: {e}"))?;
             Ok(Bytes::from(decoded))
         }
-        CompressionStrategy::ZstdDictFromPrecedingEntry { .. } => {
-            let dict = dictionary.unwrap_or(&[]);
-            // Use streaming decoder with prepared dictionary — handles trailing
-            // zero padding correctly via single_frame mode.
-            use std::io::Read;
-            let dict = zstd::dict::DecoderDictionary::copy(dict);
-            let mut decoder = zstd::Decoder::with_prepared_dictionary(bytes, &dict)
-                .map_err(|e| anyhow::anyhow!("zstd dict decoder init failed: {e}"))?
-                .single_frame();
-            let mut decoded = Vec::new();
-            decoder
-                .read_to_end(&mut decoded)
-                .map_err(|e| anyhow::anyhow!("zstd dict decompression failed: {e}"))?;
-            Ok(Bytes::from(decoded))
-        }
     }
 }
 
 /// Compresses bytes using the given compression strategy.
-/// `dictionary` is the raw decompressed content of the preceding D-chunk, if applicable.
 pub(crate) fn compress_bytes(
     bytes: &[u8],
     compression: &Option<CompressionStrategy>,
-    dictionary: Option<&[u8]>,
 ) -> anyhow::Result<Bytes> {
     match compression {
         Some(CompressionStrategy::Uncompressed) | None => Ok(Bytes::copy_from_slice(bytes)),
@@ -417,13 +441,9 @@ pub(crate) fn compress_bytes(
                 .map_err(|e| anyhow::anyhow!("zstd compression failed: {e}"))?;
             Ok(Bytes::from(encoded))
         }
-        Some(CompressionStrategy::ZstdDictFromPrecedingEntry { .. }) => {
-            let dict = dictionary.unwrap_or(&[]);
-            let mut compressor = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, dict)
-                .map_err(|e| anyhow::anyhow!("zstd dict compressor init failed: {e}"))?;
-            let encoded = compressor
-                .compress(bytes)
-                .map_err(|e| anyhow::anyhow!("zstd dict compression failed: {e}"))?;
+        Some(CompressionStrategy::ZstdLevel { level }) => {
+            let encoded = zstd::encode_all(bytes, *level as i32)
+                .map_err(|e| anyhow::anyhow!("zstd compression failed at level {level}: {e}"))?;
             Ok(Bytes::from(encoded))
         }
     }
@@ -444,7 +464,7 @@ mod tests {
 
         let pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
-            padding: Some(PaddingStrategy { block_size: 1024 }),
+            padding: Some(PaddingStrategy { block_size: 4096 }),
             encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
             skip_when_unhelpful: None,
         };
@@ -456,11 +476,10 @@ mod tests {
             &plaintext_hash,
             KDF_META,
             Some(&keys),
-            None,
         )
         .unwrap();
 
-        assert_eq!(result.bytes.len(), 1024);
+        assert_eq!(result.bytes.len(), 4096);
 
         // Decode
         let decoded = pipeline_decode(
@@ -470,132 +489,132 @@ mod tests {
             0, // plaintext_size=0, relying on zstd single_frame
             KDF_META,
             Some(&keys),
-            None,
         )
         .unwrap();
 
         assert_eq!(&decoded[..], plaintext);
     }
 
+    /// `ZstdLevel { level }` round-trips, AND a higher level produces a
+    /// smaller blob than the default level (sanity check that the level
+    /// is actually getting passed to the encoder, not silently ignored).
     #[test]
-    fn pipeline_round_trip_dict_compression() {
-        let master_secret = [42u8; 32];
-        let mut keys = BTreeMap::new();
-        keys.insert(0x0eu8, master_secret);
+    fn zstd_level_round_trips_and_compresses_better_at_high_level() {
+        // Compressible payload — repeating patterns large enough that
+        // L9 has room to find more structure than L1 does.
+        let plaintext: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        let plaintext_hash: [u8; 32] = *blake3::hash(&plaintext).as_bytes();
 
-        let pipeline = BlobPipeline {
-            compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
-            padding: Some(PaddingStrategy { block_size: 1024 }),
-            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+        let pipe_default = BlobPipeline {
+            compression: Some(CompressionStrategy::Zstd),
+            padding: None,
+            encryption: None,
+            skip_when_unhelpful: None,
+        };
+        let pipe_level9 = BlobPipeline {
+            compression: Some(CompressionStrategy::ZstdLevel { level: 9 }),
+            padding: None,
+            encryption: None,
             skip_when_unhelpful: None,
         };
 
-        // Simulate a D-chunk (dictionary source) — compressed without dictionary.
-        let dict_data = b"this is the dictionary chunk with some repeated patterns and structures for testing dictionary compression";
-        let dict_hash: [u8; 32] = *blake3::hash(dict_data).as_bytes();
-
-        let dict_result = pipeline_encode(
-            dict_data,
-            Some(&pipeline),
-            &dict_hash,
+        let r_default = pipeline_encode(
+            &plaintext,
+            Some(&pipe_default),
+            &plaintext_hash,
             KDF_LEAF,
-            Some(&keys),
-            None, // D-chunk: no dictionary
-        )
-        .unwrap();
-
-        // Decode the D-chunk (no dictionary).
-        let dict_decoded = pipeline_decode(
-            dict_result.bytes,
-            Some(&pipeline),
-            Some(&dict_hash),
-            0,
-            KDF_LEAF,
-            Some(&keys),
             None,
         )
         .unwrap();
-        assert_eq!(&dict_decoded[..], dict_data);
-
-        // Now encode a dependent chunk using the D-chunk as dictionary.
-        let dep_data = b"this is the dependent chunk with some repeated patterns and structures for testing dictionary compression but slightly different";
-        let dep_hash: [u8; 32] = *blake3::hash(dep_data).as_bytes();
-
-        let dep_result = pipeline_encode(
-            dep_data,
-            Some(&pipeline),
-            &dep_hash,
+        let r_level9 = pipeline_encode(
+            &plaintext,
+            Some(&pipe_level9),
+            &plaintext_hash,
             KDF_LEAF,
-            Some(&keys),
-            Some(dict_data.as_slice()), // use D-chunk as dictionary
-        )
-        .unwrap();
-
-        // Decode the dependent chunk WITH the dictionary.
-        let dep_decoded = pipeline_decode(
-            dep_result.bytes,
-            Some(&pipeline),
-            Some(&dep_hash),
-            0,
-            KDF_LEAF,
-            Some(&keys),
-            Some(dict_data.as_slice()),
-        )
-        .unwrap();
-        assert_eq!(&dep_decoded[..], dep_data);
-
-        // Verify that dict-compressed data is smaller than without dictionary
-        // (for similar content this should hold).
-        let nodict_result = pipeline_encode(
-            dep_data,
-            Some(&pipeline),
-            &dep_hash,
-            KDF_LEAF,
-            Some(&keys),
             None,
         )
         .unwrap();
-        // Both should round to same padding block, but compressed size should differ.
-        // At minimum, both should decode correctly.
-        assert!(dep_result.stored_blocks > 0);
-        assert!(nodict_result.stored_blocks > 0);
+
+        // Level 9 should be at least as compact as the default (L1).
+        assert!(
+            r_level9.bytes.len() <= r_default.bytes.len(),
+            "L9 produced {} bytes, default produced {} — level isn't reaching the encoder",
+            r_level9.bytes.len(),
+            r_default.bytes.len(),
+        );
+
+        // Round-trip: decoder is level-agnostic, so both pipelines decode
+        // each other's bytes.
+        let decoded = pipeline_decode(
+            r_level9.bytes,
+            Some(&pipe_level9),
+            Some(&plaintext_hash),
+            0,
+            KDF_LEAF,
+            None,
+        )
+        .unwrap();
+        assert_eq!(&decoded[..], &plaintext[..]);
     }
 
-    /// Test that D-chunk (no dictionary) encode/decode round-trips correctly
-    /// with the ZstdDictFromPrecedingEntry strategy.
+    /// The `copy` invariant: a leaf encoded with `DeterministicChaCha20`
+    /// (key derived from `master ‖ plaintext_hash`) decodes to byte-identical
+    /// plaintext when the SAME ciphertext is re-read with
+    /// `ExplicitKeyChaCha20` + the recovered per-blob key in the slot — WITHOUT
+    /// touching `plaintext_hash`. That equality is exactly what lets a shallow
+    /// copy re-home ciphertext into a foreign vault whose master differs.
     #[test]
-    fn pipeline_d_chunk_no_dict_round_trip() {
-        let master_secret = [42u8; 32];
-        let mut keys = BTreeMap::new();
-        keys.insert(0x0eu8, master_secret);
+    fn explicit_key_round_trips() {
+        let plaintext = b"the quick brown fox jumps over the lazy dog, repeatedly. ".repeat(9);
+        let plaintext_hash: [u8; 32] = *blake3::hash(&plaintext).as_bytes();
+        let master = [0x5au8; 32];
 
-        let pipeline = BlobPipeline {
-            compression: Some(CompressionStrategy::ZstdDictFromPrecedingEntry { mask: 0x07 }),
-            padding: Some(PaddingStrategy { block_size: 1024 }),
-            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x0e)),
+        // Encode exactly as the source vault would (KDF_LEAF, slot 0x10).
+        let mut src_keys = BTreeMap::new();
+        src_keys.insert(0x10u8, master);
+        let src_pipe = BlobPipeline {
+            compression: Some(CompressionStrategy::Zstd),
+            padding: Some(PaddingStrategy { block_size: 4096 }),
+            encryption: Some((EncryptionStrategy::DeterministicChaCha20, 0x10)),
             skip_when_unhelpful: None,
         };
-
-        // Simulate a large-ish chunk (like real file data).
-        let data: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
-        let hash: [u8; 32] = *blake3::hash(&data).as_bytes();
-
-        // Encode as D-chunk (no dictionary).
-        let result =
-            pipeline_encode(&data, Some(&pipeline), &hash, KDF_LEAF, Some(&keys), None).unwrap();
-
-        // Decode as D-chunk (no dictionary).
-        let decoded = pipeline_decode(
-            result.bytes,
-            Some(&pipeline),
-            Some(&hash),
-            0,
+        let enc = pipeline_encode(
+            &plaintext,
+            Some(&src_pipe),
+            &plaintext_hash,
             KDF_LEAF,
-            Some(&keys),
-            None,
+            Some(&src_keys),
         )
         .unwrap();
+        let ciphertext = enc.bytes.clone();
 
-        assert_eq!(&decoded[..], &data[..], "D-chunk round-trip failed");
+        // Recover the per-blob key the way `copy` does, and decode the SAME
+        // ciphertext with ExplicitKeyChaCha20 into slot 0x13 — no master.
+        let per_blob_key = leaf_blob_key(&master, &plaintext_hash);
+        let mut dst_keys = BTreeMap::new();
+        dst_keys.insert(0x13u8, per_blob_key);
+        let dst_pipe = BlobPipeline {
+            compression: Some(CompressionStrategy::Zstd),
+            padding: Some(PaddingStrategy { block_size: 4096 }),
+            encryption: Some((EncryptionStrategy::ExplicitKeyChaCha20, 0x13)),
+            skip_when_unhelpful: None,
+        };
+        // Note: pass plaintext_hash = None to prove the explicit path never
+        // consults it (a `None` here would make the DeterministicChaCha20 path
+        // error out — the explicit path must not care).
+        let decoded = pipeline_decode(
+            ciphertext,
+            Some(&dst_pipe),
+            None,
+            plaintext.len() as u64,
+            KDF_LEAF,
+            Some(&dst_keys),
+        )
+        .unwrap();
+        assert_eq!(
+            &decoded[..],
+            &plaintext[..],
+            "explicit-key reuse must be byte-identical"
+        );
     }
 }

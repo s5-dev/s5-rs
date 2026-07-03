@@ -325,6 +325,7 @@ mod tests {
             keys: Some(keys),
             leaf: Some(leaf_pipeline),
             node: Some(node_pipeline),
+            chunking: None,
         };
         let snapshot = Snapshot::empty(Arc::clone(&read_store), ctx);
         let result = backup(
@@ -440,6 +441,7 @@ mod tests {
             keys: Some(keys),
             leaf: Some(leaf_pipeline),
             node: Some(node_pipeline),
+            chunking: None,
         };
         let make_snap = async |src: &std::path::Path| -> anyhow::Result<Snapshot> {
             let snap = Snapshot::empty(Arc::clone(&read_store), ctx.clone());

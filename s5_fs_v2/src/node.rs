@@ -729,6 +729,24 @@ pub struct TraversalContext {
     /// Pipeline for node blobs (serialized `Node` metadata).
     #[n(2)]
     pub node: Option<BlobPipeline>,
+
+    /// Strategy for splitting a file stream into leaf-blob chunks.
+    /// `None` = inherit from parent / fall back to default (Xet CDC).
+    /// Set to `Some(FileChunkingStrategy::Fixed { chunk_size: N })` for
+    /// fixed-size slicing — cheap, predictable, no rolling-hash cost,
+    /// every file > N bytes becomes ⌈size / N⌉ blobs (last is the
+    /// remainder; no padding to N). Set to
+    /// `Some(FileChunkingStrategy::None)` for whole-file-as-one-blob
+    /// (equivalent to `Fixed { chunk_size: u32::MAX }`).
+    //
+    // TODO(design): this is a file-structure policy (leaf boundaries) — a
+    // different axis from the per-blob `leaf`/`node` encoding pipelines, and
+    // spent at the file-import boundary rather than persisting per blob. Hence a
+    // flat sibling, not part of `leaf` (a `LeafConfig { chunking, pipeline }`
+    // would falsely couple the two axes). Revisit a clearer `file`-scoped
+    // framing/name before this is depended on widely.
+    #[n(3)]
+    pub chunking: Option<FileChunkingStrategy>,
 }
 
 /// Processing pipeline for a single blob type.
@@ -849,6 +867,24 @@ pub enum EncryptionStrategy {
     /// `blake3(plaintext) == ContentRef.plaintext_hash` (local).
     #[n(0x01)]
     DeterministicChaCha20,
+
+    /// ChaCha20 keyed by an **inlined explicit key** (nonce = 0). The 32
+    /// bytes in the referenced key slot ARE the ChaCha20 key directly —
+    /// NO KDF, no `plaintext_hash` mixing.
+    ///
+    /// This is the D21 `copy` mechanism (see [`crate::copy`]). A shallow
+    /// copy re-homes a source leaf's ciphertext verbatim and inlines the
+    /// source's *per-blob* key (`derive_blob_key(KDF_LEAF, src_master,
+    /// plaintext_hash)`) — NOT the source master — into the entry's
+    /// `child_context.keys` under
+    /// [`KEY_SLOT_EXPLICIT_LEAF`](crate::snapshot::KEY_SLOT_EXPLICIT_LEAF).
+    /// The destination reader then reproduces the identical keystream from
+    /// that one slot without ever learning the source master data key.
+    /// Integrity is still enforced one layer up by the
+    /// `blake3(plaintext) == plaintext_hash` check in
+    /// [`Pipeline::export_leaf`](crate::pipeline::Pipeline::export_leaf).
+    #[n(0x02)]
+    ExplicitKeyChaCha20,
 }
 
 /// Compression strategy for data storage.
@@ -866,26 +902,33 @@ pub enum CompressionStrategy {
     #[n(0x01)]
     Zstd,
 
-    /// Zstd using a preceding entry as dictionary.
+    // Tag `0x02` is permanently RESERVED — formerly
+    // `ZstdDictFromPrecedingEntry` (zstd dictionary / "D-chunk"
+    // chaining). The strategy was purged (almost never won its
+    // complexity; see git history). Never reuse `0x02`: a legacy node
+    // carrying it must decode to a clean `Err` (verified by
+    // `node::dchunk_purge_guard`), not mis-map onto a new variant.
+    /// Zstd at an explicit compression level.
     ///
-    /// The dictionary is the decompressed content of the nearest preceding
-    /// entry in the same leaf node whose compression strategy is *not*
-    /// `ZstdDictFromPrecedingEntry`.
+    /// Use [`CompressionStrategy::Zstd`] for "default level" — this
+    /// variant exists so per-pipeline overrides can tune the level
+    /// (e.g. `level: 9` for highly-redundant logs where the
+    /// L1 → L9 ratio bump is worth the extra encode CPU).
     ///
-    /// The `mask` controls D-chunk selection: an entry becomes a D-chunk
-    /// (overriding to `Zstd`) when `plaintext_hash[0] & mask == 0`.
-    /// The first entry of any file is always a D-chunk.
-    /// For example, `mask = 0x3F` yields ~1/64 D-chunks.
+    /// `level` follows the standard zstd convention: 1–22 for normal
+    /// compression, negative values for fast mode (`zstd --fast=N`).
+    /// Decoder is level-agnostic — the level is only consulted at
+    /// encode time and is recorded here purely so writers know what to
+    /// pass `zstd::encode_all`.
     ///
-    /// Writers inherit this strategy and check each chunk's plaintext hash
-    /// against the mask to decide whether to override to `Zstd`.
-    /// Readers scan backwards for the dictionary — no build context needed.
-    #[n(0x02)]
-    ZstdDictFromPrecedingEntry {
-        /// Bitmask for D-chunk selection.
-        /// Entry is a D-chunk when `plaintext_hash[0] & mask == 0`.
+    /// Back-compat: added at a fresh minicbor tag (`0x03`); existing
+    /// vaults whose entries carry the unit `Zstd` variant decode
+    /// unchanged.
+    #[n(0x03)]
+    ZstdLevel {
+        /// Compression level passed verbatim to the zstd encoder.
         #[n(0)]
-        mask: u8,
+        level: i8,
     },
 }
 
@@ -896,7 +939,7 @@ pub enum CompressionStrategy {
 /// size is `ContentRef.stored_blocks * block_size`.
 ///
 /// A `block_size` of 1 means no padding (exact byte count).
-/// A `block_size` of 1024 pads to 1KiB boundaries (default).
+/// A `block_size` of 4096 pads to 4KiB boundaries (default).
 /// A `block_size` of 4096 pads to 4KiB boundaries.
 ///
 /// Uses `Option<PaddingStrategy>` in [`BlobPipeline`] where `None`
@@ -924,13 +967,18 @@ pub enum MetaChunkingStrategy {
 }
 
 /// File chunking strategy for serialization.
-// TODO the default (and only supported option for now) should be https://huggingface.co/docs/xet/chunking
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, Default)]
+///
+/// The default is **Gearhash CDC (Huggingface Xet spec)** — content-defined
+/// ~64 KiB chunks bounded to `[8 KiB, 128 KiB]` (see [`crate::chunking`]). It is
+/// set *explicitly* on every vault at creation, next to the encryption config
+/// (see `snapshot::encrypted_split_context`), rather than left to an implicit
+/// fallback. `Fixed`/`None` are deliberate opt-outs for blobs that are
+/// content-addressed at the file level (append-only logs, immutable segments).
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq)]
 #[cbor(map)]
 pub enum FileChunkingStrategy {
     /// No chunking - store as single blob.
     #[n(0x00)]
-    #[default]
     None,
 
     /// Strictly fixed-size blocks (e.g., 4MB chunks).
@@ -941,14 +989,24 @@ pub enum FileChunkingStrategy {
         chunk_size: u32,
     },
 
-    /// Content-Defined Chunking for Byte Streams.
+    /// Content-Defined Chunking (Gearhash / Xet spec) — the default (see
+    /// [`FileChunkingStrategy::default`]).
     #[n(0x02)]
     DataCdc {
-        // TODO ofc. we should also have a min. size before chunking maybe? how about 64k?
-        /// CDC parameters.
+        /// CDC parameters. Defaults to the Xet spec constants; the current
+        /// [`crate::chunking::XetChunker`] always applies those constants (the
+        /// only [`CdcAlgorithm`]), so the params are descriptive metadata today.
         #[n(0)]
         params: DataCdcParams,
     },
+}
+
+impl Default for FileChunkingStrategy {
+    fn default() -> Self {
+        Self::DataCdc {
+            params: DataCdcParams::default(),
+        }
+    }
 }
 
 /// Parameters for Content-Defined Chunking.
@@ -973,10 +1031,78 @@ pub struct DataCdcParams {
 }
 
 /// Algorithm for Content-Defined Chunking.
-#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq)]
+#[derive(Encode, Decode, CborLen, Clone, Debug, PartialEq, Eq, Default)]
 #[cbor(index_only)]
 pub enum CdcAlgorithm {
     /// Gearhash: Xet chunking specification using Gear hash.
     #[n(0x00)]
+    #[default]
     Gearhash,
+}
+
+impl Default for DataCdcParams {
+    /// The canonical Huggingface Xet spec constants (see [`crate::chunking`]):
+    /// Gearhash, 8 KiB min / 64 KiB target / 128 KiB max.
+    fn default() -> Self {
+        Self {
+            algorithm: CdcAlgorithm::Gearhash,
+            min_size: crate::chunking::MIN_CHUNK_SIZE as u32,
+            avg_size: crate::chunking::TARGET_CHUNK_SIZE as u32,
+            max_size: crate::chunking::MAX_CHUNK_SIZE as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod dchunk_purge_guard {
+    //! Pre-purge verification. Removing the `#[n(0x02)]`
+    //! `ZstdDictFromPrecedingEntry` variant must yield a clean `Decode`
+    //! error for any legacy tag-0x02 node — never a panic or a mis-map
+    //! to another variant. This guard proves that holds *before* the
+    //! deletion lands, deciding the commit shape (pure delete + reserved
+    //! tag vs. an explicit skip-variant). Post-purge, the second test
+    //! flips to assert the captured legacy bytes now decode to `Err`.
+    use super::CompressionStrategy;
+
+    /// minicbor `#[cbor(map)]` enums encode a variant as `{ tag => … }`.
+    /// A tag absent from `CompressionStrategy` exercises the exact
+    /// unknown-discriminant path that removing `0x02` will trigger.
+    #[derive(minicbor::Encode)]
+    #[cbor(map)]
+    enum ForeignTag {
+        #[n(0x42)]
+        Ghost {
+            #[n(0)]
+            mask: u8,
+        },
+    }
+
+    #[test]
+    fn unknown_variant_tag_decodes_to_clean_err() {
+        let bytes = minicbor::to_vec(ForeignTag::Ghost { mask: 0x07 }).unwrap();
+        let decoded: Result<CompressionStrategy, _> = minicbor::decode(&bytes);
+        assert!(
+            decoded.is_err(),
+            "unknown #[cbor(map)] variant tag must Decode to Err (got {decoded:?}); \
+             pure purge + reserved tag 0x02 is safe only if this holds"
+        );
+    }
+
+    /// RED while the variant exists; GREEN once purged. Pins the exact
+    /// legacy wire form (captured from minicbor pre-purge:
+    /// `ZstdDictFromPrecedingEntry { mask: 0x07 }` →
+    /// CBOR `[array(2): tag 0x02, {0: 7}]`) and asserts a legacy
+    /// tag-0x02 node decodes to a clean `Err` — the reserved-tag
+    /// guarantee. No constructor reference, so it keeps compiling after
+    /// the variant is gone.
+    #[test]
+    fn legacy_0x02_node_decodes_to_err() {
+        const LEGACY_DCHUNK_0X02: &[u8] = &[130, 2, 161, 0, 7];
+        let decoded: Result<CompressionStrategy, _> = minicbor::decode(LEGACY_DCHUNK_0X02);
+        assert!(
+            decoded.is_err(),
+            "reserved tag 0x02 (formerly ZstdDictFromPrecedingEntry) must \
+             decode to Err post-purge, got {decoded:?}"
+        );
+    }
 }

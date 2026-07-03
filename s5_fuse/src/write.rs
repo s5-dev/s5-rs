@@ -221,7 +221,7 @@ impl WritableFs {
         let mut entry = self
             .overlay
             .pipeline()
-            .import_bytes(&bytes, &self.store, None, None)
+            .import_bytes(&bytes, &self.store, None)
             .await
             .map_err(|err| {
                 warn!(path, error = %err, "import_bytes failed");
@@ -743,6 +743,7 @@ mod tests {
             keys: Some(keys),
             leaf: Some(leaf_pipeline),
             node: Some(node_pipeline),
+            chunking: None,
         };
         let read_store: Arc<dyn s5_core::BlobsRead> = Arc::new(store.clone());
         let snapshot = Snapshot::empty(read_store, ctx);

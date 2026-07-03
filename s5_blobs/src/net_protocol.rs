@@ -1,3 +1,26 @@
+// TODO(step 3b-2): replace `PeerConfigBlobs`-based authorisation with a
+// `BlobAcl` trait + `Option<Arc<dyn BlobAcl>>` field on `BlobsServer`,
+// modelled on the `RegistryAcl` shape just added to `s5_registry`.
+// Hook the trait at `handle_query` and `handle_download` (dropping the
+// `cfg_for(node_key)` check entirely — that path is dead in the
+// current daemon, where `peer_cfg` is always empty, so iroh-direct
+// blob fetches silently deny today).
+//
+// `s5_node::membership::MembershipBlobAcl` becomes the impl: peer in
+// some vault V where `hash[..16] ∈ V.reachable_chunks` → allow.
+// `Snapshot::collect_reachable_chunks` (s5_fs_v2) is the per-vault
+// builder; publish.rs needs a hook to call it after a successful snap
+// and write into the shared `MembershipState`.
+//
+// Architecture inspiration: iroh-blobs upstream (0.93+) `EventSender`
+// + `EventMask` + `RequestMode::Intercept` pattern — daemon
+// subscribes to a per-request channel, replies `Ok(())` or
+// `Err(AbortReason::Permission)`. Same shape, dyn-trait flavour for
+// us so the ACL is a per-server field, not a separate task.
+//
+// Step 3a (transport-level peer ACL via iroh 0.98 `EndpointHooks`) is
+// already in place upstream of this file in `s5_node::membership`.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,10 +33,128 @@ use s5_core::{Hash, blob::BlobStore};
 
 use crate::config::PeerConfigBlobs;
 use crate::rpc::{
-    DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse, RpcMessage, RpcProto, UploadBlob,
+    AuthChallengeResponse, AuthProve, DeleteBlob, DownloadBlob, PinBlob, Query, QueryResponse,
+    RpcMessage, RpcProto, UploadBlob,
 };
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64k
+
+/// Domain separator for the F02 binding-derivation step. Used with
+/// `blake3::derive_key` so the binding is cryptographically separated
+/// from any other use of blake3 in the system.
+pub(crate) const F02_BINDING_DOMAIN: &str = "s5-blobs-acl-v1-binding";
+
+/// Prefix for the ed25519 signature input on `AuthProve`. The full
+/// signed message is `F02_SIG_PREFIX || binding` where `binding` is the
+/// 32-byte blake3 derive of (nonce || client_iroh || server_iroh).
+pub(crate) const F02_SIG_PREFIX: &[u8] = b"s5-blobs-acl-v1-auth:";
+
+/// Compute the F02 channel-binding value. Both client and server
+/// independently compute this from the server-issued `nonce` and the
+/// two QUIC-authenticated transport pubkeys; mismatch on any input
+/// (e.g. a replay onto a different connection) produces a different
+/// binding and the signature won't verify.
+pub(crate) fn f02_binding(
+    nonce: &[u8; 32],
+    client_iroh_pubkey: &[u8; 32],
+    server_iroh_pubkey: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(F02_BINDING_DOMAIN);
+    h.update(nonce);
+    h.update(client_iroh_pubkey);
+    h.update(server_iroh_pubkey);
+    *h.finalize().as_bytes()
+}
+
+/// Bytes to sign / verify in `AuthProve`: the domain-tagged binding.
+pub(crate) fn f02_signed_message(binding: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(F02_SIG_PREFIX.len() + 32);
+    out.extend_from_slice(F02_SIG_PREFIX);
+    out.extend_from_slice(binding);
+    out
+}
+
+/// Which ALPN this server instance is bound to. Selects accept-loop
+/// behaviour (challenge required vs not) and which `BlobAcl` method
+/// gates reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMode {
+    /// Public ALPN (`ALPN_PUBLIC`). No challenge; serves only blobs
+    /// approved by `BlobAcl::allow_public_read`.
+    Public,
+    /// ACL ALPN (`ALPN_ACL`). F02 challenge required before any other
+    /// request; serves blobs approved by `BlobAcl::allow_acl_read`.
+    Acl,
+}
+
+/// Principal identifying *who* is making a read request, post-handshake.
+/// Used internally to dispatch the right `BlobAcl` method.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Principal {
+    /// No authentication performed (public ALPN). Reads gated by
+    /// `BlobAcl::allow_public_read(hash)`.
+    Public,
+    /// F02-challenge-bound ACL pubkey (ACL ALPN). Reads gated by
+    /// `BlobAcl::allow_acl_read(principal, hash)`.
+    AclPubkey([u8; 32]),
+}
+
+/// Per-request authorisation hook for blob queries / downloads.
+///
+/// Mirrors the design in `docs/reference/architecture-directions.md
+/// § Bandwidth economy`: two orthogonal trait methods, one per ALPN.
+/// The opaque principal bytes are deliberately small and untyped at
+/// this layer — the higher-level daemon decides what the bytes mean
+/// (today: device ACL pubkey; future: macaroon ID, blind-token hash).
+#[async_trait::async_trait]
+pub trait BlobAcl: Send + Sync + 'static + std::fmt::Debug {
+    /// Authorise a read of `hash` on the **public** ALPN — no
+    /// connection-bound principal exists (the public ALPN skips the
+    /// F02 challenge). Returns true iff the hash belongs to the
+    /// node's published-public set (e.g. identity bundles,
+    /// `public_blob_hashes`). Default denies — operators must
+    /// explicitly tag blobs as public to serve them anonymously.
+    async fn allow_public_read(&self, _hash: &Hash) -> bool {
+        false
+    }
+
+    /// Authorise a read of `hash` on the **ACL** ALPN given the
+    /// F02-challenge-bound principal (the device's ed25519 ACL/read
+    /// pubkey). Default denies — the daemon's MembershipBlobAcl impl
+    /// is the only thing that authorises ACL reads in production.
+    async fn allow_acl_read(&self, _principal: &[u8; 32], _hash: &Hash) -> bool {
+        false
+    }
+
+    /// Check during the F02 challenge handshake whether `principal` is
+    /// a recognised ACL pubkey at all — i.e. whether it appears in
+    /// `authorized_acl_pubkeys` for *any* served vault. Used to reject
+    /// unknown principals early, before they get to mint a connection
+    /// they can't use anyway. Default denies.
+    async fn allow_acl_principal(&self, _principal: &[u8; 32]) -> bool {
+        false
+    }
+}
+
+/// `BlobAcl` impl that approves every read on both ALPNs and accepts
+/// every principal. Use for intentionally world-readable vaults
+/// (in-DC compute pulling from a single-writer indexer; public mirrors;
+/// archival reads) where membership-based ACLs aren't the right gate.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PermitAllBlobAcl;
+
+#[async_trait::async_trait]
+impl BlobAcl for PermitAllBlobAcl {
+    async fn allow_public_read(&self, _hash: &Hash) -> bool {
+        true
+    }
+    async fn allow_acl_read(&self, _p: &[u8; 32], _hash: &Hash) -> bool {
+        true
+    }
+    async fn allow_acl_principal(&self, _p: &[u8; 32]) -> bool {
+        true
+    }
+}
 
 #[derive(Clone)]
 pub struct BlobsServer {
@@ -24,11 +165,30 @@ pub struct BlobsServer {
     // Keyed by stringified remote id (Display or Debug form).
     // The map may also contain a special "*" wildcard entry which
     // is used when no exact peer id match is found.
+    //
+    // TODO(post step 3b-2): drop entirely once all in-tree callers
+    // (and tests) migrate to the membership-based `BlobAcl` shape.
     peer_cfg: Arc<HashMap<String, PeerConfigBlobs>>, // per-peer ACLs
+    /// Per-request blob ACL hook. When `Some`, this takes precedence
+    /// over `peer_cfg`: the daemon's own membership-aware ACL decides
+    /// whether to serve, and approved requests search across ALL
+    /// configured stores + read-only sources (membership doesn't
+    /// carry per-store granularity).
+    acl: Option<Arc<dyn BlobAcl>>,
     /// Optional pinning backend used to enforce that uploads,
     /// downloads and deletes are scoped to the calling node
     /// (`PinContext::NodeId`).
     pinner: Option<Arc<dyn Pins>>,
+    /// This server's own iroh transport pubkey. Used as the
+    /// server-side input to the F02 channel binding so the binding is
+    /// asymmetric and unique per (client, server) pair. Set at
+    /// construction time; cheap to clone in the per-connection accept
+    /// loop.
+    local_iroh_pubkey: [u8; 32],
+    /// ALPN mode this server instance is bound to. Selects whether the
+    /// accept loop requires the F02 challenge handshake (`Acl`) or
+    /// runs anonymously over `public_blob_hashes` only (`Public`).
+    mode: ServerMode,
 }
 
 impl std::fmt::Debug for BlobsServer {
@@ -55,7 +215,10 @@ impl BlobsServer {
             stores: Arc::new(stores),
             read_sources: Arc::new(HashMap::new()),
             peer_cfg: Arc::new(peer_cfg),
+            acl: None,
             pinner,
+            local_iroh_pubkey: [0u8; 32],
+            mode: ServerMode::Acl,
         }
     }
 
@@ -73,8 +236,34 @@ impl BlobsServer {
             stores: Arc::new(stores),
             read_sources: Arc::new(read_sources),
             peer_cfg: Arc::new(peer_cfg),
+            acl: None,
             pinner,
+            local_iroh_pubkey: [0u8; 32],
+            mode: ServerMode::Acl,
         }
+    }
+
+    /// Builder: bind this server instance to a specific ALPN mode
+    /// (`Public` skips F02 challenge; `Acl` requires it).
+    pub fn with_mode(mut self, mode: ServerMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Builder: set this node's iroh transport pubkey for use in the
+    /// F02 channel-binding hash. Required when `mode = Acl`; for
+    /// `Public` mode the value is unused.
+    pub fn with_local_iroh_pubkey(mut self, pubkey: [u8; 32]) -> Self {
+        self.local_iroh_pubkey = pubkey;
+        self
+    }
+
+    /// Attach a per-request ACL hook. Once set, all reads are gated
+    /// by `acl.allow_read(peer, hash)` and the legacy `peer_cfg` path
+    /// is bypassed. Builder-style: pass-through self for chaining.
+    pub fn with_acl(mut self, acl: Arc<dyn BlobAcl>) -> Self {
+        self.acl = Some(acl);
+        self
     }
 
     fn cfg_for(&self, node_key: &str) -> Option<&PeerConfigBlobs> {
@@ -83,6 +272,99 @@ impl BlobsServer {
         self.peer_cfg
             .get(node_key)
             .or_else(|| self.peer_cfg.get("*"))
+    }
+
+    /// Server-side verification of an `AuthProve` message. Returns the
+    /// bound ACL pubkey on success, or an error string describing why
+    /// the proof was rejected.
+    ///
+    /// Checks, in order:
+    /// 1. A prior `AuthChallenge` exists (no challenge → no proof).
+    /// 2. The ed25519 signature verifies under `acl_pubkey` over
+    ///    `F02_SIG_PREFIX || binding`, where `binding` is computed from
+    ///    `(nonce, client_iroh_pubkey, server_iroh_pubkey)`.
+    /// 3. `acl_pubkey ∈` some served vault's `authorized_acl_pubkeys`
+    ///    (via `BlobAcl::allow_acl_principal`).
+    ///
+    /// The channel binding (step 2) is what stops cross-connection
+    /// replay: a sig minted under nonce N₁ + client A's iroh pubkey
+    /// will not verify under nonce N₂ or under a different client iroh
+    /// pubkey, even with the same `acl_pubkey`.
+    async fn verify_auth_prove(
+        &self,
+        pending_nonce: Option<[u8; 32]>,
+        client_iroh_pubkey: &[u8; 32],
+        proof: AuthProve,
+    ) -> Result<[u8; 32], String> {
+        let Some(nonce) = pending_nonce else {
+            return Err("AuthProve without prior AuthChallenge".to_string());
+        };
+        let binding = f02_binding(&nonce, client_iroh_pubkey, &self.local_iroh_pubkey);
+        let signed = f02_signed_message(&binding);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&proof.acl_pubkey)
+            .map_err(|e| format!("bad acl_pubkey: {e}"))?;
+        let sig = ed25519_dalek::Signature::from_bytes(&proof.sig_bytes());
+        vk.verify_strict(&signed, &sig)
+            .map_err(|e| format!("F02 signature verify failed: {e}"))?;
+        if let Some(acl) = self.acl.as_ref()
+            && !acl.allow_acl_principal(&proof.acl_pubkey).await
+        {
+            return Err("acl_pubkey not in any served vault's acl_keys".to_string());
+        }
+        Ok(proof.acl_pubkey)
+    }
+
+    /// Decide which store/source names to search for a read request.
+    ///
+    /// When an `acl` is configured, the daemon's membership-aware
+    /// hook gates the request; if approved, the search covers ALL
+    /// configured stores and read-only sources (membership-based ACL
+    /// has no per-store granularity — that's a deliberate property,
+    /// see the architectural rationale in `s5_node::membership` and
+    /// `docs/reference/iroh-inspirations.md`).
+    ///
+    /// The store-membership choice (vs a per-snapshot reachable-set)
+    /// is what preserves access to older snapshots: a peer who
+    /// retained an old snapshot's root hash can still fetch its blobs
+    /// from the vault's store, because the blobs are still there even
+    /// if not reachable from the *current* snapshot. The constraint
+    /// is "do not mix vault meta blobs with unrelated risky data in
+    /// the same store" — vault stores are scoped per-vault by
+    /// convention.
+    ///
+    /// When no ACL is set, falls back to the legacy `peer_cfg`
+    /// readable-stores list (preserves existing test setups).
+    /// `None` return = denied.
+    async fn resolve_readable_names(
+        &self,
+        node_key: &str,
+        principal: &Principal,
+        hash: &Hash,
+    ) -> Option<Vec<String>> {
+        if let Some(acl) = self.acl.as_ref() {
+            let approved = match principal {
+                Principal::Public => acl.allow_public_read(hash).await,
+                Principal::AclPubkey(pk) => acl.allow_acl_read(pk, hash).await,
+            };
+            if !approved {
+                return None;
+            }
+            return Some(
+                self.stores
+                    .keys()
+                    .chain(self.read_sources.keys())
+                    .cloned()
+                    .collect(),
+            );
+        }
+        // Legacy path: peer_cfg-based per-peer readable_stores. Used
+        // by deployments and tests that haven't migrated to the
+        // membership-based `BlobAcl` shape. Works regardless of
+        // principal — the lookup is by `node_key` (stringified
+        // transport pubkey), not by ACL principal.
+        let _ = principal;
+        self.cfg_for(node_key)
+            .map(|cfg| cfg.readable_stores.clone())
     }
 }
 
@@ -94,16 +376,84 @@ impl ProtocolHandler for BlobsServer {
 
         tracing::info!(
             peer = %node_id.fmt_short(),
+            mode = ?self.mode,
             "blobs: accepted connection"
         );
+
+        // F02 connection state (ACL ALPN only):
+        //   pending_nonce: the nonce we issued via AuthChallenge,
+        //     awaiting an AuthProve. Consumed on first AuthProve.
+        //   bound_acl_pubkey: the ACL pubkey the client proved
+        //     possession of. Set on successful AuthProve; required for
+        //     all subsequent read/write requests.
+        let mut pending_nonce: Option<[u8; 32]> = None;
+        let mut bound_acl_pubkey: Option<[u8; 32]> = None;
 
         let mut request_count = 0u64;
         while let Some(msg) = read_request::<RpcProto>(&conn).await? {
             request_count += 1;
+            // Compute the current principal from connection state.
+            let principal: Principal = match self.mode {
+                ServerMode::Public => Principal::Public,
+                ServerMode::Acl => match bound_acl_pubkey {
+                    Some(pk) => Principal::AclPubkey(pk),
+                    // Pre-authentication: only Auth* messages are
+                    // permitted. All other handler branches below
+                    // check `bound_acl_pubkey` and reject with
+                    // "authentication required".
+                    None => Principal::AclPubkey([0u8; 32]),
+                },
+            };
+
             match msg {
+                RpcMessage::AuthChallenge(msg) => {
+                    let irpc::WithChannels { inner: _, tx, .. } = msg;
+                    if self.mode != ServerMode::Acl {
+                        // Public ALPN doesn't run the challenge. Reply
+                        // with a zero nonce; clients that mistakenly
+                        // dial the public ALPN with an Authenticate
+                        // flow will fail on AuthProve.
+                        let _ = tx.send(AuthChallengeResponse { nonce: [0u8; 32] }).await;
+                        continue;
+                    }
+                    use rand::Rng;
+                    let mut nonce = [0u8; 32];
+                    rand::rng().fill_bytes(&mut nonce);
+                    pending_nonce = Some(nonce);
+                    let _ = tx.send(AuthChallengeResponse { nonce }).await;
+                }
+                RpcMessage::AuthProve(msg) => {
+                    let irpc::WithChannels { inner, tx, .. } = msg;
+                    if self.mode != ServerMode::Acl {
+                        let _ = tx.send(Err("AuthProve on public ALPN".to_string())).await;
+                        continue;
+                    }
+                    let result = self
+                        .verify_auth_prove(pending_nonce.take(), &node_id_bytes, inner)
+                        .await;
+                    if let Ok(pk) = result {
+                        bound_acl_pubkey = Some(pk);
+                        let _ = tx.send(Ok(())).await;
+                    } else {
+                        let _ = tx.send(Err(result.unwrap_err())).await;
+                    }
+                }
+                _ if self.mode == ServerMode::Acl && bound_acl_pubkey.is_none() => {
+                    // Reject any non-Auth request on the ACL ALPN
+                    // before authentication. The bi-stream send paths
+                    // differ per RPC variant — best-effort log + drop.
+                    tracing::warn!(
+                        peer = %node_id.fmt_short(),
+                        "blobs: rejecting pre-auth request on ACL ALPN"
+                    );
+                    // Drop the message; the channel close signals the
+                    // client that the request will not be served.
+                    drop(msg);
+                }
                 RpcMessage::Query(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_query(self, &node_key, inner, tx).await;
+                    let _ =
+                        handle_query(self, &node_key, &principal, node_id_bytes, inner, tx).await;
                 }
                 RpcMessage::UploadBlob(msg) => {
                     let irpc::WithChannels { inner, rx, tx, .. } = msg;
@@ -111,7 +461,8 @@ impl ProtocolHandler for BlobsServer {
                 }
                 RpcMessage::DownloadBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
-                    let _ = handle_download(self, &node_key, node_id_bytes, inner, tx).await;
+                    let _ = handle_download(self, &node_key, &principal, node_id_bytes, inner, tx)
+                        .await;
                 }
                 RpcMessage::DeleteBlob(msg) => {
                     let irpc::WithChannels { inner, tx, .. } = msg;
@@ -184,45 +535,59 @@ async fn handle_pin(
 async fn handle_query(
     server: &BlobsServer,
     node_key: &str,
+    principal: &Principal,
+    _node_id_bytes: [u8; 32],
     query: Query,
     tx: irpc::channel::oneshot::Sender<QueryResponse>,
 ) {
     // TODO: If/when target_types is added, support additional targets (e.g. Obao6) in queries/answers.
     let mut resp = QueryResponse::default();
 
-    if let Some(cfg) = server.cfg_for(node_key) {
-        if query.blinded {
-            // Blinded query: hash field contains blake3(actual_hash)
-            // We need to find a blob where blake3(blob_hash) == query.hash
-            // Note: blinded queries only work on full BlobStores (need list_hashes)
-            let blinded_hash = query.hash;
-
+    if query.blinded {
+        // Blinded queries probe by `blake3(actual_hash)` — used by the
+        // opt-in cross-vault public CAS (architecture-directions §
+        // "Cross-vault dedup via shared CAS"). The membership ACL is
+        // hash-keyed, so it can't pre-authorise the unknown actual
+        // hash; for now, blinded queries fall through to the legacy
+        // `peer_cfg` path only. When `acl` is set, blinded queries
+        // are denied (return an empty response).
+        // TODO(step 3b followup): once public-CAS is wired, add a
+        // `BlobAcl::allow_blinded` hook returning the search-store
+        // list for that peer.
+        if server.acl.is_some() {
+            let _ = tx.send(resp).await;
+            return;
+        }
+        let blinded_hash = query.hash;
+        if let Some(cfg) = server.cfg_for(node_key) {
             for name in &cfg.readable_stores {
-                if let Some(store) = server.stores.get(name) {
-                    // Try to find matching blob by checking blinded hashes
-                    if let Some(actual_hash) = find_blob_by_blinded_hash(store, blinded_hash).await
+                if let Some(store) = server.stores.get(name)
+                    && let Some(actual_hash) = find_blob_by_blinded_hash(store, blinded_hash).await
+                {
+                    resp.exists = true;
+                    resp.actual_hash = Some(*actual_hash.as_bytes());
+
+                    if resp.size.is_none()
+                        && let Ok(sz) = store.size(actual_hash).await
                     {
-                        resp.exists = true;
-                        resp.actual_hash = Some(*actual_hash.as_bytes());
-
-                        if resp.size.is_none()
-                            && let Ok(sz) = store.size(actual_hash).await
-                        {
-                            resp.size = Some(sz);
-                        }
-
-                        if let Ok(mut locs) = store.provide(actual_hash).await {
-                            resp.locations.append(&mut locs);
-                        }
-                        break; // Found it
+                        resp.size = Some(sz);
                     }
+
+                    if let Ok(mut locs) = store.provide(actual_hash).await {
+                        resp.locations.append(&mut locs);
+                    }
+                    break; // Found it
                 }
             }
-        } else {
-            // Normal query: hash field is the actual hash
-            let hash: Hash = query.hash.into();
-
-            for name in &cfg.readable_stores {
+        }
+    } else {
+        // Normal query: hash field is the actual hash
+        let hash: Hash = query.hash.into();
+        if let Some(names) = server
+            .resolve_readable_names(node_key, principal, &hash)
+            .await
+        {
+            for name in &names {
                 // Check full stores first (they can provide locations)
                 if let Some(store) = server.stores.get(name)
                     && let Ok(true) = store.contains(hash).await
@@ -342,6 +707,7 @@ async fn handle_upload(
 async fn handle_download(
     server: &BlobsServer,
     node_key: &str,
+    principal: &Principal,
     node_id_bytes: [u8; 32],
     req: DownloadBlob,
     tx: irpc::channel::mpsc::Sender<bytes::Bytes>,
@@ -355,11 +721,14 @@ async fn handle_download(
         "handle_download: request received"
     );
 
-    let Some(cfg) = server.cfg_for(node_key) else {
+    let Some(names) = server
+        .resolve_readable_names(node_key, principal, &hash)
+        .await
+    else {
         tracing::warn!(
             peer = node_key,
             hash = hash_short,
-            "download denied: no peer config"
+            "download denied: ACL or peer_cfg refused"
         );
         return;
     };
@@ -370,7 +739,7 @@ async fn handle_download(
     let mut from_read_source = false;
     let mut source_name: Option<String> = None;
 
-    for name in &cfg.readable_stores {
+    for name in &names {
         // Check full stores first
         if let Some(store) = server.stores.get(name) {
             match store.contains(hash).await {
@@ -418,11 +787,15 @@ async fn handle_download(
         }
     }
 
-    // Pin check: only required for blobs from regular stores.
-    // Read sources are explicitly published data — any peer configured
-    // to read them should be able to download without pinning.
+    // Pin check: only required for blobs from regular stores under
+    // the legacy `peer_cfg` path. The membership-aware ACL path
+    // (when `server.acl` is set) is strictly stronger than pin —
+    // peer is in a vault, no need to additionally require a per-node
+    // pin for vault content.
     if !from_read_source
-        && !cfg.skip_pin_check
+        && server.acl.is_none()
+        && let Some(legacy_cfg) = server.cfg_for(node_key)
+        && !legacy_cfg.skip_pin_check
         && let Some(pinner) = &server.pinner
     {
         let is_pinned = pinner
@@ -444,7 +817,7 @@ async fn handle_download(
         tracing::info!(
             peer = node_key,
             hash = hash_short,
-            readable_stores = ?cfg.readable_stores,
+            readable_stores = ?names,
             num_stores = server.stores.len(),
             num_read_sources = server.read_sources.len(),
             "download: blob not found in any readable store"

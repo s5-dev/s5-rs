@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::{Endpoint, endpoint::presets};
-use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
+use s5_blobs::{ALPN_PUBLIC as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, ServerMode};
 use s5_core::blob::BlobsRead;
 use s5_store_local::LocalStore;
 use s5_store_local_links::LocalLinksStore;
@@ -57,7 +57,8 @@ async fn workflow_local_links_serve() -> Result<()> {
     };
     peer_cfg.insert("*".to_string(), acl);
 
-    let blobs_server = BlobsServer::with_read_sources(stores, read_sources, peer_cfg, None);
+    let blobs_server = BlobsServer::with_read_sources(stores, read_sources, peer_cfg, None)
+        .with_mode(ServerMode::Public);
 
     let router = iroh::protocol::Router::builder(server_endpoint.clone())
         .accept(BLOBS_ALPN, blobs_server)
@@ -65,7 +66,11 @@ async fn workflow_local_links_serve() -> Result<()> {
 
     // 3. Setup client and connect to server
     let client_endpoint = Endpoint::builder(presets::N0).bind().await?;
-    let client = s5_blobs::Client::connect(client_endpoint.clone(), server_endpoint.addr());
+    let client = s5_blobs::Client::connect_with_addr(
+        client_endpoint.clone(),
+        server_endpoint.addr(),
+        BLOBS_ALPN,
+    );
 
     // 4. Client queries for the linked file
     let query_result = client.query(blob_id.hash, BTreeSet::new()).await?;

@@ -16,4 +16,5 @@ irpc.workspace = true
 irpc-iroh.workspace = true
 s5_core.workspace = true
 serde.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true

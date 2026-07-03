@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
+use ed25519_dalek::Signer;
 use iroh::Endpoint;
 use irpc::Client as IrpcClient;
 use irpc_iroh::IrohLazyRemoteConnection;
@@ -30,13 +31,142 @@ pub struct Client {
 
 impl Client {
     // TODO: Add high-level "fetch" that queries a set of peers, aggregates QueryResponse.locations, and chooses best source.
-    pub const ALPN: &'static [u8] = crate::rpc::ALPN;
+    pub const ALPN_PUBLIC: &'static [u8] = crate::rpc::ALPN_PUBLIC;
+    pub const ALPN_ACL: &'static [u8] = crate::rpc::ALPN_ACL;
 
-    pub fn connect(endpoint: Endpoint, addr: impl Into<iroh::EndpointAddr>) -> Self {
-        let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), Self::ALPN.to_vec());
+    /// Open a connection on the given ALPN without any handshake.
+    /// Exposed `pub` so test code can drive the F02 challenge by hand
+    /// (verifying replay-rejection etc.). Production code uses
+    /// [`Self::connect_to_peer_public`] or
+    /// [`Self::connect_to_peer_acl`].
+    pub fn connect_with_alpn(
+        endpoint: Endpoint,
+        peer_pubkey: [u8; 32],
+        alpn: &[u8],
+    ) -> anyhow::Result<Self> {
+        let id = iroh::EndpointId::from_bytes(&peer_pubkey)
+            .map_err(|e| anyhow::anyhow!("invalid peer pubkey: {e}"))?;
+        Ok(Self::connect_with_addr(
+            endpoint,
+            iroh::EndpointAddr::from(id),
+            alpn,
+        ))
+    }
+
+    /// Like [`Self::connect_with_alpn`] but accepts a full
+    /// `EndpointAddr` (including direct socket addresses and relay
+    /// info). Useful in tests where the discovery system isn't running
+    /// and the caller has the server's `endpoint.addr()` directly.
+    pub fn connect_with_addr(
+        endpoint: Endpoint,
+        addr: impl Into<iroh::EndpointAddr>,
+        alpn: &[u8],
+    ) -> Self {
+        let conn = IrohLazyRemoteConnection::new(endpoint, addr.into(), alpn.to_vec());
         Client {
             inner: IrpcClient::boxed(conn),
         }
+    }
+
+    /// **F02 step 1.** Issue an `AuthChallenge` RPC and return the
+    /// server's nonce. Public so tests can pair this with
+    /// [`Self::auth_prove_raw`] to construct adversarial scenarios.
+    pub async fn auth_challenge(&self) -> anyhow::Result<[u8; 32]> {
+        let resp = self
+            .inner
+            .rpc(crate::rpc::AuthChallenge::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("AuthChallenge RPC failed: {e}"))?;
+        Ok(resp.nonce)
+    }
+
+    /// **F02 step 2.** Submit an `AuthProve` message with the given
+    /// `acl_pubkey` + signature halves. Production callers use
+    /// [`Self::connect_to_peer_acl`] which computes a correctly-bound
+    /// signature internally. Public for test replay scenarios.
+    pub async fn auth_prove_raw(
+        &self,
+        acl_pubkey: [u8; 32],
+        sig_r: [u8; 32],
+        sig_s: [u8; 32],
+    ) -> anyhow::Result<Result<(), String>> {
+        self.inner
+            .rpc(crate::rpc::AuthProve {
+                acl_pubkey,
+                sig_r,
+                sig_s,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("AuthProve RPC failed: {e}"))
+    }
+
+    /// Compute the channel-bound F02 binding for `(server, client,
+    /// nonce)` — both sides do this independently. Returns the 32-byte
+    /// blake3-derived binding that goes under the signature.
+    pub fn f02_binding(
+        nonce: &[u8; 32],
+        client_iroh_pubkey: &[u8; 32],
+        server_iroh_pubkey: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key(crate::net_protocol::F02_BINDING_DOMAIN);
+        h.update(nonce);
+        h.update(client_iroh_pubkey);
+        h.update(server_iroh_pubkey);
+        *h.finalize().as_bytes()
+    }
+
+    /// Compute the bytes the client signs in `AuthProve`:
+    /// `F02_SIG_PREFIX || binding`.
+    pub fn f02_signed_message(binding: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(crate::net_protocol::F02_SIG_PREFIX.len() + 32);
+        out.extend_from_slice(crate::net_protocol::F02_SIG_PREFIX);
+        out.extend_from_slice(binding);
+        out
+    }
+
+    /// Connect to a peer on the **public** ALPN (no F02 challenge).
+    /// The peer serves only blobs in their `public_blob_hashes` set —
+    /// today that's identity bundles, advertised public-vault content.
+    pub fn connect_to_peer_public(
+        endpoint: Endpoint,
+        peer_pubkey: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_alpn(endpoint, peer_pubkey, Self::ALPN_PUBLIC)
+    }
+
+    /// Connect to a peer on the **ACL** ALPN and complete the F02
+    /// challenge handshake. On success the returned `Client` is bound
+    /// to `acl_signing_key.verifying_key()` for its lifetime — all
+    /// subsequent requests are gated against
+    /// `BlobAcl::allow_acl_read(acl_pubkey, hash)` server-side.
+    ///
+    /// Two RPC round-trips:
+    /// 1. `AuthChallenge` → server returns fresh 32-byte nonce.
+    /// 2. `AuthProve` → client signs the channel-bound binding;
+    ///    server verifies sig + checks the principal is recognised.
+    pub async fn connect_to_peer_acl(
+        endpoint: Endpoint,
+        peer_pubkey: [u8; 32],
+        acl_signing_key: &ed25519_dalek::SigningKey,
+    ) -> anyhow::Result<Self> {
+        let client = Self::connect_with_alpn(endpoint.clone(), peer_pubkey, Self::ALPN_ACL)?;
+        let client_iroh = *endpoint.id().as_bytes();
+
+        let nonce = client.auth_challenge().await?;
+        let binding = Self::f02_binding(&nonce, &client_iroh, &peer_pubkey);
+        let signed = Self::f02_signed_message(&binding);
+        let sig = acl_signing_key.sign(&signed);
+        let sig_bytes = sig.to_bytes();
+        let acl_pubkey = acl_signing_key.verifying_key().to_bytes();
+        let mut sig_r = [0u8; 32];
+        let mut sig_s = [0u8; 32];
+        sig_r.copy_from_slice(&sig_bytes[..32]);
+        sig_s.copy_from_slice(&sig_bytes[32..]);
+
+        let result = client.auth_prove_raw(acl_pubkey, sig_r, sig_s).await?;
+        result.map_err(|e| anyhow::anyhow!("F02 challenge rejected: {e}"))?;
+
+        Ok(client)
     }
 
     /// Requests that the remote peer unpin this client's reference to
@@ -215,7 +345,10 @@ impl BlobsRead for Client {
     }
 
     async fn blob_download(&self, hash: Hash) -> BlobResult<Bytes> {
-        self.blob_download_slice(hash, 0, None).await
+        // Full reads verify the content address (BlobsRead contract) —
+        // a remote peer is exactly where wrong bytes come from.
+        let bytes = self.blob_download_slice(hash, 0, None).await?;
+        s5_core::blob::verify_bytes(hash, bytes)
     }
 
     async fn blob_download_slice(

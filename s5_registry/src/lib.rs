@@ -21,9 +21,14 @@ use iroh::{
     endpoint::{Connection, Endpoint},
     protocol::{AcceptError, ProtocolHandler},
 };
-use irpc::{Client as IrpcClient, channel::oneshot, rpc_requests};
+use irpc::{
+    Client as IrpcClient,
+    channel::{mpsc, oneshot},
+    rpc_requests,
+};
 use irpc_iroh::{IrohLazyRemoteConnection, read_request};
 
+use async_trait::async_trait;
 use s5_core::{RegistryApi, StreamKey, StreamMessage};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -33,6 +38,13 @@ use tracing::warn;
 /// keys are no longer fixed at 32 bytes).
 pub const ALPN: &[u8] = b"s5/registry/1";
 
+// TODO(audit): keys here are sent as raw `Vec<u8>` (the byte form
+// returned by `StreamKey::storage_key()`) because StreamKey is
+// variable-length. That pushes encode/decode to every caller and
+// hides what the field actually is. A `#[serde(with = "…")]`
+// adapter or a wire-only `StreamKeyBytes` newtype would let the
+// field be typed `StreamKey` while still serialising as bytes.
+// Cosmetic; not behavior.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetRequest {
     /// Full storage key: `[type_tag, key_bytes...]` — produced by
@@ -58,6 +70,54 @@ pub struct DeleteRequest {
     pub key: Vec<u8>,
 }
 
+/// Subscribe to live updates on a fixed set of keys.
+///
+/// On open, the server replays the *current* value of each requested
+/// key as a `RegistryEvent::Initial` (one event per key, including
+/// keys with no entry — `message: None`). After that, the server
+/// streams every subsequent SET / DELETE that lands on any of the
+/// subscribed keys.
+///
+/// Push-based replication is the right shape here because the total
+/// registry-entry cardinality is small — one entry per vault per
+/// device + one per identity (typically tens). Polling for changes
+/// would either be wasteful (frequent polls) or laggy (rare polls);
+/// fanning every SET to all interested parties is cheap and keeps
+/// the system reliable even after disconnect/reconnect cycles.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubscribeRequest {
+    /// Full storage keys to subscribe to. Each entry is the byte
+    /// form returned by `StreamKey::storage_key()`.
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// Event delivered over the Subscribe stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegistryEvent {
+    /// Initial value for one of the subscribed keys, sent once at
+    /// subscription start. `message: None` indicates no entry yet.
+    Initial {
+        /// Storage key bytes (matches one of the request's `keys`).
+        key: Vec<u8>,
+        /// Serialised `StreamMessage`, or `None` if no entry.
+        message: Option<Vec<u8>>,
+    },
+    /// A SET landed on one of the subscribed keys after the initial
+    /// catch-up. The message body is the serialised `StreamMessage`
+    /// — clients deserialise to extract the new value.
+    Set {
+        /// Storage key bytes.
+        key: Vec<u8>,
+        /// Serialised `StreamMessage`.
+        message: Vec<u8>,
+    },
+    /// A DELETE landed on one of the subscribed keys.
+    Delete {
+        /// Storage key bytes.
+        key: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[rpc_requests(message = RegistryRpcMessage)]
 pub enum RpcProto {
@@ -67,32 +127,150 @@ pub enum RpcProto {
     Set(SetRequest),
     #[rpc(tx = oneshot::Sender<Result<(), String>>)]
     Delete(DeleteRequest),
+    #[rpc(tx = mpsc::Sender<RegistryEvent>)]
+    Subscribe(SubscribeRequest),
 }
 
-/// Server that exposes a [`RegistryApi`] implementation over iroh.
+/// Server that exposes a [`BroadcastingRegistry`] over iroh.
 ///
-/// Generic over any `R: RegistryApi`, allowing use with different
-/// registry backends (e.g., `RedbRegistry` from `s5_registry_redb`,
-/// `MemoryRegistry`, `StoreRegistry`, or custom implementations).
+/// Wraps a `BroadcastingRegistry` so every `set`/`delete` — whether
+/// it comes from a remote RPC or a local writer in the same daemon —
+/// fires the same broadcast channel that `Subscribe` handlers listen
+/// on. The server itself owns no broadcast channel: live event fanout
+/// lives in the wrapped registry, not split across two code paths.
 #[derive(Clone)]
-pub struct RegistryServer<R> {
-    registry: Arc<R>,
+pub struct RegistryServer {
+    registry: Arc<BroadcastingRegistry>,
+    acl: Option<Arc<dyn RegistryAcl>>,
 }
 
-impl<R> fmt::Debug for RegistryServer<R> {
+/// Event broadcast on every successful set/delete on a
+/// [`BroadcastingRegistry`]. `Subscribe` handlers fan these out to
+/// interested clients (filtered by key). Public so callers can build
+/// their own subscribers on the wrapper directly if needed.
+#[derive(Debug, Clone)]
+pub enum RegistryChange {
+    Set {
+        key_bytes: Vec<u8>,
+        message_bytes: Vec<u8>,
+    },
+    Delete {
+        key_bytes: Vec<u8>,
+    },
+}
+
+impl fmt::Debug for RegistryServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RegistryServer").finish()
     }
 }
 
-impl<R: RegistryApi + Send + Sync + 'static> RegistryServer<R> {
-    pub fn new(registry: R) -> Self {
+/// Wraps any [`RegistryApi`] with a broadcast channel that fires on
+/// every successful `set` / `delete`. Plumbing this wrapper as the
+/// single registry handle ensures that *every* writer in the daemon —
+/// the RPC server, the publish task, identity bundle publishing,
+/// inbound subscription event-apply — feeds the same fanout that
+/// remote subscribers listen on. Without this wrapper the publish
+/// task wrote directly to the inner registry and live subscribers
+/// silently missed updates.
+pub struct BroadcastingRegistry {
+    inner: Arc<dyn RegistryApi + Send + Sync>,
+    events: tokio::sync::broadcast::Sender<RegistryChange>,
+}
+
+impl BroadcastingRegistry {
+    /// Wrap an existing registry. Capacity 256: well above the typical
+    /// total entry cardinality (~tens) so we never lag in practice.
+    pub fn wrap(inner: Arc<dyn RegistryApi + Send + Sync>) -> Arc<Self> {
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        Arc::new(Self { inner, events })
+    }
+
+    /// Subscribe to live SET/DELETE events. Returned receiver yields
+    /// `RegistryChange::{Set, Delete}` for every successful write that
+    /// goes through this wrapper.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RegistryChange> {
+        self.events.subscribe()
+    }
+}
+
+impl fmt::Debug for BroadcastingRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BroadcastingRegistry").finish()
+    }
+}
+
+#[async_trait]
+impl RegistryApi for BroadcastingRegistry {
+    async fn get(&self, key: &StreamKey) -> Result<Option<StreamMessage>> {
+        self.inner.get(key).await
+    }
+
+    async fn set(&self, message: StreamMessage) -> Result<()> {
+        let key_bytes = message.key.storage_key();
+        let message_bytes = message.serialize().to_vec();
+        self.inner.set(message).await?;
+        // Best-effort broadcast — failure here just means no
+        // subscribers; that's fine.
+        let _ = self.events.send(RegistryChange::Set {
+            key_bytes,
+            message_bytes,
+        });
+        Ok(())
+    }
+
+    async fn delete(&self, key: &StreamKey) -> Result<()> {
+        let key_bytes = key.storage_key();
+        self.inner.delete(key).await?;
+        let _ = self.events.send(RegistryChange::Delete { key_bytes });
+        Ok(())
+    }
+}
+
+/// Per-request authorisation hook for registry operations.
+///
+/// Inspiration: iroh-blobs upstream's provider-events `EventMask` +
+/// `RequestMode::Intercept` pattern (iroh-blobs 0.93+) — a per-request
+/// callback the server consults before dispatching, allowing s5_node to
+/// gate registry access by vault membership without coupling
+/// s5_registry to the identity layer.
+///
+/// Identity-vault entries (`StreamKey::Vault { vault_id == IDENTITY_VAULT_ID, .. }`)
+/// MUST be permitted for read by any peer — they're public DID
+/// bundles. Implementations should encode that exemption.
+#[async_trait]
+pub trait RegistryAcl: Send + Sync + 'static + std::fmt::Debug {
+    /// Authorise a `get` from `peer_pubkey` against `key`. Returns
+    /// false to deny. Default: allow.
+    async fn allow_read(&self, _peer_pubkey: &[u8; 32], _key: &StreamKey) -> bool {
+        true
+    }
+    /// Authorise a `set` from `peer_pubkey` against `key` — registry
+    /// signature verification handles writer-key authentication; this
+    /// hook gates by vault membership on top of that.
+    async fn allow_write(&self, _peer_pubkey: &[u8; 32], _key: &StreamKey) -> bool {
+        true
+    }
+}
+
+impl RegistryServer {
+    pub fn new(registry: Arc<BroadcastingRegistry>) -> Self {
         Self {
-            registry: Arc::new(registry),
+            registry,
+            acl: None,
         }
     }
 
-    async fn handle_get(&self, req: GetRequest) -> GetResponse {
+    /// Construct with a per-request ACL hook; the trait's default-allow
+    /// methods are the stub used when no ACL is supplied.
+    pub fn with_acl(registry: Arc<BroadcastingRegistry>, acl: Arc<dyn RegistryAcl>) -> Self {
+        Self {
+            registry,
+            acl: Some(acl),
+        }
+    }
+
+    async fn handle_get(&self, req: GetRequest, peer: &[u8; 32]) -> GetResponse {
         let key = match StreamKey::from_storage_key(&req.key) {
             Ok(key) => key,
             Err(err) => {
@@ -100,6 +278,14 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryServer<R> {
                 return GetResponse { message: None };
             }
         };
+
+        if let Some(acl) = self.acl.as_ref()
+            && !acl.allow_read(peer, &key).await
+        {
+            // Same response shape as "not found" — peer cannot
+            // distinguish a denied lookup from a missing entry.
+            return GetResponse { message: None };
+        }
 
         match self.registry.get(&key).await {
             Ok(Some(message)) => GetResponse {
@@ -113,41 +299,167 @@ impl<R: RegistryApi + Send + Sync + 'static> RegistryServer<R> {
         }
     }
 
-    async fn handle_set(&self, req: SetRequest) -> std::result::Result<(), String> {
+    async fn handle_set(
+        &self,
+        req: SetRequest,
+        peer: &[u8; 32],
+    ) -> std::result::Result<(), String> {
         let message =
             StreamMessage::deserialize(Bytes::from(req.message)).map_err(|err| err.to_string())?;
 
+        if let Some(acl) = self.acl.as_ref()
+            && !acl.allow_write(peer, &message.key).await
+        {
+            return Err("registry write denied by ACL".to_string());
+        }
+
+        // The wrapped `BroadcastingRegistry` fires the subscriber
+        // fanout from inside its `set` — no separate broadcast call
+        // here, so the RPC path and the local writer path share one
+        // fanout site.
         self.registry
             .set(message)
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        Ok(())
     }
 
-    async fn handle_delete(&self, req: DeleteRequest) -> std::result::Result<(), String> {
+    async fn handle_delete(
+        &self,
+        req: DeleteRequest,
+        peer: &[u8; 32],
+    ) -> std::result::Result<(), String> {
         let key = StreamKey::from_storage_key(&req.key).map_err(|err| err.to_string())?;
+
+        if let Some(acl) = self.acl.as_ref()
+            && !acl.allow_write(peer, &key).await
+        {
+            return Err("registry delete denied by ACL".to_string());
+        }
 
         self.registry
             .delete(&key)
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    async fn handle_subscribe(
+        &self,
+        req: SubscribeRequest,
+        peer: &[u8; 32],
+        tx: irpc::channel::mpsc::Sender<RegistryEvent>,
+    ) {
+        // ACL: filter the requested key set down to those the peer is
+        // allowed to read. Keys that don't pass the ACL never appear
+        // in the Initial replay nor in the live event stream.
+        let mut authorised: Vec<(Vec<u8>, StreamKey)> = Vec::new();
+        for raw in &req.keys {
+            let Ok(parsed) = StreamKey::from_storage_key(raw) else {
+                continue;
+            };
+            if let Some(acl) = self.acl.as_ref()
+                && !acl.allow_read(peer, &parsed).await
+            {
+                continue;
+            }
+            authorised.push((raw.clone(), parsed));
+        }
+        if authorised.is_empty() {
+            return;
+        }
+
+        // Subscribe to the broadcast BEFORE doing the catch-up reads
+        // so we don't drop SETs that land between the GET and the
+        // subscribe (small but real race).
+        let mut rx = self.registry.subscribe_events();
+
+        // Initial catch-up: emit the current value of each subscribed
+        // key. `None` for absent keys lets the consumer learn "no
+        // entry exists" without needing a separate Get.
+        for (raw_key, parsed_key) in &authorised {
+            let message = match self.registry.get(parsed_key).await {
+                Ok(Some(msg)) => Some(msg.serialize().to_vec()),
+                Ok(None) => None,
+                Err(err) => {
+                    warn!("subscribe initial get error: {err}");
+                    None
+                }
+            };
+            if tx
+                .send(RegistryEvent::Initial {
+                    key: raw_key.clone(),
+                    message,
+                })
+                .await
+                .is_err()
+            {
+                return; // subscriber gone
+            }
+        }
+
+        // The authorised set can be small, so a linear scan per event
+        // is fine. For larger subscriptions we'd swap to a HashSet.
+        let key_set: std::collections::HashSet<Vec<u8>> =
+            authorised.iter().map(|(k, _)| k.clone()).collect();
+
+        loop {
+            match rx.recv().await {
+                Ok(change) => {
+                    let event = match change {
+                        RegistryChange::Set {
+                            key_bytes,
+                            message_bytes,
+                        } => {
+                            if !key_set.contains(&key_bytes) {
+                                continue;
+                            }
+                            RegistryEvent::Set {
+                                key: key_bytes,
+                                message: message_bytes,
+                            }
+                        }
+                        RegistryChange::Delete { key_bytes } => {
+                            if !key_set.contains(&key_bytes) {
+                                continue;
+                            }
+                            RegistryEvent::Delete { key: key_bytes }
+                        }
+                    };
+                    if tx.send(event).await.is_err() {
+                        return; // subscriber gone
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "registry subscriber lagged — events dropped");
+                    // Continue receiving; the subscriber missed events
+                    // but the channel is still usable.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
     }
 }
 
-impl<R: RegistryApi + Send + Sync + 'static> ProtocolHandler for RegistryServer<R> {
+impl ProtocolHandler for RegistryServer {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let peer: [u8; 32] = *conn.remote_id().as_bytes();
         while let Some(msg) = read_request::<RpcProto>(&conn).await? {
             match msg {
                 RegistryRpcMessage::Get(irpc::WithChannels { inner, tx, .. }) => {
-                    let resp = self.handle_get(inner).await;
+                    let resp = self.handle_get(inner, &peer).await;
                     let _ = tx.send(resp).await;
                 }
                 RegistryRpcMessage::Set(irpc::WithChannels { inner, tx, .. }) => {
-                    let result = self.handle_set(inner).await;
+                    let result = self.handle_set(inner, &peer).await;
                     let _ = tx.send(result).await;
                 }
                 RegistryRpcMessage::Delete(irpc::WithChannels { inner, tx, .. }) => {
-                    let result = self.handle_delete(inner).await;
+                    let result = self.handle_delete(inner, &peer).await;
                     let _ = tx.send(result).await;
+                }
+                RegistryRpcMessage::Subscribe(irpc::WithChannels { inner, tx, .. }) => {
+                    self.handle_subscribe(inner, &peer, tx).await;
                 }
             }
         }
@@ -167,6 +479,14 @@ impl Client {
         Client {
             inner: IrpcClient::boxed(conn),
         }
+    }
+
+    /// Convenience: connect to a peer identified by their iroh
+    /// pubkey (`[u8; 32]`). Mirrors `s5_blobs::Client::connect_to_peer`.
+    pub fn connect_to_peer(endpoint: Endpoint, peer_pubkey: [u8; 32]) -> Result<Self> {
+        let id = iroh::EndpointId::from_bytes(&peer_pubkey)
+            .map_err(|e| anyhow!("invalid peer pubkey: {e}"))?;
+        Ok(Self::connect(endpoint, iroh::EndpointAddr::from(id)))
     }
 
     pub async fn get(&self, key: StreamKey) -> Result<Option<StreamMessage>> {
@@ -212,8 +532,34 @@ impl Client {
             Err(err) => Err(anyhow!(err.to_string())),
         }
     }
+
+    /// Subscribe to a fixed set of `StreamKey`s.
+    ///
+    /// Returns an mpsc receiver that yields `RegistryEvent`s: first
+    /// one `Initial` event per requested key (with the current value
+    /// or `None`), then live `Set` / `Delete` events for any future
+    /// changes on the subscribed keys.
+    ///
+    /// `capacity` is the per-subscriber buffer size — set higher than
+    /// the expected event burst rate. For typical s5 deployments
+    /// (tens of entries total, low rate) `64` is plenty.
+    pub async fn subscribe(
+        &self,
+        keys: Vec<StreamKey>,
+        capacity: usize,
+    ) -> Result<irpc::channel::mpsc::Receiver<RegistryEvent>> {
+        let raw_keys: Vec<Vec<u8>> = keys.iter().map(|k| k.storage_key()).collect();
+        Ok(self
+            .inner
+            .server_streaming(SubscribeRequest { keys: raw_keys }, capacity)
+            .await?)
+    }
 }
 
+// TODO(audit): `RemoteRegistry` is a 15-line wrapper that exists
+// only to hang `impl RegistryApi` off a different type. `Client`
+// could implement `RegistryApi` directly and `RemoteRegistry`
+// would go away. Mechanical.
 #[derive(Clone, Debug)]
 pub struct RemoteRegistry {
     client: Client,
