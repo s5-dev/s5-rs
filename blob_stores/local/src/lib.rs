@@ -4,11 +4,19 @@ use futures::{Stream, StreamExt};
 use s5_core::blob::location::BlobLocation;
 use s5_core::blob::store::BlobStore;
 use s5_core::store::{StoreFeatures, StoreResult};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::{ReaderStream, StreamReader};
 use walkdir::WalkDir;
+
+pub mod prune;
+
+/// Atomic-write staging subdir (the tmp+rename target of `put_bytes`).
+/// One source of truth: `put_bytes` writes here, `list_hashes` excludes
+/// it, and `prune` never evicts from it — in-flight uploads are not
+/// cached blobs and racing them breaks the atomic-write contract.
+pub(crate) const TMP_SUBDIR: &str = ".tmp";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalStoreConfig {
@@ -90,29 +98,42 @@ impl s5_core::store::Store for LocalStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Atomic write: tmp file in the same directory + rename. The
-        // direct `tokio::fs::write` path opens with O_TRUNC then
-        // streams bytes, leaving the file empty/partial in the window
-        // a concurrent reader could land in. That window is what made
-        // `StoreRegistry::set` (which calls `get` → reads the file)
-        // observe "insufficient bytes for deserialization" under
-        // concurrent publishes — the registry entry was mid-rewrite.
-        // tmp+rename closes the window: readers see either the old
-        // bytes or the new bytes, never partial.
+        // Atomic write via tmp+rename: write to a sibling `.tmp/blob/`
+        // directory (same filesystem, so rename is atomic), then move
+        // into the final key path. Keeps the CAS directory pristine —
+        // no orphaned tmp files from interrupted uploads leak into
+        // listings or tiered sweeps. `.tmp/` is the standard Linux
+        // pattern (git, rsync, et al).
         //
-        // Tmp suffix combines pid (cross-process uniqueness) with a
-        // process-wide atomic counter (intra-process uniqueness — two
-        // concurrent put_bytes calls in the same process otherwise race
-        // on a shared tmp path and the second's rename fails with
-        // ENOENT after the first's rename consumed the tmp file).
+        // Why tmp+rename at all: a direct `tokio::fs::write` opens with
+        // O_TRUNC then streams bytes, leaving the file empty/partial
+        // in the window a concurrent reader could land in. That
+        // window is what made `StoreRegistry::set` (which calls `get`
+        // → reads the file) observe "insufficient bytes for
+        // deserialization" under concurrent publishes — the registry
+        // entry was mid-rewrite. Tmp+rename closes the window:
+        // readers see either the old bytes or the new bytes, never
+        // partial.
+        //
+        // The pid+counter suffix combines cross-process uniqueness
+        // (pid) with intra-process uniqueness (atomic counter — two
+        // concurrent `put_bytes` calls in the same process otherwise
+        // race on a shared tmp path and the second's rename fails
+        // with ENOENT after the first's rename consumed the tmp).
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = full_path.with_extension(format!(
+        let tmp_dir = self.base_path.join(TMP_SUBDIR).join("blob");
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("blob");
+        let tmp_path = tmp_dir.join(format!(
             "{}.tmp.{}.{}",
-            full_path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+            file_name,
             std::process::id(),
-            counter,
+            counter
         ));
+        tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::write(&tmp_path, &bytes).await?;
         tokio::fs::rename(&tmp_path, &full_path).await?;
         Ok(())
@@ -205,6 +226,12 @@ impl s5_core::store::Store for LocalStore {
         Ok(std::fs::metadata(&self.resolve_path(path)?)?.len())
     }
 
+    async fn modified(&self, path: &str) -> StoreResult<Option<std::time::SystemTime>> {
+        Ok(Some(
+            std::fs::metadata(&self.resolve_path(path)?)?.modified()?,
+        ))
+    }
+
     async fn list(
         &self,
     ) -> StoreResult<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + Unpin + 'static>>
@@ -212,20 +239,23 @@ impl s5_core::store::Store for LocalStore {
         let base_path = self.base_path.clone();
         let walker = WalkDir::new(&base_path).into_iter();
         let stream = futures::stream::iter(walker).filter_map(move |entry| {
-            futures::future::ready(match entry {
-                Ok(entry) => {
-                    if entry.file_type().is_file() {
-                        let path = entry.path();
+            let item = match entry {
+                Ok(entry) if entry.file_type().is_file() => {
+                    let path = entry.path();
+                    let relative_path = path.strip_prefix(&base_path).unwrap();
 
-                        let relative_path = path.strip_prefix(&base_path).unwrap();
+                    // Skip the `.tmp/` directory (atomic-write staging).
+                    if relative_path.starts_with(TMP_SUBDIR) {
+                        None
+                    } else {
                         let key = relative_path.to_string_lossy().into_owned();
                         Some(Ok(key))
-                    } else {
-                        None
                     }
                 }
-                Err(e) => Some(Err(e.into())),
-            })
+                Ok(_) => None,
+                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+            };
+            futures::future::ready(item)
         });
 
         Ok(Box::new(stream))
