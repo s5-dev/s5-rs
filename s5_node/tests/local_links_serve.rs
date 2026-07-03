@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::{Endpoint, endpoint::presets};
-use s5_blobs::{ALPN_PUBLIC as BLOBS_ALPN, BlobsServer, PeerConfigBlobs, ServerMode};
+use s5_blobs::{ALPN_ACL as BLOBS_ALPN, BlobsServer, PeerConfigBlobs};
 use s5_core::blob::BlobsRead;
 use s5_store_local::LocalStore;
 use s5_store_local_links::LocalLinksStore;
@@ -57,8 +57,15 @@ async fn workflow_local_links_serve() -> Result<()> {
     };
     peer_cfg.insert("*".to_string(), acl);
 
+    // For the legacy-path test we bind the BlobsServer to the ACL ALPN
+    // BUT with `mode = ServerMode::Public` so the F02 challenge is
+    // skipped — the legacy peer_cfg path handles authorisation. This
+    // mirrors the pre-S3b single-ALPN behaviour while compiling
+    // against the new BlobsServer API.
+    let local_iroh = *server_endpoint.id().as_bytes();
     let blobs_server = BlobsServer::with_read_sources(stores, read_sources, peer_cfg, None)
-        .with_mode(ServerMode::Public);
+        .with_mode(s5_blobs::ServerMode::Public)
+        .with_local_iroh_pubkey(local_iroh);
 
     let router = iroh::protocol::Router::builder(server_endpoint.clone())
         .accept(BLOBS_ALPN, blobs_server)

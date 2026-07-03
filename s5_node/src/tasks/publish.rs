@@ -17,14 +17,13 @@
 //! decrypt it with their age identity, and recover the full `TraversalContext`
 //! (keys, pipelines) needed to traverse the vault.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use s5_core::blob::BlobStore;
-use s5_core::{BlobsRead, BlobsWrite, Hash, RegistryApi, StreamKey, StreamMessage};
+use s5_core::blob::Blobs;
+use s5_core::{BlobsRead, Hash, RegistryApi, StreamKey, StreamMessage};
 use s5_fs_v2::layer::ReadableLayer;
 use s5_fs_v2::node::{ContentRef, Node, NodeEntry, NodeKind, Structural};
 use s5_fs_v2::pipeline::Pipeline;
@@ -37,6 +36,25 @@ use super::vault_persist::{
 use super::{
     TaskExecutorContext, resolve_key, resolve_store, resolve_vault, resolve_vault_key_info,
 };
+
+/// `S5_CONVERGENCE_TREEDIFF` — compute the convergence merge by pruning
+/// byte-identical subtrees (tree-diff) instead of re-folding the whole corpus.
+/// Byte-identical to the full path; default off until soaked.
+fn convergence_treediff_enabled() -> bool {
+    std::env::var("S5_CONVERGENCE_TREEDIFF")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// `S5_CONVERGENCE_TREEDIFF_VERIFY` — run BOTH the treediff and full convergence
+/// merge, assert the roots match, and publish the FULL (proven) result. The
+/// validation soak before trusting treediff alone; only consulted when
+/// `S5_CONVERGENCE_TREEDIFF` is also set.
+fn convergence_treediff_verify_enabled() -> bool {
+    std::env::var("S5_CONVERGENCE_TREEDIFF_VERIFY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
 
 /// Derive the Ed25519 signing key the device uses to sign every vault
 /// registry entry it writes — i.e., the device's iroh transport key
@@ -63,23 +81,51 @@ pub fn derive_vault_id(recovery_secret: &[u8; 32]) -> [u8; 16] {
     id
 }
 
-/// Derive the Ed25519 recovery signing key from a vault's
-/// `recovery_secret`:
+/// The fixed 16-byte vault id for a *well-known* vault — one located by a
+/// constant domain rather than a per-vault `recovery_secret`:
 ///
 /// ```text
-/// recovery_signing_seed = blake3("s5-recovery-sig" || recovery_secret)
-/// recovery_signing_key  = ed25519_keypair_from_seed(recovery_signing_seed)
+/// well_known_vault_id(domain) = blake3(domain)[..16]
 /// ```
 ///
-/// Anyone with the vault root can derive this key (no device or DID
-/// state needed) and verify the recovery registry entry — the canonical
-/// disaster-recovery lookup path.
-pub fn recovery_signing_key(recovery_secret: &[u8; 32]) -> SigningKey {
+/// Used by the master-anchored special vaults (`identity_secrets`, `stores`)
+/// and the identity bundle, all of which are found at `(master_pubkey,
+/// well_known_vault_id(...))` — no secret needed to locate them (confidentiality
+/// is the age layer; see `docs/reference/special-vaults.md`). Any peer can
+/// compute it from the public domain string.
+pub fn well_known_vault_id(domain: &str) -> [u8; 16] {
+    let h = blake3::hash(domain.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.as_bytes()[..16]);
+    id
+}
+
+/// Derive a vault's per-vault, **non-authoritative** *discovery* signing key
+/// from the identity-wide recovery `seed` (held in the `config` vault) and the
+/// vault's `vault_id`:
+///
+/// ```text
+/// discovery_signing_seed = blake3("s5-vault-discovery" || seed || vault_id)
+/// discovery_signing_key  = ed25519_keypair_from_seed(discovery_signing_seed)
+/// ```
+///
+/// It is derived from the `config`-vault `seed`, so a recovering or
+/// freshly-paired device can derive it from the config vault alone (`seed` + the
+/// `vault_id` directory), with no vault root and no per-vault secret. It carries
+/// **no write/merge authority**: `discovery_pubkey`
+/// appears in no identity bundle's `signers[]`, so the membership ACL never
+/// accepts it as a merge source. Its sole job is the owner's private
+/// `(discovery_pubkey, vault_id) → current HEAD` breadcrumb, mirrored into the
+/// owner's own durable store on each publish and read back on recovery
+/// (`docs/reference/registry-durability.md`). The locator is unguessable without
+/// `seed`.
+pub fn discovery_signing_key(seed: &[u8; 32], vault_id: &[u8; 16]) -> SigningKey {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"s5-recovery-sig");
-    hasher.update(recovery_secret);
-    let seed: [u8; 32] = *hasher.finalize().as_bytes();
-    SigningKey::from_bytes(&seed)
+    hasher.update(b"s5-vault-discovery");
+    hasher.update(seed);
+    hasher.update(vault_id);
+    let signing_seed: [u8; 32] = *hasher.finalize().as_bytes();
+    SigningKey::from_bytes(&signing_seed)
 }
 
 /// Extract the `recovery_secret` (32 bytes) from a vault root's
@@ -131,77 +177,6 @@ fn verify_recovery_secret_invariant(
     Ok(())
 }
 
-/// Ensure the one-time recovery registry entry exists.
-///
-/// The recovery entry maps `recovery_pubkey → device_signing_pubkey` so
-/// that a restorer with just the vault root (paper passphrase →
-/// recovery_age_secret → age-decrypt vault root → `KEY_SLOT_RECOVERY`)
-/// can discover one of the device's vault registry entries (which in
-/// turn points to the latest encrypted vault root).
-///
-/// Both the recovery entry and the per-device entry share the same
-/// `vault_id`, so the lookup is `(recovery_pubkey, vault_id)` →
-/// payload contains the device's signing pubkey, then
-/// `(device_pubkey, vault_id)` → current HEAD.
-///
-/// Only writes if no entry exists yet (revision == 0).
-async fn ensure_recovery_entry(
-    registry: &dyn RegistryApi,
-    vault_name: &str,
-    recovery_secret: &[u8; 32],
-    vault_id: [u8; 16],
-    device_pubkey: &VerifyingKey,
-) -> anyhow::Result<()> {
-    let recovery_key = recovery_signing_key(recovery_secret);
-    let recovery_verifying: VerifyingKey = (&recovery_key).into();
-    let recovery_stream_key = StreamKey::Vault {
-        pubkey: recovery_verifying.to_bytes(),
-        vault_id,
-    };
-
-    // Check if entry already exists
-    match registry.get(&recovery_stream_key).await {
-        Ok(Some(_)) => {
-            tracing::debug!(vault = vault_name, "recovery registry entry already exists");
-            return Ok(());
-        }
-        Ok(None) => {} // Need to create it
-        Err(e) => {
-            tracing::warn!(
-                vault = vault_name,
-                error = %e,
-                "could not check recovery registry entry"
-            );
-            return Ok(()); // Don't fail the publish
-        }
-    }
-
-    // The recovery entry's "hash" stores the device's signing pubkey
-    // (32 bytes). Slight abuse of the Hash field — it's the simplest way
-    // to carry 32 bytes in a registry entry payload without a new field.
-    let device_pubkey_hash = Hash::from(device_pubkey.to_bytes());
-
-    let message = sign_registry_entry(&recovery_key, vault_id, device_pubkey_hash, 1)?;
-
-    registry
-        .set(message)
-        .await
-        .context("publishing recovery registry entry")?;
-
-    let recovery_hex = hex::encode(recovery_verifying.to_bytes());
-    let device_hex = hex::encode(device_pubkey.to_bytes());
-    let vault_hex = hex::encode(vault_id);
-    tracing::info!(
-        vault = vault_name,
-        recovery_pubkey = recovery_hex,
-        device_pubkey = device_hex,
-        vault_id = vault_hex,
-        "recovery registry entry published"
-    );
-
-    Ok(())
-}
-
 /// Sign a v3 vault registry entry for the given vault, hash, and revision.
 ///
 /// Wire format (per `s5_core::stream::types`):
@@ -218,30 +193,91 @@ fn sign_registry_entry(
         .map_err(|e| anyhow!("creating signed registry entry: {e}"))
 }
 
-/// Age-decrypt bytes using a raw age secret key string (e.g. `AGE-SECRET-KEY-1...`).
+/// Mirror the just-published HEAD under the vault's non-authoritative discovery
+/// key, so a paper recovery or a freshly-paired device can find it from the
+/// `config` vault alone (`seed` + the vault directory) — no vault root, no
+/// `recovery_secret`. The entry lives at `(discovery_pubkey, vault_id)` and
+/// points at the same encrypted-TN hash as the device-keyed HEAD; it carries no
+/// write/merge authority (peers never trust `discovery_pubkey` as a writer), so
+/// it is a pure owner-private breadcrumb in the owner's durable store.
 ///
-/// Used for disaster recovery: the user has only their paper key, no identity
-/// files on disk. Parses the secret into an `age::x25519::Identity` and
-/// decrypts directly.
-pub(crate) fn age_decrypt_with_secret_key(
-    ciphertext: &[u8],
-    age_secret: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let identity: age::x25519::Identity = age_secret
-        .trim()
-        .parse()
-        .map_err(|e| anyhow!("parsing age secret key: {e}"))?;
+/// Best-effort: a failure only means the breadcrumb is stale/absent, not that
+/// the publish failed. Writes only when the pointer actually changed, so it adds
+/// no churn on a re-publish of unchanged content.
+async fn publish_discovery_entry(
+    registry: &dyn RegistryApi,
+    seed: &[u8; 32],
+    vault_id: [u8; 16],
+    head_hash: Hash,
+) -> anyhow::Result<()> {
+    let discovery_key = discovery_signing_key(seed, &vault_id);
+    let pubkey = VerifyingKey::from(&discovery_key).to_bytes();
+    let stream_key = StreamKey::Vault { pubkey, vault_id };
 
-    let decryptor = age::Decryptor::new(ciphertext).map_err(|e| anyhow!("age decryptor: {e}"))?;
+    let revision = match registry.get(&stream_key).await? {
+        Some(prev) if prev.hash == head_hash => return Ok(()), // already current
+        Some(prev) => prev.revision + 1,
+        None => 1,
+    };
+    let message = sign_registry_entry(&discovery_key, vault_id, head_hash, revision)?;
+    registry
+        .set(message)
+        .await
+        .context("publishing discovery registry entry")?;
+    Ok(())
+}
 
-    let mut plaintext = vec![];
-    let mut reader = decryptor
-        .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|e| anyhow!("age decrypt with paper key: {e}"))?;
-    reader
-        .read_to_end(&mut plaintext)
-        .context("reading age plaintext")?;
-    Ok(plaintext)
+/// Derive a vault's `vault_id` from a loaded vault-root `TraversalContext`
+/// (its `KEY_SLOT_RECOVERY` slot). The read-side counterpart to
+/// [`recovery_secret_from_vault_root`] for callers that already hold the
+/// decrypted root context (e.g. the restore/list-snapshots paths).
+pub(crate) fn vault_id_from_context(
+    ctx: &s5_fs_v2::node::TraversalContext,
+) -> anyhow::Result<[u8; 16]> {
+    let recovery_secret = ctx
+        .keys
+        .as_ref()
+        .and_then(|map| map.get(&s5_fs_v2::snapshot::KEY_SLOT_RECOVERY))
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "vault root TraversalContext has no KEY_SLOT_RECOVERY slot — \
+                 was this vault created before the v3 schema?"
+            )
+        })?;
+    Ok(derive_vault_id(&recovery_secret))
+}
+
+/// Download a published Transparent Node blob by hash and parse it, trying an
+/// age-decrypt with the supplied identity files first and falling back to a
+/// direct CBOR parse (the read-side counterpart to `plaintext_published_tn`).
+///
+/// Used to follow a vault's published history chain: each history entry in a
+/// published TN points at a *previous* encrypted-TN blob, and resolving a
+/// `#snap` selector walks back along those pointers.
+pub(crate) async fn download_published_node(
+    blob_store: &dyn Blobs,
+    hash: Hash,
+    identity_files: &[String],
+) -> anyhow::Result<Node> {
+    let blob_bytes = blob_store
+        .blob_download(hash)
+        .await
+        .map_err(|e| anyhow!("downloading published TN {}: {e}", hash.fmt_short()))?;
+
+    if !identity_files.is_empty() {
+        match age_decrypt_with_identity_files(&blob_bytes, identity_files) {
+            Ok(plaintext) => {
+                Node::from_bytes(&plaintext).map_err(|e| anyhow!("CBOR decode published TN: {e}"))
+            }
+            Err(decrypt_err) => match Node::from_bytes(&blob_bytes) {
+                Ok(node) => Ok(node),
+                Err(_) => Err(decrypt_err).context("decrypting published Transparent Node"),
+            },
+        }
+    } else {
+        Node::from_bytes(&blob_bytes).map_err(|e| anyhow!("CBOR decode published TN: {e}"))
+    }
 }
 
 /// Fetch the previously published encrypted Transparent Node, decrypt it,
@@ -250,7 +286,7 @@ pub(crate) fn age_decrypt_with_secret_key(
 /// Returns `None` if nothing was previously published (no registry entry).
 pub(crate) async fn fetch_previous_published_node(
     registry: &dyn RegistryApi,
-    blob_store: &BlobStore,
+    blob_store: &dyn Blobs,
     stream_key: &StreamKey,
     identity_files: &[String],
 ) -> anyhow::Result<Option<(Node, Hash, u64)>> {
@@ -259,16 +295,7 @@ pub(crate) async fn fetch_previous_published_node(
         None => return Ok(None),
     };
 
-    let encrypted_bytes = blob_store
-        .blob_download(entry.hash)
-        .await
-        .map_err(|e| anyhow!("downloading previous encrypted TN: {e}"))?;
-
-    let cbor = age_decrypt_with_identity_files(&encrypted_bytes, identity_files)
-        .context("decrypting previous published Transparent Node")?;
-
-    let node = Node::from_bytes(&cbor).map_err(|e| anyhow!("CBOR decode previous TN: {e}"))?;
-
+    let node = download_published_node(blob_store, entry.hash, identity_files).await?;
     Ok(Some((node, entry.hash, entry.revision)))
 }
 
@@ -282,6 +309,7 @@ fn build_published_node(
     current_cbor: &[u8],
     prev_node: Option<&Node>,
     prev_encrypted_hash: Option<Hash>,
+    tn_history_keep: Option<usize>,
 ) -> anyhow::Result<Node> {
     let current_node =
         Node::from_bytes(current_cbor).map_err(|e| anyhow!("CBOR decode current TN: {e}"))?;
@@ -329,6 +357,27 @@ fn build_published_node(
         node.entries.insert(timestamp, history_entry);
     }
 
+    // Bound the history chain to the last `n` entries, if configured. The
+    // `""` current-snapshot entry is always kept and never counted. History
+    // keys are RFC3339 timestamps and `node.entries` is a `BTreeMap`, so
+    // iteration is ascending == chronological — the oldest `len - n` keys
+    // are the front of the list. Dropping them unbinds their old
+    // encrypted-TN blobs (their last referrer), making those blobs
+    // unreachable and thus eligible for the cold-store GC. `None` =>
+    // unbounded (the historical behavior; zero impact on other vaults).
+    if let Some(n) = tn_history_keep {
+        let mut hist: Vec<String> = node
+            .entries
+            .keys()
+            .filter(|k| !k.is_empty())
+            .cloned()
+            .collect();
+        let drop_count = hist.len().saturating_sub(n);
+        for k in hist.drain(..drop_count) {
+            node.entries.remove(&k);
+        }
+    }
+
     Ok(node)
 }
 
@@ -358,7 +407,7 @@ fn build_published_node(
 async fn maybe_merge_with_prev_published(
     local_cbor: &[u8],
     prev_node: Option<&Node>,
-    blob_store: &BlobStore,
+    blob_store: Arc<dyn Blobs>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(prev) = prev_node else {
         return Ok(None);
@@ -392,7 +441,7 @@ async fn maybe_merge_with_prev_published(
     // vault keys via TraversalContext (recipient set is per-vault), so a
     // single Pipeline built from local's context decrypts entries from
     // either side.
-    let read_store: Arc<dyn BlobsRead> = Arc::new(blob_store.clone());
+    let read_store: Arc<dyn BlobsRead> = blob_store.clone();
     let local_ctx = local_entry
         .child_context
         .as_ref()
@@ -420,16 +469,82 @@ async fn maybe_merge_with_prev_published(
     let pipeline = Pipeline::new(Arc::clone(&read_store), local_ctx.clone());
     let chunk_mask = prev_snap.chunk_mask().await;
 
-    let merge_result = pipeline
-        .merge_and_persist(&prev_snap, chunk_mask, &local_snap, blob_store)
-        .await
-        .context("merging local TN with previously published TN")?;
+    // Convergence merge (the ~25 s publish floor: it re-derives the whole
+    // 2.58 M-entry tree every cycle — entries_changed≈corpus). Mode by env:
+    //  - off (default): full O(corpus) `merge_and_persist`.
+    //  - S5_CONVERGENCE_TREEDIFF: `merge_and_persist_treediff` — prune subtrees
+    //    byte-identical between prev-published and local (by content hash), diff
+    //    only the rest, feed the small change-layer to the oracle-tested
+    //    structural merge. Byte-identical to the full path, O(changed leaves).
+    //  - S5_CONVERGENCE_TREEDIFF_VERIFY: run BOTH, assert roots match, and
+    //    PUBLISH THE FULL (proven) result — a treediff bug is loud-but-harmless
+    //    during the soak. Drop the verify after a clean soak for the real win.
+    let t_merge = std::time::Instant::now();
+    let treediff = convergence_treediff_enabled();
+    let merge_result = if treediff && convergence_treediff_verify_enabled() {
+        let t_td = std::time::Instant::now();
+        let td = pipeline
+            .merge_and_persist_treediff(&prev_snap, chunk_mask, &local_snap, blob_store.as_ref())
+            .await
+            .context("convergence treediff merge")?;
+        let td_ms = t_td.elapsed().as_millis() as u64;
+        let full = pipeline
+            .merge_and_persist(&prev_snap, chunk_mask, &local_snap, blob_store.as_ref())
+            .await
+            .context("merging local TN with previously published TN")?;
+        match (&td, &full) {
+            (Some((th, tph, _)), Some((fh, fph, _))) => {
+                if th != fh || tph != fph {
+                    tracing::error!(
+                        td_root = ?th, full_root = ?fh, td_ms,
+                        "S5_CONVERGENCE_TREEDIFF_VERIFY: ROOT MISMATCH — publishing the FULL result (treediff has a bug)"
+                    );
+                } else {
+                    tracing::info!(
+                        td_ms,
+                        "convergence treediff verify OK (root matches full path)"
+                    );
+                }
+            }
+            (None, None) => {
+                tracing::info!(td_ms, "convergence treediff verify OK (both empty)");
+            }
+            _ => tracing::error!(
+                td_ok = td.is_some(),
+                full_ok = full.is_some(),
+                "S5_CONVERGENCE_TREEDIFF_VERIFY: shape divergence — publishing the FULL result"
+            ),
+        }
+        full
+    } else if treediff {
+        pipeline
+            .merge_and_persist_treediff(&prev_snap, chunk_mask, &local_snap, blob_store.as_ref())
+            .await
+            .context("convergence treediff merge")?
+    } else {
+        pipeline
+            .merge_and_persist(&prev_snap, chunk_mask, &local_snap, blob_store.as_ref())
+            .await
+            .context("merging local TN with previously published TN")?
+    };
+    let merge_ms = t_merge.elapsed().as_millis() as u64;
 
-    let Some((unified_root, unified_plaintext_hash, _stats)) = merge_result else {
+    let Some((unified_root, unified_plaintext_hash, stats)) = merge_result else {
         // Both sides empty after tombstone filter — emit an empty TN.
         // Fall through to local_cbor unchanged; nothing to merge.
+        tracing::info!(merge_ms, "convergence merge: empty result (no-op union)");
         return Ok(None);
     };
+    tracing::info!(
+        merge_ms,
+        treediff,
+        entries_changed = stats.entries_changed,
+        entries_reused = stats.entries_reused,
+        leaf_nodes = stats.leaf_nodes,
+        nodes_uploaded = stats.nodes_uploaded,
+        nodes_deduped = stats.nodes_deduped,
+        "convergence merge: local vs prev-published"
+    );
 
     // Wrap the merged tree in a fresh Transparent Node. Carry local's
     // semantic / non-content fields if any.
@@ -456,6 +571,27 @@ async fn maybe_merge_with_prev_published(
     Ok(Some(cbor))
 }
 
+/// Load a configured vault's current *local* root and derive its `vault_id`
+/// (`derive_vault_id(recovery_secret)`), reading the working snapshot directly —
+/// no registry round-trip. Returns `Ok(None)` when the vault has no local
+/// snapshot yet (nothing to record in the recovery directory). Used by the
+/// `config` vault bootstrap ([`crate::config_vault::publish_bootstrap_config`])
+/// to build the vault directory at startup.
+pub(crate) fn vault_id_for_config(
+    config: &crate::config::S5NodeConfig,
+    vault_name: &str,
+) -> anyhow::Result<Option<[u8; 16]>> {
+    let vault = resolve_vault(config, vault_name)?;
+    let (_, identity_files) = resolve_vault_key_info(config, vault_name)
+        .context("resolving vault key for local decryption")?;
+    let current_path = vault_root_path(&vault.root_path);
+    let Some(cbor) = load_vault_root_cbor(&current_path, &identity_files)? else {
+        return Ok(None);
+    };
+    let recovery_secret = recovery_secret_from_vault_root(&cbor)?;
+    Ok(Some(derive_vault_id(&recovery_secret)))
+}
+
 /// Run a publish task.
 ///
 /// 1. Load raw CBOR of the vault's Transparent Node (decrypted from local file).
@@ -473,7 +609,7 @@ pub async fn run_publish(
     vault_name: &str,
     key_names: &[String],
 ) -> anyhow::Result<()> {
-    let (vault, key_configs, vault_identity_files) = {
+    let (vault, key_configs, vault_identity_files, data_store_name, meta_store_name) = {
         let config = ctx.config.read().await;
         let vault = resolve_vault(&config, vault_name)?.clone();
         let mut key_configs = Vec::new();
@@ -485,7 +621,15 @@ pub async fn run_publish(
         }
         let (_, id_files) = resolve_vault_key_info(&config, vault_name)
             .context("resolving vault key for local decryption")?;
-        (vault, key_configs, id_files)
+        let data_store_name = config.vault_data_store(vault_name, &vault)?.to_string();
+        let meta_store_name = config.vault_meta_store(vault_name, &vault)?.to_string();
+        (
+            vault,
+            key_configs,
+            id_files,
+            data_store_name,
+            meta_store_name,
+        )
     };
     let registry = ctx
         .registry
@@ -504,33 +648,91 @@ pub async fn run_publish(
         })?;
 
     // -- Resolve recipient keys (public keys + identity files) --
+    //
+    // Two sources, unioned:
+    //   1. The hand-listed `vault.recipients = [...]` config (legacy
+    //      path; each name resolves to a `[key.<name>]` block).
+    //   2. The `keyAgreement` recipients of every member's published
+    //      DidDocument (step 5 — auto-derived from the bundle layer).
+    //
+    // (2) is the production-shape path: adding a friend to a vault is
+    //     `members = [..., "alice"]` + `[friend.alice].id = "did:s5:..."`,
+    //     no recipient hand-edit needed. (1) remains because some
+    //     recipients (e.g. paper recovery) live as standalone keys
+    //     without a published DID.
     let mut recipient_strings = Vec::new();
     let mut identity_files = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
     for key_config in &key_configs {
-        recipient_strings.push(key_config.public_key.clone());
+        if seen.insert(key_config.public_key.clone()) {
+            recipient_strings.push(key_config.public_key.clone());
+        }
         if let Some(ref id_file) = key_config.identity_file {
             identity_files.push(id_file.clone());
         }
     }
+    if let Some(membership) = ctx.membership.as_ref() {
+        let state = membership.read().await;
+        if let Some(vm) = state.vaults.get(vault_name) {
+            for r in &vm.age_recipients {
+                if seen.insert(r.clone()) {
+                    recipient_strings.push(r.clone());
+                }
+            }
+        }
+    }
 
-    if recipient_strings.is_empty() {
+    // `plaintext_published_tn` skips the age envelope on publication —
+    // see NodeConfigVault docs. A recipient-less, plaintext publish is the
+    // public-publisher pattern (one writer, many anonymous read-only
+    // consumers); a recipient list with the flag set is harmless (we'd
+    // just ignore the recipients below, but flag a config bug).
+    let plaintext_publish = vault.plaintext_published_tn;
+    if plaintext_publish && !recipient_strings.is_empty() {
+        tracing::warn!(
+            vault = vault_name,
+            recipient_count = recipient_strings.len(),
+            "plaintext_published_tn = true but recipients/members resolved to a non-empty set — \
+             ignoring recipients for the publish envelope (TN will be plaintext)"
+        );
+    }
+    if !plaintext_publish && recipient_strings.is_empty() {
         return Err(anyhow!(
-            "publish requires at least one key recipient (specify keys in task config)"
+            "publish requires at least one recipient (vault.recipients or vault.members), \
+             unless `plaintext_published_tn = true` is set on the vault"
         ));
     }
 
-    // -- Resolve blob store --
-    let blob_store_name = vault.blob_stores.first().ok_or_else(|| {
-        anyhow!(
-            "vault '{}' has no blob_stores configured — cannot upload encrypted snapshot",
-            vault_name
-        )
-    })?;
-    let blob_store: &BlobStore = resolve_store(&ctx.stores, blob_store_name)?;
+    // -- Resolve blob store: the encrypted TN goes to the vault's META
+    // primary (which defaults to the data store) — see decision D1.
+    let blob_store_name = &meta_store_name;
+    let blob_store = resolve_store(&ctx.stores, blob_store_name)?;
 
     // -- Derive vault_id from the vault root's KEY_SLOT_RECOVERY slot --
     let recovery_secret = recovery_secret_from_vault_root(&cbor)?;
     let vault_id = derive_vault_id(&recovery_secret);
+
+    // Register `vault_name → vault_id` in shared membership state so
+    // the per-vault registry ACL can resolve wire-level `vault_id`
+    // back to a name. First publish for each vault populates the
+    // mapping; subsequent publishes are a no-op. The membership
+    // subscriber reads this mapping to know which (peer, vault_id)
+    // data keys to subscribe to.
+    if let Some(membership) = ctx.membership.as_ref() {
+        let mut state = membership.write().await;
+        let changed = state.register_vault_id(vault_name, vault_id);
+        if changed {
+            tracing::info!(
+                vault = vault_name,
+                vault_id = %hex::encode(vault_id),
+                "registered vault_id in membership state"
+            );
+            drop(state);
+            if let Some(refresh) = ctx.membership_refresh.as_ref() {
+                refresh.notify_one();
+            }
+        }
+    }
 
     // -- Per-device signing key + stream key --
     // The device's iroh transport key signs every vault registry entry
@@ -542,6 +744,21 @@ pub async fn run_publish(
         pubkey: verifying_key.to_bytes(),
         vault_id,
     };
+
+    // The plaintext snapshot tree root of our local TN (the `""` entry's CAS
+    // hash). Stable for identical content — the fs_v2 encryption is
+    // deterministic, so an unchanged tree always hashes the same. Used below to
+    // detect a true no-op snap: `build_published_node` appends a
+    // fresh-timestamped history entry on every publish, so the published TN's
+    // *encrypted* hash always changes and the in-loop
+    // `this_hash == prev_encrypted_hash` guard can never fire — but the
+    // underlying tree root does not, so compare that instead.
+    let local_root_hash: Option<[u8; 32]> = Node::from_bytes(&cbor)
+        .ok()
+        .as_ref()
+        .and_then(|n| n.transparent_entry())
+        .and_then(|e| e.content.as_ref())
+        .map(|c| c.hash);
 
     // ---- Convergence retry loop ----------------------------------------
     //
@@ -578,10 +795,13 @@ pub async fn run_publish(
 
     for attempt in 0..MAX_PUBLISH_RETRIES {
         // -- Fetch the latest registry-published TN --
+        // DIAGNOSTIC 2026-06-18: split the ~28 s publish gap into fetch vs the
+        // convergence merge (timed in maybe_merge_with_prev_published).
+        let t_fetch = std::time::Instant::now();
         let (prev_node, prev_encrypted_hash, prev_revision) = if !identity_files.is_empty() {
             match fetch_previous_published_node(
                 registry.as_ref(),
-                blob_store,
+                blob_store.as_ref(),
                 &stream_key,
                 &identity_files,
             )
@@ -643,9 +863,41 @@ pub async fn run_publish(
             (None, None, rev)
         };
 
+        tracing::info!(
+            attempt,
+            fetch_ms = t_fetch.elapsed().as_millis() as u64,
+            has_prev = prev_node.is_some(),
+            "publish: fetched previous published TN"
+        );
+
+        // -- True no-op short-circuit --
+        // If our local snapshot tree root matches the already-published one,
+        // there is genuinely nothing new to publish. Skip the history append,
+        // encrypt, upload, durability `sync()` (one Sia slab ≈ 40 s on the
+        // packed path), and the registry bump entirely. Only fires once a vault
+        // has a published prev to compare against (first publish always
+        // proceeds); a peer-diverged tree has a different root and falls
+        // through to the merge below.
+        if let (Some(local), Some(prev)) = (local_root_hash, prev_node.as_ref()) {
+            let prev_root = prev
+                .transparent_entry()
+                .and_then(|e| e.content.as_ref())
+                .map(|c| c.hash);
+            if prev_root == Some(local) {
+                tracing::info!(
+                    vault = vault_name,
+                    revision = prev_revision,
+                    "snapshot unchanged from published revision — skipping publish (no-op)"
+                );
+                return Ok(());
+            }
+        }
+
         // -- Convergence merge: union local + previously published --
         let merged_cbor =
-            match maybe_merge_with_prev_published(&cbor, prev_node.as_ref(), blob_store).await {
+            match maybe_merge_with_prev_published(&cbor, prev_node.as_ref(), blob_store.clone())
+                .await
+            {
                 Ok(Some(merged)) => {
                     tracing::info!(
                         vault = vault_name,
@@ -680,33 +932,41 @@ pub async fn run_publish(
             };
 
         // -- Build enriched Node with history --
-        let published_node =
-            build_published_node(&merged_cbor, prev_node.as_ref(), prev_encrypted_hash)?;
+        let published_node = build_published_node(
+            &merged_cbor,
+            prev_node.as_ref(),
+            prev_encrypted_hash,
+            vault.tn_history_keep,
+        )?;
         let history_count = published_node.entries.len() - 1;
 
         let enriched_cbor = published_node
             .to_vec()
             .map_err(|e| anyhow!("CBOR encode enriched TN: {e}"))?;
 
-        // -- Age-encrypt + upload --
-        let encrypted = age_encrypt_for_recipients(&enriched_cbor, &recipient_strings)
-            .context("encrypting for recipients")?;
-        let bytes = Bytes::from(encrypted);
+        // -- Encrypt (or skip) + upload --
+        // With `plaintext_published_tn`, the published TN goes onto the wire
+        // as raw CBOR. Authenticity still hinges on the signed registry
+        // entry (BLAKE3 hash of the published blob).
+        let bytes = if plaintext_publish {
+            Bytes::from(enriched_cbor.clone())
+        } else {
+            let encrypted = age_encrypt_for_recipients(&enriched_cbor, &recipient_strings)
+                .context("encrypting for recipients")?;
+            Bytes::from(encrypted)
+        };
         let blob_id = blob_store
             .blob_upload_bytes(bytes.clone())
             .await
-            .map_err(|e| anyhow!("uploading encrypted Transparent Node: {e}"))?;
+            .map_err(|e| anyhow!("uploading published Transparent Node: {e}"))?;
         let this_hash = blob_id.hash;
 
-        // -- Already-published short-circuit (idempotent) --
-        if prev_encrypted_hash.is_some_and(|h| h == this_hash) {
-            tracing::info!(
-                vault = vault_name,
-                revision = prev_revision,
-                "snapshot already published at current revision"
-            );
-            return Ok(());
-        }
+        // (The idempotent "already published" short-circuit lives at the top of
+        // the loop now — a plaintext snapshot-root compare. An encrypted-hash
+        // compare here is unreachable: we only get past that skip when content
+        // changed or there's no prev, and `build_published_node` appends a
+        // fresh-timestamped history entry, so `this_hash` never equals
+        // `prev_encrypted_hash`.)
 
         tracing::info!(
             vault = vault_name,
@@ -717,6 +977,32 @@ pub async fn run_publish(
             history_entries = history_count,
             "encrypted Transparent Node uploaded"
         );
+
+        // -- Durability barrier (unconditional) --
+        // Flush the blob store ONCE before the registry entry is set, so a root
+        // is never published ahead of its data — the content-addressed
+        // crash-safety contract (`blob_store` holds the full published vault:
+        // file blobs, tree nodes via the meta-tee, and the encrypted TN).
+        //
+        // REQUIRED for the packing store: a packed vault's chunks sit in local
+        // staging until `sync()` force-flushes them into Sia packs — publishing
+        // the HEAD first would reference non-durable data. Also covers the
+        // batched-fjall case (writes only in the write buffer until now). Cheap
+        // for stores that already persist per write (a near-no-op fsync).
+        // meta_store is a re-derivable local cache (nodes also live here via the
+        // tee), so it needs no separate barrier.
+        {
+            let t = std::time::Instant::now();
+            blob_store
+                .blob_sync()
+                .await
+                .context("syncing blob store before publishing registry entry")?;
+            tracing::info!(
+                vault = vault_name,
+                sync_ms = t.elapsed().as_millis() as u64,
+                "publish: blob store synced (durability barrier before registry.set)"
+            );
+        }
 
         // -- Sign + publish at prev_revision + 1 --
         let new_revision = prev_revision + 1;
@@ -791,13 +1077,14 @@ pub async fn run_publish(
     let encrypted_bytes = encrypted_bytes.expect("set in the win branch");
     let encrypted_hash = encrypted_hash.expect("set in the win branch");
 
-    // -- Mirror encrypted TN to meta_targets (relay stores for cross-device sync) --
-    // Skips any target equal to the primary blob_store (already written above).
-    // A failure to mirror to one target does not fail the publish: the encrypted
-    // TN is on the primary, the registry entry has its hash, and a later publish
-    // can re-attempt the mirror. Loud-warn so operators notice.
-    for meta_target in &vault.meta_targets {
-        if meta_target == blob_store_name {
+    // -- Mirror encrypted TN to the data store when meta rides a separate
+    // store (relay/cross-device sync setups) — so a reader following only
+    // the data store still finds the TN. A failure to mirror does not fail
+    // the publish: the TN is on the meta primary, the registry entry has
+    // its hash, and a later publish re-attempts. Loud-warn so operators
+    // notice.
+    for meta_target in [&data_store_name] {
+        if *meta_target == *blob_store_name {
             continue;
         }
         match resolve_store(&ctx.stores, meta_target) {
@@ -836,20 +1123,23 @@ pub async fn run_publish(
         }
     }
 
-    // -- Ensure one-time recovery entry exists --
-    if let Err(e) = ensure_recovery_entry(
-        registry.as_ref(),
-        vault_name,
-        &recovery_secret,
-        vault_id,
-        &verifying_key,
-    )
-    .await
-    {
-        tracing::warn!(
+    // -- Mirror the HEAD under the discovery key (paper/add-device recovery) --
+    // Reachable from the config vault alone (seed + vault directory). Skipped
+    // until the bootstrap publish has populated the seed.
+    if let Some(seed) = ctx.discovery_seed.get() {
+        if let Err(e) =
+            publish_discovery_entry(registry.as_ref(), seed, vault_id, encrypted_hash).await
+        {
+            tracing::warn!(
+                vault = vault_name,
+                error = %e,
+                "could not publish discovery entry — publish still succeeded"
+            );
+        }
+    } else {
+        tracing::debug!(
             vault = vault_name,
-            error = %e,
-            "could not ensure recovery registry entry — publish still succeeded"
+            "discovery seed not yet available; skipping discovery entry"
         );
     }
 
@@ -886,15 +1176,69 @@ mod tests {
     }
 
     #[test]
-    fn recovery_signing_key_is_deterministic() {
-        let recovery_secret = [3u8; 32];
-        let k1 = recovery_signing_key(&recovery_secret);
-        let k2 = recovery_signing_key(&recovery_secret);
+    fn discovery_signing_key_is_deterministic_and_scoped() {
+        let seed = [5u8; 32];
+        let vault_id = [6u8; 16];
+
+        // Same (seed, vault_id) → same key.
+        let k1 = discovery_signing_key(&seed, &vault_id);
+        let k2 = discovery_signing_key(&seed, &vault_id);
         assert_eq!(k1.to_bytes(), k2.to_bytes());
 
-        let other = [4u8; 32];
-        let k3 = recovery_signing_key(&other);
-        assert_ne!(k1.to_bytes(), k3.to_bytes());
+        // Distinct per vault under the same identity seed...
+        let other_vault = discovery_signing_key(&seed, &[7u8; 16]);
+        assert_ne!(k1.to_bytes(), other_vault.to_bytes());
+
+        // ...and distinct per identity seed for the same vault.
+        let other_seed = discovery_signing_key(&[8u8; 32], &vault_id);
+        assert_ne!(k1.to_bytes(), other_seed.to_bytes());
+    }
+
+    /// The recovery contract: with only the config-vault `seed` and a vault's
+    /// `vault_id`, a fresh device re-derives the discovery locator and finds the
+    /// current HEAD — no device pubkey, no `recovery_secret`. Idempotent on an
+    /// unchanged HEAD; bumps on a new one.
+    #[tokio::test]
+    async fn discovery_entry_is_findable_from_seed_alone() {
+        use s5_registry::MemoryRegistry;
+
+        let registry = MemoryRegistry::new();
+        let seed = [11u8; 32];
+        let vault_id = derive_vault_id(&[22u8; 32]);
+        let head = Hash::from([33u8; 32]);
+
+        publish_discovery_entry(&registry, &seed, vault_id, head)
+            .await
+            .unwrap();
+
+        let discovery_pubkey =
+            VerifyingKey::from(&discovery_signing_key(&seed, &vault_id)).to_bytes();
+        let locator = StreamKey::Vault {
+            pubkey: discovery_pubkey,
+            vault_id,
+        };
+        let entry = registry.get(&locator).await.unwrap().unwrap();
+        assert_eq!(entry.hash, head, "the breadcrumb points at the HEAD");
+        let rev1 = entry.revision;
+
+        // Re-publishing the same HEAD is a no-op (no churn).
+        publish_discovery_entry(&registry, &seed, vault_id, head)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.get(&locator).await.unwrap().unwrap().revision,
+            rev1,
+            "unchanged HEAD must not bump the discovery revision"
+        );
+
+        // A new HEAD advances the pointer.
+        let head2 = Hash::from([44u8; 32]);
+        publish_discovery_entry(&registry, &seed, vault_id, head2)
+            .await
+            .unwrap();
+        let entry2 = registry.get(&locator).await.unwrap().unwrap();
+        assert_eq!(entry2.hash, head2);
+        assert_eq!(entry2.revision, rev1 + 1);
     }
 
     #[test]
@@ -939,40 +1283,6 @@ mod tests {
     #[test]
     fn age_encrypt_no_recipients_fails() {
         let result = age_encrypt_for_recipients(b"data", &[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn age_decrypt_with_secret_key_round_trip() {
-        use age::secrecy::ExposeSecret;
-
-        let identity = age::x25519::Identity::generate();
-        let recipient_str = identity.to_public().to_string();
-        let secret_str = identity.to_string().expose_secret().to_string();
-
-        let plaintext = b"disaster recovery test data";
-        let encrypted = age_encrypt_for_recipients(plaintext, &[recipient_str]).unwrap();
-
-        let decrypted = age_decrypt_with_secret_key(&encrypted, &secret_str).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn age_decrypt_with_wrong_secret_key_fails() {
-        let identity = age::x25519::Identity::generate();
-        let recipient_str = identity.to_public().to_string();
-
-        // Encrypt for one identity
-        let plaintext = b"test";
-        let encrypted = age_encrypt_for_recipients(plaintext, &[recipient_str]).unwrap();
-
-        // Try to decrypt with a different identity
-        let other = age::x25519::Identity::generate();
-        let other_secret = {
-            use age::secrecy::ExposeSecret;
-            other.to_string().expose_secret().to_string()
-        };
-        let result = age_decrypt_with_secret_key(&encrypted, &other_secret);
         assert!(result.is_err());
     }
 
@@ -1063,7 +1373,7 @@ mod tests {
         let current = make_transparent_node([1u8; 32]);
         let cbor = current.to_vec().unwrap();
 
-        let node = build_published_node(&cbor, None, None).unwrap();
+        let node = build_published_node(&cbor, None, None, None).unwrap();
 
         assert_eq!(node.header.kind, NodeKind::Transparent);
         assert_eq!(node.entries.len(), 1); // only ""
@@ -1094,7 +1404,7 @@ mod tests {
         );
 
         let prev_hash = Hash::from([1u8; 32]);
-        let node = build_published_node(&cbor, Some(&prev), Some(prev_hash)).unwrap();
+        let node = build_published_node(&cbor, Some(&prev), Some(prev_hash), None).unwrap();
 
         // "" (current) + "2025-01-01..." (carried forward) + new timestamp entry
         assert_eq!(node.entries.len(), 3);
@@ -1123,10 +1433,91 @@ mod tests {
         let prev = make_transparent_node([2u8; 32]);
         let prev_hash = Hash::from([50u8; 32]);
 
-        let node = build_published_node(&cbor, Some(&prev), Some(prev_hash)).unwrap();
+        let node = build_published_node(&cbor, Some(&prev), Some(prev_hash), None).unwrap();
 
         // "" (current) + 1 new history entry
         assert_eq!(node.entries.len(), 2);
         assert!(node.entries.contains_key(""));
+    }
+
+    /// Insert `keys.len()` history entries into `node` under the given
+    /// RFC3339 timestamp keys (test helper for the history-bound tests).
+    fn add_history_entries(node: &mut Node, keys: &[&str]) {
+        for (i, k) in keys.iter().enumerate() {
+            node.entries.insert(
+                (*k).to_string(),
+                NodeEntry {
+                    content: Some(ContentRef {
+                        structural: Structural::Leaf,
+                        hash: [i as u8; 32],
+                        size: 0,
+                        plaintext_hash: None,
+                        stored_blocks: None,
+                    }),
+                    semantic: None,
+                    child_context: None,
+                    tombstone: None,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn build_published_node_keeps_only_last_n_history() {
+        let current = make_transparent_node([9u8; 32]);
+        let cbor = current.to_vec().unwrap();
+
+        // Previous TN carrying 6 history entries. `prev_encrypted_hash =
+        // None` so no new timestamp entry is added — this isolates the
+        // history-bound prune from the carry-forward+append logic.
+        let mut prev = make_transparent_node([1u8; 32]);
+        add_history_entries(
+            &mut prev,
+            &[
+                "2020-01-01T00:00:00Z",
+                "2021-01-01T00:00:00Z",
+                "2022-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                "2024-01-01T00:00:00Z",
+                "2025-01-01T00:00:00Z",
+            ],
+        );
+
+        let node = build_published_node(&cbor, Some(&prev), None, Some(3)).unwrap();
+
+        // Exactly the 3 newest history keys + "" survive.
+        assert_eq!(node.entries.len(), 4);
+        assert!(node.entries.contains_key(""));
+        assert!(node.entries.contains_key("2023-01-01T00:00:00Z"));
+        assert!(node.entries.contains_key("2024-01-01T00:00:00Z"));
+        assert!(node.entries.contains_key("2025-01-01T00:00:00Z"));
+        // The 3 oldest were dropped.
+        assert!(!node.entries.contains_key("2020-01-01T00:00:00Z"));
+        assert!(!node.entries.contains_key("2021-01-01T00:00:00Z"));
+        assert!(!node.entries.contains_key("2022-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn build_published_node_none_is_unbounded() {
+        let current = make_transparent_node([9u8; 32]);
+        let cbor = current.to_vec().unwrap();
+
+        let mut prev = make_transparent_node([1u8; 32]);
+        add_history_entries(
+            &mut prev,
+            &[
+                "2020-01-01T00:00:00Z",
+                "2021-01-01T00:00:00Z",
+                "2022-01-01T00:00:00Z",
+                "2023-01-01T00:00:00Z",
+                "2024-01-01T00:00:00Z",
+                "2025-01-01T00:00:00Z",
+            ],
+        );
+
+        // None => unbounded: every history entry preserved (regression
+        // guard for vaults that never set tn_history_keep).
+        let node = build_published_node(&cbor, Some(&prev), None, None).unwrap();
+        assert_eq!(node.entries.len(), 7); // "" + 6 carried
     }
 }

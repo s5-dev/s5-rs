@@ -10,8 +10,9 @@ license = "MIT OR Apache-2.0"
 anyhow.workspace = true
 blake3.workspace = true
 futures.workspace = true
+globset = "0.4"
 ignore = "0.4"
-libc = "0.2"
+libc.workspace = true
 s5_core.workspace = true
 s5_fs_v2.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
@@ -21,5 +22,5 @@ xattr = "1"
 
 [dev-dependencies]
 s5_store_memory.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -16,6 +16,10 @@ tracing.workspace = true
 # Native-only deps for service discovery (lock file + iroh connect)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 directories = "6.0.0"
+hex.workspace = true
 iroh.workspace = true
 irpc-iroh.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile.workspace = true

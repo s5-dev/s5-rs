@@ -33,11 +33,37 @@ pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
             .is_some_and(|v| v == s5_node_api::VERSION);
 
         if version_matches {
-            // Same version — try to connect
+            // Same version — get a lazy client and verify the daemon
+            // is actually answering. `connect_with_lock` builds an
+            // `IrohLazyRemoteConnection`, which never fails even if
+            // the daemon is dead; we have to issue a real RPC to
+            // tell. A short timeout is enough — local IPC roundtrip
+            // is sub-millisecond, so anything taking longer than ~2s
+            // is a stale lockfile pointing at a process that crashed
+            // (e.g. SIGKILL, OOM, or a `pkill vup` that took the
+            // daemon with the CLI).
             if let Ok(client) = connect::connect_with_lock(&lock).await {
-                return Ok(client);
+                let probe = tokio::time::timeout(Duration::from_secs(2), client.get_status()).await;
+                if matches!(probe, Ok(Ok(_))) {
+                    return Ok(client);
+                }
+                tracing::info!(
+                    "stale lock file (daemon not responding) — killing by PID and respawning"
+                );
+                client.close().await;
             }
-            // Connection failed despite lock existing — fall through to respawn
+            // Connection failed or daemon not responding —
+            // fall through to kill-and-respawn via the same path
+            // version mismatch takes.
+            if let Some(pid) = lock.pid {
+                #[cfg(unix)]
+                {
+                    use std::process::Command;
+                    let _ = Command::new("kill").arg(pid.to_string()).output();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            connect::remove_lock();
         } else {
             // Version mismatch (or old lock without version) — shut down stale daemon
             let old_version = lock.version.as_deref().unwrap_or("unknown");
@@ -53,10 +79,30 @@ pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
             if let Ok(client) = connect::connect_with_lock(&lock).await {
                 if client.shutdown().await.is_ok() {
                     shutdown_ok = true;
-                    // Give it a moment to clean up
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 client.close().await;
+            }
+
+            // An ACKED shutdown is not a dead daemon: a wedged
+            // upload can hold the old exit path while the process keeps the
+            // iroh endpoint key and service.lock — the replacement daemon
+            // then aborts on "another endpoint connected with the same
+            // endpoint id" and the takeover fails. Wait for the process to
+            // actually exit, then hard-kill it if it will not.
+            if shutdown_ok {
+                if let Some(pid) = lock.pid {
+                    if !wait_for_pid_exit(pid, Duration::from_secs(10)).await {
+                        tracing::warn!(
+                            pid,
+                            "old daemon acked shutdown but did not exit within 10s — hard-killing"
+                        );
+                        hard_kill(pid);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                } else {
+                    // No PID recorded — all we can do is give it a moment.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
 
             // Fallback: kill by PID if RPC failed (e.g. protocol mismatch)
@@ -124,6 +170,54 @@ pub async fn ensure_node_running(config_path: &Path) -> Result<S5NodeClient> {
     }
 }
 
+/// Poll until `pid` no longer exists, up to `grace`. Returns `true` when the
+/// process exited within the window.
+pub(crate) async fn wait_for_pid_exit(pid: u32, grace: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        #[cfg(unix)]
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        #[cfg(windows)]
+        let alive = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false);
+        #[cfg(not(any(unix, windows)))]
+        let alive = false;
+
+        if !alive {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Force-terminate `pid` (SIGKILL / `taskkill /F`) — the last resort for a
+/// daemon that acked shutdown but cannot die (wedged upload holding the exit
+/// path).
+fn hard_kill(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+}
+
 /// Spawn `vup _daemon --config <path>` as a fully detached background process.
 fn spawn_daemon(config_path: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("could not determine own executable path")?;
@@ -131,18 +225,36 @@ fn spawn_daemon(config_path: &Path) -> Result<()> {
         .to_str()
         .context("config path is not valid UTF-8")?;
 
+    // The child's tracing goes to node.log once it boots, but anything BEFORE
+    // tracing initializes (startup panic, bad config, linker error) used to
+    // vanish into /dev/null — a dead spawn attempt left no trail at all. Append stderr to daemon-spawn.log instead.
+    let spawn_stderr = || -> std::process::Stdio {
+        dirs::cache_dir()
+            .map(|d| d.join("s5").join("logs"))
+            .and_then(|dir| {
+                std::fs::create_dir_all(&dir).ok()?;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("daemon-spawn.log"))
+                    .ok()
+            })
+            .map(std::process::Stdio::from)
+            .unwrap_or_else(std::process::Stdio::null)
+    };
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         // process_group(0) makes the child a session leader so it survives
-        // the parent's exit. Redirect stdio to /dev/null.
+        // the parent's exit.
         let child = Command::new(&exe)
             .args(["_daemon", "--config", config_str])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(spawn_stderr())
             .process_group(0)
             .spawn()
             .with_context(|| format!("failed to spawn daemon: {}", exe.display()))?;
@@ -162,7 +274,7 @@ fn spawn_daemon(config_path: &Path) -> Result<()> {
             .args(["_daemon", "--config", config_str])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(spawn_stderr())
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .with_context(|| format!("failed to spawn daemon: {}", exe.display()))?;

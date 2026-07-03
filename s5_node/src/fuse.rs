@@ -46,7 +46,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::NodeConfigStore;
+use crate::config::NodeConfigStoreBackend;
 use crate::tasks::TaskExecutor;
 use crate::tasks::vault_persist::{load_vault_root, save_vault_root, vault_root_path};
 
@@ -262,9 +262,9 @@ impl MountManager {
                 )
             })?;
 
-        if vault_cfg.blob_stores.is_empty() {
-            bail!("vault '{vault}' has no blob_stores configured — nothing to mount from");
-        }
+        let mount_store_names = config
+            .vault_read_stores(vault, vault_cfg)
+            .map_err(|e| anyhow!("vault '{vault}': {e} — nothing to mount from"))?;
 
         // Re-open vault stores in-process for the mount. The daemon
         // already has these stores in `ctx.stores`, but mount needs
@@ -285,16 +285,26 @@ impl MountManager {
         ));
 
         let mut concrete_stores: Vec<BlobStore> = Vec::new();
-        for name in &vault_cfg.blob_stores {
+        for name in &mount_store_names {
             let store_cfg = config
                 .store
-                .get(name)
+                .get(*name)
                 .ok_or_else(|| anyhow!("blob_store '{name}' not declared in [store.*]"))?;
+            // TODO(mount/remote): lift this restriction by
+            // resolving the vault's stores from the daemon's OWN open
+            // handles — `NodeStores::blobs_map()` (D15) already holds
+            // every backend (packing-over-indexd included) as
+            // `Arc<dyn Blobs>`; re-opening from config here is what
+            // limits mounts to local stores. With the registry handles a
+            // Sia-backed vault mounts with zero extra machinery. Blocked
+            // only on plumbing `NodeStores` (or the blobs map) into
+            // `MountManager`.
+            //
             // Until the mount path moves through a daemon-internal
             // store handle (rather than re-opening from config), we
             // only support local stores in-process.
-            let local_cfg = match store_cfg {
-                NodeConfigStore::Local(cfg) => cfg,
+            let local_cfg = match &store_cfg.backend {
+                NodeConfigStoreBackend::Local(cfg) => cfg,
                 _ => bail!(
                     "blob_store '{name}' is not a local store — daemon-side mount currently \
                      supports only local stores (remote backends will be added when \
@@ -317,14 +327,16 @@ impl MountManager {
         let read_store: Arc<dyn BlobsRead> = Arc::new(FallbackBlobsRead::new(meta_store, combined));
 
         let current_path = vault_root_path(root_path);
-        let (root, root_plaintext_hash, context) =
-            load_vault_root(&current_path, &[identity_file.to_string()])
-                .with_context(|| format!("reading vault root for '{vault}'"))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "vault '{vault}' has no snapshot to mount — run `vup +{vault} snap` first"
-                    )
-                })?;
+        let (root, root_plaintext_hash, context) = load_vault_root(
+            &current_path,
+            &[identity_file.to_string()],
+        )
+        .with_context(|| format!("reading vault root for '{vault}'"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "vault '{vault}' has no snapshot to mount — run `vup backup <path> {vault}:` first"
+            )
+        })?;
 
         // Recipients (key names + age pubkeys) are only consumed by
         // the rw flush; resolving them up front keeps the rw branch
@@ -346,7 +358,7 @@ impl MountManager {
         let primary_store = concrete_stores
             .first()
             .cloned()
-            .ok_or_else(|| anyhow!("vault '{vault}' has no blob_stores configured"))?;
+            .ok_or_else(|| anyhow!("vault '{vault}' resolved no mountable store"))?;
         let vault_root_file = vault_root_path(root_path);
 
         Ok(ResolvedMount {
@@ -389,7 +401,7 @@ async fn publish_after_flush(
     vault_root_file: PathBuf,
 ) -> Result<()> {
     save_vault_root(&vault_root_file, &snapshot, &recipient_pubkeys)
-        .with_context(|| format!("rw flush: saving vault root for +{vault}"))?;
+        .with_context(|| format!("rw flush: saving vault root for {vault}:"))?;
 
     let (task_id, _) = executor
         .spawn(TaskSpec::Publish {
@@ -397,7 +409,7 @@ async fn publish_after_flush(
             keys: recipient_key_names,
         })
         .await
-        .with_context(|| format!("rw flush: dispatching publish task for +{vault}"))?;
+        .with_context(|| format!("rw flush: dispatching publish task for {vault}:"))?;
 
     tracing::info!(
         vault = %vault,

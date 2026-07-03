@@ -24,6 +24,17 @@ pub(crate) const BLOCK_SIZE: u32 = 4096;
 /// How long the kernel may cache the entry/attr replies before
 /// re-asking. One second strikes a balance between staleness on writes
 /// and avoiding lookup amplification on long directory walks.
+//
+// TODO(perf): 1s is a conservative placeholder. The daemon owns *every*
+// mutation — kernel writes funnel through `WritableFs`, and remote HEAD swaps
+// go through the mount manager — so staleness is fully observable on our side.
+// Once we surface the FUSE notifier and push `notify_inval_{inode,entry}` on
+// change (see `mount.rs`), raise this TTL by orders of magnitude: minutes for
+// directories, and effectively unbounded for immutable content-addressed
+// leaves (a given hash never changes its bytes). Long TTL + active
+// invalidation is exactly what removes the per-stat kernel<->daemon round trip
+// on a hot working set — the reason "FUSE is slow on metadata" does not apply
+// to a RAM-backed, mutation-aware daemon like this one.
 pub(crate) const ENTRY_TTL: Duration = Duration::from_secs(1);
 
 pub(crate) fn file_attr(entry: &NodeEntry) -> FileAttr {

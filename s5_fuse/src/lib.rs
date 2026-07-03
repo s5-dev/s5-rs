@@ -13,6 +13,14 @@
 //! Public surface kept narrow: callers normally just need
 //! [`mount::mount`] (re-exported as [`crate::mount`]) and, when
 //! testing, [`read::ReadOnlyFs`].
+//!
+//! TODO(mount/test): there is NO end-to-end mount test —
+//! nothing mounts a real vault and reads/writes through the kernel. Add
+//! an env-gated E2E (needs /dev/fuse): mount → hash-verify the tree →
+//! write via --rw → unmount → verify the published snapshot.
+//! TODO(mount/limits): document-as-beta-limitations rather
+//! than silently EIO: no rename, no random-offset writes (whole-file
+//! replace only), no chmod/chown persistence beyond size-truncate.
 
 mod attr;
 mod path;

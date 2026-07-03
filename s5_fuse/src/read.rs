@@ -118,6 +118,25 @@ impl PathFilesystem for ReadOnlyFs {
         }
     }
 
+    /// Read file bytes for `path` over `[offset, offset+size)`.
+    //
+    // TODO(perf): two kernel-assisted fast paths bypass this callback entirely
+    // and are the path to native-speed reads:
+    //   • FUSE passthrough (mainline Linux 6.9): for an *unencrypted*,
+    //     single-blob leaf (one `LocalStore` file on XFS), hand the kernel that
+    //     backing fd at `open` so reads go straight to XFS — never entering the
+    //     daemon. Gate strictly on: identity pipeline (no decrypt/decompress)
+    //     AND a single `Structural::Leaf` whose blob maps 1:1 to a backing
+    //     file. Does not apply to encrypted or multi-chunk content out of the
+    //     box (no plaintext backing file to pass through) — but a decrypted
+    //     plaintext cache file (materialise once on first open, hand the kernel
+    //     *that* fd) extends passthrough to encrypted/chunked content too,
+    //     trading disk for native data-path throughput. Blocked on `fuse3`
+    //     exposing passthrough.
+    //   • Page-cache retention (FOPEN_KEEP_CACHE): content is immutable per
+    //     content hash, so the kernel may keep cached pages across opens of the
+    //     same inode. Add an `open` impl returning the keep-cache flag for
+    //     committed (hash-stable) entries.
     async fn read(
         &self,
         _req: Request,
@@ -137,6 +156,22 @@ impl PathFilesystem for ReadOnlyFs {
                 Errno::from(libc::EIO)
             })?
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
+        // TODO(perf): CRITICAL — `export_bytes` materialises the *entire* file
+        // (fetch → decrypt → decompress every chunk) on every `read` call, then
+        // discards all but `[offset, offset+size)`. A sequential read of an
+        // N-byte file is therefore O(N²): each ~128 KiB kernel read redoes the
+        // whole file. Make this range-aware — descend the prolly tree to only
+        // the leaf chunks overlapping `[offset, offset+size)` and export those
+        // (the CDC chunk index already carries per-chunk offsets/sizes). Pair
+        // with a small per-fh decoded-chunk LRU so adjacent sequential reads
+        // don't re-fetch the shared boundary chunk. This is the single biggest
+        // read-path win and gates any real-world use as a live filesystem.
+        //
+        // TODO(mount/perf): the ranged primitive ALREADY EXISTS —
+        // `Pipeline::export_byte_chunks_at(&entry, &wanted, cache)`
+        // (s5_fs_v2/src/snapshot.rs, proven by
+        // `export_byte_chunks_at_fetches_only_wanted`). Wiring it here plus
+        // the per-fh LRU is the whole fix; no new machinery needed.
         let bytes = self.pipeline.export_bytes(&entry).await.map_err(|err| {
             warn!(key, error = %err, "export_bytes failed");
             Errno::from(libc::EIO)
@@ -167,6 +202,13 @@ impl PathFilesystem for ReadOnlyFs {
         ReplyDirectory<impl futures_util::Stream<Item = FuseResult<DirectoryEntry>> + Send + 'a>,
     > {
         let key = snapshot_key(path);
+        // TODO(perf): this re-scans and re-materialises *all* children on every
+        // `readdir`/`readdirplus` batch, then `skip`s `offset`. The kernel pages
+        // a large directory in many batches, so listing a dir with D entries is
+        // O(D²). Hold a per-fh resumable scan cursor (the prolly-tree scan is
+        // already an ordered stream — keep it open across batches keyed by `fh`)
+        // so each batch is O(batch), not O(D). readdirplus itself is correctly
+        // implemented; this is purely the pagination shape.
         let children = list_children(self.base.as_ref(), &key).await?;
 
         let mut entries: Vec<DirectoryEntry> = Vec::with_capacity(children.len() + 2);
@@ -308,7 +350,7 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(KEY_SLOT_LEAF, [42u8; 32]);
         keys.insert(KEY_SLOT_NODE, [43u8; 32]);
-        let pad = Some(PaddingStrategy { block_size: 1024 });
+        let pad = Some(PaddingStrategy { block_size: 4096 });
         let leaf_pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
             padding: pad.clone(),
@@ -424,7 +466,7 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(KEY_SLOT_LEAF, [42u8; 32]);
         keys.insert(KEY_SLOT_NODE, [43u8; 32]);
-        let pad = Some(PaddingStrategy { block_size: 1024 });
+        let pad = Some(PaddingStrategy { block_size: 4096 });
         let leaf_pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
             padding: pad.clone(),

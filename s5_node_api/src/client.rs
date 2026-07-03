@@ -22,6 +22,20 @@ impl S5NodeClient {
         }
     }
 
+    /// Create a client over a local (in-process) irpc transport — no
+    /// iroh endpoint involved. Pair with `S5NodeServer::serve_local`
+    /// (in the s5_node crate) on the server side to drive the same
+    /// RPC surface as remote callers without an iroh round-trip.
+    ///
+    /// Used by an embedding host's `bg_persist` hook to fire the s5
+    /// ingest task immediately after each persist cycle.
+    pub fn local(inner: irpc::Client<S5NodeProto>) -> Self {
+        Self {
+            inner,
+            endpoint: None,
+        }
+    }
+
     /// Access the underlying irpc client.
     pub fn inner(&self) -> &irpc::Client<S5NodeProto> {
         &self.inner
@@ -29,47 +43,52 @@ impl S5NodeClient {
 
     /// Run a task by name (looked up in node config).
     /// Daemon-side refusals (task missing, executor full, …) come back
-    /// as `Err`, not as a sentinel response — callers don't have to
-    /// special-case `task_id == 0` any more.
+    /// as `Err`.
     pub async fn run_task_by_name(&self, name: impl Into<String>) -> Result<SpawnedTask> {
-        let resp: RunTaskResponse = self
-            .inner
-            .rpc(RunTask {
-                name: Some(name.into()),
-                spec_json: None,
-            })
-            .await
-            .context("run_task RPC failed")?;
-        spawned_or_err(resp)
+        flatten_string_err(
+            self.inner
+                .rpc(RunTask {
+                    name: Some(name.into()),
+                    spec_json: None,
+                })
+                .await
+                .context("run_task RPC failed")?,
+        )
     }
 
     /// Run a task with an inline spec. See `run_task_by_name` for
     /// error-handling semantics.
     pub async fn run_task(&self, spec: TaskSpec) -> Result<SpawnedTask> {
         let spec_json = serde_json::to_string(&spec).context("failed to serialize task spec")?;
-        let resp: RunTaskResponse = self
-            .inner
-            .rpc(RunTask {
-                name: None,
-                spec_json: Some(spec_json),
-            })
-            .await
-            .context("run_task RPC failed")?;
-        spawned_or_err(resp)
+        flatten_string_err(
+            self.inner
+                .rpc(RunTask {
+                    name: None,
+                    spec_json: Some(spec_json),
+                })
+                .await
+                .context("run_task RPC failed")?,
+        )
     }
 
-    /// Get status of a task.
+    /// Snapshot of one task's current status. Implemented as the
+    /// first message of `watch_task_status` since `WatchTaskStatus`
+    /// already replays the current state — no separate RPC needed.
     pub async fn get_task_status(&self, task_id: u64) -> Result<TaskStatusResponse> {
-        self.inner
-            .rpc(GetTaskStatus { task_id })
-            .await
-            .context("get_task_status RPC failed")
+        let mut rx = self.watch_task_status(task_id).await?;
+        match rx.recv().await {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(anyhow!("task {task_id} not found")),
+            Err(e) => Err(anyhow!("watch_task_status stream error: {e}")),
+        }
     }
 
     /// Stream status updates for a task until it reaches a terminal state.
     ///
-    /// Returns a receiver that yields `TaskStatusResponse` messages as the task
-    /// progresses. The stream ends when the task completes, fails, or is cancelled.
+    /// First message = current state (so a single `recv` gives a
+    /// snapshot equivalent to the old `get_task_status`); subsequent
+    /// messages follow state changes. The stream ends when the task
+    /// completes, fails, or is cancelled.
     pub async fn watch_task_status(
         &self,
         task_id: u64,
@@ -81,11 +100,13 @@ impl S5NodeClient {
     }
 
     /// Cancel a running task.
-    pub async fn cancel_task(&self, task_id: u64) -> Result<CancelTaskResponse> {
-        self.inner
-            .rpc(CancelTask { task_id })
-            .await
-            .context("cancel_task RPC failed")
+    pub async fn cancel_task(&self, task_id: u64) -> Result<()> {
+        flatten_string_err(
+            self.inner
+                .rpc(CancelTask { task_id })
+                .await
+                .context("cancel_task RPC failed")?,
+        )
     }
 
     /// List all tasks.
@@ -113,13 +134,17 @@ impl S5NodeClient {
     }
 
     /// Apply an RFC 6902 JSON Patch to the node's configuration.
-    pub async fn patch_config(&self, patch: serde_json::Value) -> Result<PatchConfigResponse> {
+    /// Returns the patched config serialised as a JSON string on
+    /// success.
+    pub async fn patch_config(&self, patch: serde_json::Value) -> Result<String> {
         let patch_json =
             serde_json::to_string(&patch).context("failed to serialize patch to JSON string")?;
-        self.inner
-            .rpc(PatchConfig { patch_json })
-            .await
-            .context("patch_config RPC failed")
+        flatten_string_err(
+            self.inner
+                .rpc(PatchConfig { patch_json })
+                .await
+                .context("patch_config RPC failed")?,
+        )
     }
 
     /// Get a high-level node status summary.
@@ -130,6 +155,15 @@ impl S5NodeClient {
             .context("get_status RPC failed")
     }
 
+    /// Walk the node's health signals: per-store reachability + staging
+    /// gauges + configured schedules (`vup doctor` / `vup status`).
+    pub async fn get_health(&self) -> Result<GetHealthResponse> {
+        self.inner
+            .rpc(GetHealth)
+            .await
+            .context("get_health RPC failed")
+    }
+
     /// List vault snapshots.
     pub async fn list_snapshots(&self, vault: Option<String>) -> Result<ListSnapshotsResponse> {
         self.inner
@@ -138,11 +172,33 @@ impl S5NodeClient {
             .context("list_snapshots RPC failed")
     }
 
-    /// Mount a vault on the daemon as a FUSE filesystem. Returns a
-    /// `MountedVault` carrying the handle the daemon expects on
-    /// `unmount_vault`. Daemon-side preflight failures (vault missing,
-    /// `/dev/fuse` absent, mount point doesn't exist, etc.) come back
-    /// as `Err`, not as a sentinel response.
+    /// List a vault's tree contents, optionally at a past `#snap` and/or
+    /// scoped to a `subtree`, depth-bounded by `max_depth`. Daemon-side
+    /// failures (unknown vault, bad snapshot selector, missing subtree)
+    /// come through as `Err`.
+    pub async fn list_tree(
+        &self,
+        vault: impl Into<String>,
+        snapshot: Option<String>,
+        subtree: Option<String>,
+        max_depth: Option<u32>,
+    ) -> Result<ListTreeResponse> {
+        flatten_string_err(
+            self.inner
+                .rpc(ListTree {
+                    vault: vault.into(),
+                    snapshot,
+                    subtree,
+                    max_depth,
+                })
+                .await
+                .context("list_tree RPC failed")?,
+        )
+    }
+
+    /// Mount a vault on the daemon as a FUSE filesystem. Returns the
+    /// mount handle the daemon expects back on `unmount_vault`.
+    /// Daemon-side preflight failures come through as `Err`.
     pub async fn mount_vault(
         &self,
         vault: impl Into<String>,
@@ -150,58 +206,170 @@ impl S5NodeClient {
         rw: bool,
         debounce_ms: u64,
     ) -> Result<MountedVault> {
-        let resp: MountVaultResponse = self
-            .inner
-            .rpc(MountVault {
-                vault: vault.into(),
-                mountpoint,
-                rw,
-                debounce_ms,
-            })
-            .await
-            .context("mount_vault RPC failed")?;
-        match resp {
-            MountVaultResponse::Mounted { mount_id } => Ok(MountedVault { mount_id }),
-            MountVaultResponse::Refused { error } => Err(anyhow!(error)),
-        }
+        flatten_string_err(
+            self.inner
+                .rpc(MountVault {
+                    vault: vault.into(),
+                    mountpoint,
+                    rw,
+                    debounce_ms,
+                })
+                .await
+                .context("mount_vault RPC failed")?,
+        )
     }
 
     /// Unmount a vault previously mounted via `mount_vault`. Drops the
     /// daemon-side `MountHandle` (which performs the actual FUSE
     /// unmount) and tears down any attached rw debounce loop.
     pub async fn unmount_vault(&self, mount_id: u64) -> Result<()> {
-        let resp: UnmountVaultResponse = self
-            .inner
-            .rpc(UnmountVault { mount_id })
-            .await
-            .context("unmount_vault RPC failed")?;
-        match resp {
-            UnmountVaultResponse::Ok => Ok(()),
-            UnmountVaultResponse::Err { error } => Err(anyhow!(error)),
-        }
+        flatten_string_err(
+            self.inner
+                .rpc(UnmountVault { mount_id })
+                .await
+                .context("unmount_vault RPC failed")?,
+        )
     }
 
     /// Build a frozen-anonymous share URL for a vault snapshot.
-    /// Daemon-side errors come back as `Err`, not as a sentinel response.
     pub async fn export_vault(
         &self,
         vault: impl Into<String>,
         path: Option<String>,
     ) -> Result<ExportedShare> {
-        let resp: ExportVaultResponse = self
-            .inner
-            .rpc(ExportVault {
-                vault: vault.into(),
-                path,
-            })
+        flatten_string_err(
+            self.inner
+                .rpc(ExportVault {
+                    vault: vault.into(),
+                    path,
+                })
+                .await
+                .context("export_vault RPC failed")?,
+        )
+    }
+
+    /// Sender-side pair handshake. Returns a stream that yields
+    /// exactly one `Minted { token }` event followed by either a
+    /// `Redeemed { peer_did }` or `Failed { error }` event, then
+    /// closes. The CLI prints the token and prompts for a petname
+    /// once `Redeemed` arrives.
+    pub async fn pair(&self) -> Result<irpc::channel::mpsc::Receiver<PairEvent>> {
+        self.inner
+            .server_streaming(Pair, 2)
             .await
-            .context("export_vault RPC failed")?;
-        match resp {
-            ExportVaultResponse::Ok { url, blob_hash_hex } => {
-                Ok(ExportedShare { url, blob_hash_hex })
-            }
-            ExportVaultResponse::Err { error } => Err(anyhow!(error)),
-        }
+            .context("pair RPC failed")
+    }
+
+    /// Receiver-side: parse `token`, dial the sender's iroh
+    /// endpoint over `s5/pair/0`, present the secret, and return
+    /// the sender's DID on success.
+    pub async fn redeem_pair(&self, token: impl Into<String>) -> Result<String> {
+        flatten_string_err(
+            self.inner
+                .rpc(RedeemPair {
+                    token: token.into(),
+                })
+                .await
+                .context("redeem_pair RPC failed")?,
+        )
+    }
+
+    /// Inviter-side device enrollment (D10). Returns a stream that
+    /// yields one `Minted { token }` event followed by either
+    /// `Admitted { label, .. }` or `Failed { error }`, then closes.
+    pub async fn device_invite(
+        &self,
+        label: Option<String>,
+    ) -> Result<irpc::channel::mpsc::Receiver<DeviceInviteEvent>> {
+        self.inner
+            .server_streaming(DeviceInvite { label }, 2)
+            .await
+            .context("device_invite RPC failed")
+    }
+
+    /// Read the device catalogue (label → pubkeys; UI only).
+    pub async fn list_devices(&self) -> Result<ListDevicesResponse> {
+        flatten_string_err(
+            self.inner
+                .rpc(ListDevices)
+                .await
+                .context("list_devices RPC failed")?,
+        )
+    }
+
+    /// Revoke a device by catalogue label (D18 routine removal): its
+    /// four keys leave the identity bundle, its catalogue entry is
+    /// removed, and the special vaults are re-wrapped to the survivors
+    /// (+ paper). Refusals (unknown label, self-revoke) come back as
+    /// `Err`.
+    pub async fn revoke_device(&self, label: impl Into<String>) -> Result<RevokeDeviceResponse> {
+        flatten_string_err(
+            self.inner
+                .rpc(RevokeDevice {
+                    label: label.into(),
+                })
+                .await
+                .context("revoke_device RPC failed")?,
+        )
+    }
+
+    /// Persist a `[friend.<petname>]` entry with the supplied DID.
+    /// Idempotent on identical pairings; refuses petname collisions
+    /// with a different DID.
+    pub async fn add_friend(
+        &self,
+        petname: impl Into<String>,
+        did: impl Into<String>,
+    ) -> Result<()> {
+        flatten_string_err(
+            self.inner
+                .rpc(AddFriend {
+                    petname: petname.into(),
+                    did: did.into(),
+                })
+                .await
+                .context("add_friend RPC failed")?,
+        )
+    }
+
+    /// Append `@petname` to `vault.<vault>.members`, persist, and
+    /// fire a membership refresh.
+    /// Consume an `s5://export/…` share URL; returns the joined vault label.
+    pub async fn join_export(&self, url: impl Into<String>) -> Result<String> {
+        flatten_string_err(
+            self.inner
+                .rpc(JoinExport { url: url.into() })
+                .await
+                .context("join_export RPC failed")?,
+        )
+    }
+
+    pub async fn grant_vault(
+        &self,
+        vault: impl Into<String>,
+        petname: impl Into<String>,
+        write: bool,
+    ) -> Result<()> {
+        flatten_string_err(
+            self.inner
+                .rpc(GrantVault {
+                    vault: vault.into(),
+                    petname: petname.into(),
+                    write,
+                })
+                .await
+                .context("grant_vault RPC failed")?,
+        )
+    }
+
+    /// Snapshot of per-peer connection observation — every iroh
+    /// pubkey this daemon has handshaked with, with per-ALPN
+    /// counts and timestamps. Powers `vup debug peers`.
+    pub async fn debug_peers(&self) -> Result<DebugPeersResponse> {
+        self.inner
+            .rpc(DebugPeers)
+            .await
+            .context("debug_peers RPC failed")
     }
 
     /// Gracefully close the underlying iroh endpoint.
@@ -215,14 +383,12 @@ impl S5NodeClient {
     }
 }
 
-/// Convert a `RunTaskResponse` into a flattened `Result<SpawnedTask>`,
-/// used by both `run_task` and `run_task_by_name` so the matching
-/// logic lives in exactly one place.
-fn spawned_or_err(resp: RunTaskResponse) -> Result<SpawnedTask> {
-    match resp {
-        RunTaskResponse::Spawned { task_id, spec_json } => Ok(SpawnedTask { task_id, spec_json }),
-        RunTaskResponse::Refused { error } => Err(anyhow!(error)),
-    }
+/// Lift a daemon-returned `Result<T, String>` into the client's
+/// `anyhow::Result<T>` so callers don't have to match on a String
+/// error variant themselves. Used by every RPC that returns
+/// `Result<_, String>` on the wire.
+fn flatten_string_err<T>(resp: std::result::Result<T, String>) -> Result<T> {
+    resp.map_err(|e| anyhow!(e))
 }
 
 impl Drop for S5NodeClient {
