@@ -5,12 +5,39 @@ use s5_core::blob::location::BlobLocation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// The ALPN string for this protocol
-pub const ALPN: &[u8] = b"s5/blobs/0";
+/// ALPN for the **public** blobs protocol — serves only blobs in the
+/// node's `public_blob_hashes` set (identity bundles, advertised
+/// public-vault content). No challenge handshake; any peer may dial.
+pub const ALPN_PUBLIC: &[u8] = b"s5/blobs/public/v1";
+
+/// ALPN for the **ACL-gated** blobs protocol. First exchange must be
+/// `AuthChallenge` → `AuthProve` (F02 challenge per
+/// `docs/reference/acl-and-revocation.md §3a`). The client signs a
+/// server-issued nonce bound to both transport pubkeys with its device
+/// ACL key; the server verifies the sig and checks that the ACL pubkey
+/// is in some served vault's `authorized_acl_pubkeys`. All subsequent
+/// requests are gated by `allow_acl_read(bound_acl_pubkey, hash)`.
+pub const ALPN_ACL: &[u8] = b"s5/blobs/acl/v1";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[rpc_requests(message = RpcMessage)]
 pub enum RpcProto {
+    /// **F02 challenge step 1** (ACL ALPN only). The client opens this
+    /// RPC as its first message; the server replies with a fresh 32-byte
+    /// random nonce held in per-connection state. On the public ALPN,
+    /// this is rejected with a permission error.
+    #[rpc(tx = oneshot::Sender<AuthChallengeResponse>)]
+    AuthChallenge(AuthChallenge),
+    /// **F02 challenge step 2** (ACL ALPN only). The client signs
+    /// `"s5-blobs-acl-v1-auth:" || binding` (where `binding` is
+    /// `blake3.derive_key("s5-blobs-acl-v1-binding", nonce ||
+    /// client_iroh_pub || server_iroh_pub)`) with its device ACL key
+    /// and presents it here. The server verifies the signature and
+    /// checks that `acl_pubkey ∈` some served vault's
+    /// `authorized_acl_pubkeys`; on success it records the bound ACL
+    /// pubkey for the connection lifetime.
+    #[rpc(tx = oneshot::Sender<Result<(), String>>)]
+    AuthProve(AuthProve),
     #[rpc(tx = oneshot::Sender<QueryResponse>)]
     Query(Query),
     // Client streams bytes to server; server replies with a Result.
@@ -25,7 +52,13 @@ pub enum RpcProto {
     /// The response is `Ok(true)` if the blob became orphaned
     /// and was deleted, `Ok(false)` if other pins remain, and
     /// `Err(String)` on permission or other server-side errors.
-    // TODO this could be a privacy issue, because now any node knows if maybe someone else pinned the same hash on the remote node or not. do we actually need the bool?
+    //
+    // TODO(audit): drop the bool. It tells the caller whether
+    // *other* peers also pinned this hash, which is a privacy
+    // leak — anyone can probe "is this hash pinned by someone
+    // else here?" by sending DeleteBlob and reading the bool.
+    // Replace with `Result<(), String>`; clients don't actually
+    // consume the bool today.
     #[rpc(tx = oneshot::Sender<Result<bool, String>>)]
     DeleteBlob(DeleteBlob),
     /// Request that the server pin a blob that already exists.
@@ -34,6 +67,76 @@ pub enum RpcProto {
     /// `Ok(false)` if the blob was not found, and `Err(String)` on error.
     #[rpc(tx = oneshot::Sender<Result<bool, String>>)]
     PinBlob(PinBlob),
+}
+
+/// First step of the F02 ACL challenge. Client sends a wire-format
+/// version tag (currently `1`) so future protocol revisions can be
+/// distinguished cleanly; the server generates a fresh 32-byte random
+/// nonce and returns it. Client must call this before any other
+/// request on the ACL ALPN.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthChallenge {
+    pub version: u8,
+}
+
+impl Default for AuthChallenge {
+    fn default() -> Self {
+        Self { version: 1 }
+    }
+}
+
+/// Response to `AuthChallenge`. The 32-byte `nonce` is the only piece
+/// the client needs from the server; combined with both transport
+/// pubkeys (known to both sides at QUIC handshake time) it forms the
+/// binding the client signs in `AuthProve`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthChallengeResponse {
+    pub nonce: [u8; 32],
+}
+
+/// Second step of the F02 ACL challenge. `acl_pubkey` is the client's
+/// device ACL/read verifying key (must `∈` some served vault's
+/// `authorized_acl_pubkeys` for the principal check to pass).
+///
+/// The signature is ed25519 over `b"s5-blobs-acl-v1-auth:" || binding`,
+/// where `binding = blake3.derive_key("s5-blobs-acl-v1-binding",
+/// nonce || client_iroh_pubkey || server_iroh_pubkey)`. Split into two
+/// 32-byte halves (`sig_r`, `sig_s`) — semantically the R-point and s-
+/// scalar of the ed25519 signature; the split exists because serde's
+/// derive macros don't support `[u8; 64]` directly.
+///
+/// The channel-bound binding is the entire MITM/relay defence: a sig
+/// minted for connection A can't be replayed on connection B because B's
+/// nonce + transport pubkeys produce a different binding. The `nonce`
+/// alone prevents time-replay on the same identity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthProve {
+    pub acl_pubkey: [u8; 32],
+    pub sig_r: [u8; 32],
+    pub sig_s: [u8; 32],
+}
+
+impl AuthProve {
+    /// Build an `AuthProve` from a contiguous 64-byte ed25519 signature.
+    pub fn from_sig(acl_pubkey: [u8; 32], sig: [u8; 64]) -> Self {
+        let mut sig_r = [0u8; 32];
+        let mut sig_s = [0u8; 32];
+        sig_r.copy_from_slice(&sig[..32]);
+        sig_s.copy_from_slice(&sig[32..]);
+        Self {
+            acl_pubkey,
+            sig_r,
+            sig_s,
+        }
+    }
+
+    /// Reassemble the 64-byte ed25519 signature.
+    pub fn sig_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.sig_r);
+        out[32..].copy_from_slice(&self.sig_s);
+        out
+    }
 }
 
 /// Pin request identified by the blob's content hash.
@@ -83,6 +186,16 @@ pub struct QueryResponse {
 }
 
 /// Query a peer for a blob.
+//
+// TODO(audit): this struct + `QueryResponse` are the unfinished
+// peer-routing design (locations, blinded, actual_hash,
+// location_types). In-tree only `exists` and `size` are consumed
+// (`BlobsRead::blob_contains` / `blob_get_size`); the rest is
+// dead weight on every wire round-trip. Either commit to the
+// full peer-discovery design with tests + a real consumer, or
+// strip Query/QueryResponse to `{hash} -> {exists, size}` and
+// add the richer shape back behind a versioned RPC when there's
+// an actual user. See also the original-design TODOs below.
 #[derive(Debug, Serialize, Deserialize)]
 // TODO: Implement multi-target queries as in the original design:
 // - interpret `location_types` as requested location kinds (e.g. BlobContent, Obao6).

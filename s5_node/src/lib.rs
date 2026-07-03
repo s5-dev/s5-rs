@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use crate::config::{NodeConfigRegistry, NodeConfigStore, S5NodeConfig};
 use anyhow::anyhow;
 use iroh::{Endpoint, protocol::Router};
-use s5_blobs::{ALPN as BLOBS_ALPN, BlobsServer};
+use s5_blobs::{ALPN_PUBLIC as BLOBS_ALPN, BlobsServer, ServerMode};
 use s5_core::blob::{BlobStore, BlobsRead};
 use s5_core::{RegistryApi, StoreResult};
 use s5_registry::MemoryRegistry;
@@ -171,7 +171,8 @@ impl S5Node {
         // system is wired up (replaces the old `config.fs` loop).
 
         let blobs_server =
-            BlobsServer::with_read_sources(stores.clone(), read_sources, peer_cfg, pinner);
+            BlobsServer::with_read_sources(stores.clone(), read_sources, peer_cfg, pinner)
+                .with_mode(ServerMode::Public);
         let mut router_builder = Router::builder(endpoint.clone()).accept(BLOBS_ALPN, blobs_server);
         if let Some(registry_ref) = registry.as_ref() {
             // TODO: registry should forward set events to all connected peers

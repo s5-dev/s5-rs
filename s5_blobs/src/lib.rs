@@ -24,7 +24,7 @@
 //! even without the server feature).
 
 pub mod rpc;
-pub use crate::rpc::ALPN;
+pub use crate::rpc::{ALPN_ACL, ALPN_PUBLIC};
 
 #[cfg(feature = "server")]
 mod config;
@@ -37,7 +37,7 @@ pub use client::Client;
 #[cfg(feature = "server")]
 mod net_protocol;
 #[cfg(feature = "server")]
-pub use net_protocol::BlobsServer;
+pub use net_protocol::{BlobAcl, BlobsServer, PermitAllBlobAcl, ServerMode};
 
 mod store_remote;
 pub use store_remote::RemoteBlobStore;
