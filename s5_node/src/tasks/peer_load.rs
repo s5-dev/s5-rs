@@ -3,14 +3,14 @@
 //! Each device that participates in a vault publishes its current
 //! Transparent Node tip into the registry under
 //! `StreamKey::Vault { pubkey: device_signing_pubkey, vault_id }` and
-//! mirrors the encrypted blob to the vault's `meta_targets`. This module
+//! mirrors the encrypted blob to the vault's meta store. This module
 //! is the read-side mirror: given a peer's `device_signing_pubkey` and
 //! the shared `vault_id`, it walks the registry → store → age-decrypt
 //! pipeline and returns a [`Snapshot`] over that peer's tip — ready to
 //! drop into a [`MergedView`](s5_fs_v2::merge::MergedView) alongside our
 //! own snapshot.
 //!
-//! This is the primitive behind `vup +<vault> mount` showing peers' files.
+//! This is the primitive behind `vup mount <vault>:` showing peers' files.
 //! Today there is no `[vault.<name>.peers]` config field that records the
 //! enumerated peer pubkeys (a future Pair flow concern); for now the
 //! caller specifies peers explicitly. Keeping the helper this narrow
@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use s5_core::blob::BlobStore;
+use s5_core::blob::Blobs;
 use s5_core::{BlobsRead, RegistryApi, StreamKey};
 use s5_fs_v2::snapshot::Snapshot;
 
@@ -48,7 +48,7 @@ pub async fn load_peer_snapshot(
     peer_pubkey: [u8; 32],
     vault_id: [u8; 16],
     registry: &dyn RegistryApi,
-    blob_store: &BlobStore,
+    blob_store: &dyn Blobs,
     identity_files: &[String],
     read_store: Arc<dyn BlobsRead>,
 ) -> anyhow::Result<Option<Snapshot>> {

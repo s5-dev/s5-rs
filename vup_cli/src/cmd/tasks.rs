@@ -4,7 +4,7 @@
 //! `ensure_node_running()`.
 //!
 //! Some helpers here (`run_task_by_name`, `run_ingest`, `run_backup`,
-//! `resolve_single_or_default`, `run_remote_restore_task`) currently
+//! `resolve_single_or_default`) currently
 //! have no caller — they're legacy verb wrappers tied to the old config
 //! shape (e.g. `run_backup` derives keys from `vault.<name>.key` rather
 //! than `vault.<name>.recipients`). The new vocabulary verbs in
@@ -32,7 +32,7 @@ pub async fn run_task_by_name(client: &S5NodeClient, name: &str) -> Result<()> {
 }
 
 /// `vup ingest` — run an inline ingest task.
-#[allow(dead_code)] // ingest is bundled into `+vault snap`; kept for direct-task scenarios
+#[allow(dead_code)] // ingest is bundled into `vup backup`; kept for direct-task scenarios
 pub async fn run_ingest(
     client: &S5NodeClient,
     vault: &str,
@@ -55,12 +55,12 @@ pub async fn run_ingest(
 /// All parameters are optional. When omitted, they're resolved from config:
 /// - vault: the sole vault, or "default"
 /// - source: the sole source, or "default"
-/// - blob_store: first store from the vault's `blob_stores`
+/// - blob_store: the vault's resolved data store (D1)
 /// - keys: vault's `key` + "recovery" if configured
 ///
 /// This reads the **legacy** vault shape (`vault.<name>.key` as a single
 /// key string + a parallel `recovery` lookup). The new vocabulary verb
-/// `vup +<vault> snap` reads `vault.<name>.recipients` directly and
+/// `vup backup … <vault>:` reads `vault.<name>.recipients` directly and
 /// builds the `TaskSpec::Backup` inline in `cmd::vault::run_snap`.
 #[allow(dead_code)] // legacy resolver — superseded by cmd::vault::run_snap
 pub async fn run_backup(
@@ -94,18 +94,7 @@ pub async fn run_backup(
     // Resolve blob store
     let blob_store = match blob_store_override {
         Some(b) => b.to_string(),
-        None => vault_cfg
-            .get("blob_stores")
-            .and_then(|s| s.as_array())
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "vault '{}' has no blob_stores configured — use --blob-store",
-                    vault_name
-                )
-            })?,
+        None => super::vault::resolve_data_store(&config, &vault_name)?,
     };
 
     // Resolve keys
@@ -136,6 +125,7 @@ pub async fn run_backup(
         blob_store,
         keys,
         target_path: None,
+        changed_paths: None,
     };
     let resp = client.run_task(spec).await?;
     println!("Backup started (id={})", resp.task_id);
@@ -173,43 +163,32 @@ fn resolve_single_or_default(
 }
 
 /// `vup restore` — restore a vault to a target directory.
+///
+/// `snapshot` (D20 `#snap`) selects a past published snapshot; `subtree`
+/// (D20 `vault:path`) restores only that path, re-rooted at the target. Both
+/// default to the whole current snapshot when `None`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_restore_task(
     client: &S5NodeClient,
     vault: &str,
     target_path: &str,
     blob_store: Option<&str>,
+    snapshot: Option<&str>,
+    subtree: Option<&str>,
 ) -> Result<()> {
     let spec = TaskSpec::Restore {
         vault: vault.to_string(),
         target_path: target_path.to_string(),
         blob_store: blob_store.map(String::from),
+        snapshot: snapshot.map(String::from),
+        subtree: subtree.map(String::from),
     };
     let resp = client.run_task(spec).await?;
     println!("Restore started (id={})", resp.task_id);
     poll_until_done(client, resp.task_id).await
 }
 
-/// `vup remote-restore` — disaster recovery from paper age key.
-#[allow(dead_code)] // retained — natural fit for a future `vup join s5://…` recovery URL flow
-pub async fn run_remote_restore_task(
-    client: &S5NodeClient,
-    age_secret_key: &str,
-    vault: &str,
-    blob_store: &str,
-    target_path: &str,
-) -> Result<()> {
-    let spec = TaskSpec::RemoteRestore {
-        vault: vault.to_string(),
-        age_secret_key: age_secret_key.to_string(),
-        blob_store: blob_store.to_string(),
-        target_path: target_path.to_string(),
-    };
-    let resp = client.run_task(spec).await?;
-    println!("Remote restore started (id={})", resp.task_id);
-    poll_until_done(client, resp.task_id).await
-}
-
-/// `vup task-status <id>` — show task status.
+/// `vup tasks <id>` — show task status.
 pub async fn task_status(client: &S5NodeClient, task_id: u64) -> Result<()> {
     let resp = client.get_task_status(task_id).await?;
     print_status(resp.task_id, &resp.state, resp.progress.as_ref());
@@ -232,11 +211,9 @@ pub async fn list_tasks(client: &S5NodeClient) -> Result<()> {
 
 /// `vup cancel <id>` — cancel a running task.
 pub async fn cancel_task(client: &S5NodeClient, task_id: u64) -> Result<()> {
-    let resp = client.cancel_task(task_id).await?;
-    if resp.ok {
-        println!("Task {} cancelled.", task_id);
-    } else {
-        println!("Task {}: {}", task_id, resp.message);
+    match client.cancel_task(task_id).await {
+        Ok(()) => println!("Task {} cancelled.", task_id),
+        Err(e) => println!("Task {}: {:#}", task_id, e),
     }
     Ok(())
 }

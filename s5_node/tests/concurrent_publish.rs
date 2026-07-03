@@ -38,7 +38,7 @@ use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures_util::StreamExt;
 use s5_core::RegistryApi;
-use s5_core::blob::BlobStore;
+use s5_core::blob::{BlobStore, Blobs};
 use s5_core::store::Store;
 use s5_fs_v2::layer::ReadableLayer;
 use s5_fs_v2::overlay::WritableOverlay;
@@ -65,8 +65,8 @@ fn build_ctx(
     relay_raw: Arc<dyn Store>,
     node_secret: [u8; 32],
 ) -> Arc<TaskExecutorContext> {
-    let mut stores = HashMap::new();
-    stores.insert("relay".to_string(), relay_blob);
+    let mut stores: HashMap<String, Arc<dyn Blobs>> = HashMap::new();
+    stores.insert("relay".to_string(), Arc::new(relay_blob));
 
     let memory: Arc<dyn RegistryApi + Send + Sync> = Arc::new(MemoryRegistry::new());
     let store_reg: Arc<dyn RegistryApi + Send + Sync> =
@@ -78,6 +78,9 @@ fn build_ctx(
         stores,
         node_secret,
         registry: Some(Arc::new(multi)),
+        membership: None,
+        membership_refresh: None,
+        discovery_seed: Default::default(),
     })
 }
 
@@ -105,6 +108,9 @@ fn vault_config(
             respect_ignore_files: false,
             exclude: Vec::new(),
             one_file_system: false,
+            follow_symlinks: false,
+            detect_deletions: false,
+            max_concurrent_ops: None,
         },
     );
 
@@ -114,13 +120,18 @@ fn vault_config(
         NodeConfigVault {
             root_path: vault_root.to_string(),
             key: "paper".to_string(),
-            blob_stores: vec!["relay".to_string()],
+            data_store: Some("relay".to_string()),
             preset: None,
             recipients: vec!["paper".to_string()],
             sources: vec!["docs".to_string()],
-            meta_targets: vec![],
+            meta_store: None,
             plaintext_tree: false,
+            plaintext_published_tn: false,
             watch: false,
+            members: Vec::new(),
+            pipelines: Vec::new(),
+            vault_id: None,
+            ..Default::default()
         },
     );
 
@@ -129,13 +140,19 @@ fn vault_config(
             secret_key_file: None,
             secret_key: None,
             encrypted_with: None,
+            master_key_file: None,
+            anchor_entry_file: None,
+            keyset_file: None,
+            bootstrap_store: None,
         },
         key,
         store: BTreeMap::new(),
+        default_store: None,
         registry: BTreeMap::new(),
         source,
         vault,
         task: BTreeMap::new(),
+        friend: BTreeMap::new(),
     }
 }
 
@@ -158,7 +175,7 @@ fn make_initial_snapshot(
     keys.insert(KEY_SLOT_LEAF, [0xAAu8; 32]);
     keys.insert(KEY_SLOT_NODE, [0xBBu8; 32]);
     keys.insert(KEY_SLOT_RECOVERY, recovery_secret);
-    let pad = Some(PaddingStrategy { block_size: 1024 });
+    let pad = Some(PaddingStrategy { block_size: 4096 });
     let leaf_pipeline = BlobPipeline {
         compression: Some(CompressionStrategy::Zstd),
         padding: pad.clone(),
@@ -249,13 +266,13 @@ async fn list_keys_in_latest_published(
         .stores
         .get("relay")
         .ok_or_else(|| anyhow!("no relay store"))?;
-    let read_store: Arc<dyn s5_core::BlobsRead> = Arc::new(blob_store.clone());
+    let read_store: Arc<dyn s5_core::BlobsRead> = blob_store.clone();
 
     let snap = load_peer_snapshot(
         pubkey_bytes,
         vault_id,
         registry.as_ref(),
-        blob_store,
+        blob_store.as_ref(),
         &[identity_file.to_string()],
         read_store,
     )

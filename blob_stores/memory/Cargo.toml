@@ -9,8 +9,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-dashmap = "6.1.0"
+dashmap.workspace = true
 futures.workspace = true
+# Byte-weighted W-TinyLFU backend for the budgeted store variant.
+moka = { version = "0.12", features = ["sync"] }
 s5_core.workspace = true
 
 [dev-dependencies]

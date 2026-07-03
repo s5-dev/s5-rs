@@ -125,7 +125,7 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(KEY_SLOT_LEAF, [42u8; 32]);
         keys.insert(KEY_SLOT_NODE, [43u8; 32]);
-        let pad = Some(PaddingStrategy { block_size: 1024 });
+        let pad = Some(PaddingStrategy { block_size: 4096 });
         let leaf_pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
             padding: pad.clone(),

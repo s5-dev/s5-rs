@@ -91,6 +91,21 @@ where
 
     let fs = ReadOnlyFs::new(snapshot);
 
+    // TODO(perf): transport + caching knobs that bring FUSE within striking
+    // distance of a native FS are not yet wired here. In rough order of impact:
+    //   • io_uring backend (FUSE-over-io_uring, mainline Linux 6.14): collapses
+    //     the per-request context-switch cost on every kernel<->daemon round
+    //     trip — the dominant cost on cache misses (cold tree walks). Blocked on
+    //     `fuse3` exposing an io_uring mount path; track upstream or move to a
+    //     binding that does. Single biggest win for metadata-heavy workloads.
+    //   • notify-invalidate: surface the `Session`/`MountHandle` notifier so the
+    //     daemon can push `fuse_lowlevel_notify_inval_{inode,entry}` whenever a
+    //     mutation lands (local write via WritableFs, or a remote HEAD swap).
+    //     This is the precondition for a long entry/attr TTL (see
+    //     `attr::ENTRY_TTL`) being safe — long TTL + active invalidation ≈ zero
+    //     metadata round trips on a hot working set.
+    //   • writeback caching (FUSE_WRITEBACK_CACHE) + larger max_write: matters
+    //     on the writable mount (see `mount_rw`), not here.
     let mut options = MountOptions::default();
     options.fs_name("s5");
     options.read_only(true);
@@ -153,6 +168,17 @@ where
     let fs = WritableFs::new(snapshot, store);
     on_mount(fs.clone());
 
+    // TODO(perf): see `mount()` for the shared transport/caching list
+    // (io_uring, notify-invalidate). Two more matter specifically on the
+    // writable path:
+    //   • writeback caching (FUSE_WRITEBACK_CACHE): lets the kernel coalesce
+    //     dirty pages and issue fewer, larger WRITEs instead of one per page —
+    //     and is what makes writable MAP_SHARED mmap behave correctly (FUSE's
+    //     sharpest remaining edge vs a kernel FS). Enable once the write path
+    //     streams chunks rather than buffering whole files in RAM (see
+    //     `write.rs` — in_flight Vec<u8> + commit-on-release).
+    //   • bump max_write (currently 1 MiB in `init`) in tandem with writeback
+    //     so big sequential writes aren't capped at 1 MiB per request.
     let mut options = MountOptions::default();
     options.fs_name("s5");
     options.allow_root(allow_root);

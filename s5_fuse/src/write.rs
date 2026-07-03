@@ -402,6 +402,19 @@ impl PathFilesystem for WritableFs {
         Ok(ReplyOpen { fh, flags })
     }
 
+    /// Buffer a write into the per-path in-flight buffer; commit happens on
+    /// `release`.
+    //
+    // TODO(perf): the in-flight buffer is a whole-file `Vec<u8>` (see struct
+    // docs), so writing one byte into a 10 GB file costs 10 GB of RAM and a full
+    // re-chunk + re-encrypt of the file on commit. Stream instead: chunk the
+    // write region with the CDC chunker and rewrite only the affected leaf
+    // chunks (content-defined boundaries mean an in-place edit re-chunks just a
+    // local window, not the whole file — this is the CoW win the prolly tree is
+    // built for). Until then, large-file random writes are effectively
+    // unsupported. Separately, `in_flight` is one global `Mutex<HashMap>` that
+    // every read/write/attr locks — shard it (per-path or DashMap) before this
+    // sees concurrent multi-file write load.
     async fn write(
         &self,
         _req: Request,
@@ -461,6 +474,10 @@ impl PathFilesystem for WritableFs {
                 Errno::from(libc::EIO)
             })?
             .ok_or_else(|| Errno::from(libc::ENOENT))?;
+        // TODO(perf): same whole-file materialisation problem as
+        // `ReadOnlyFs::read` (O(N²) on sequential reads) — make range-aware and
+        // share the per-fh decoded-chunk LRU. See the CRITICAL note in
+        // `read.rs`.
         let bytes = self
             .overlay
             .pipeline()
@@ -726,7 +743,7 @@ mod tests {
         let mut keys = BTreeMap::new();
         keys.insert(KEY_SLOT_LEAF, [42u8; 32]);
         keys.insert(KEY_SLOT_NODE, [43u8; 32]);
-        let pad = Some(PaddingStrategy { block_size: 1024 });
+        let pad = Some(PaddingStrategy { block_size: 4096 });
         let leaf_pipeline = BlobPipeline {
             compression: Some(CompressionStrategy::Zstd),
             padding: pad.clone(),

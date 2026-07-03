@@ -2,7 +2,7 @@
 //!
 //! Creates the config directory, generates age keys, asks where to store
 //! backups (local or S3), scaffolds `config.toml` with the vault schema
-//! (recipients/sources/meta_targets), and prints the recovery secret
+//! (recipients/sources/default_store), and prints the recovery secret
 //! for the user to write down.
 //!
 //! `onboard` is one of two CLI verbs that runs without a daemon
@@ -62,38 +62,76 @@ pub async fn run_onboard(config_path: &Path) -> Result<()> {
         fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
     }
 
-    // -- Generate recovery key -----------------------------------------------
-    let (recovery_public, recovery_secret) = crate::recovery::generate_recovery_key();
+    // -- Generate paper recovery mnemonic ------------------------------------
+    // The phrase is the user's paper recovery token: BOTH the recovery age key
+    // (a permanent recipient of every vault root → vault *content* recovery) and
+    // the COLD identity key (whose pubkey IS the DID → *identity* recovery)
+    // derive from it, so the words alone reconstruct the identity and decrypt
+    // the data (identity-rotation.md §3/§8).
+    let mnemonic =
+        s5_node::mnemonic::generate_mnemonic().context("generating recovery mnemonic")?;
+    let root_master =
+        s5_node::mnemonic::root_master(&mnemonic).context("deriving root from mnemonic")?;
+    let recovery_public = s5_node::mnemonic::paper_age_identity(&root_master)
+        .context("deriving recovery age key")?
+        .to_public()
+        .to_string();
 
-    // -- Generate node identity secret (32 random bytes, age-encrypted) --------
+    // D17 cold/warm split: the cold key signs exactly one thing — the cold
+    // pointer below — and is NEVER written to disk (paper-only; the phrase
+    // re-derives it). Epoch 1's pubkey is the pre-committed successor
+    // (identity-rotation.md §6.3), derivable now while the mnemonic is in hand.
+    let cold = s5_node::mnemonic::identity_cold_signing_key(&root_master, 0);
+    let did = s5_core::Did::from_pubkey(s5_core::identity::DidMasterPubkey::from_verifying_key(
+        &cold.verifying_key(),
+    ));
+    let next_cold_pub = s5_node::mnemonic::identity_cold_signing_key(&root_master, 1)
+        .verifying_key()
+        .to_bytes();
+
+    // -- Persist the per-device + identity secrets, age-encrypted at rest ----
+    // Node/device identity: random per device, never recovered from the phrase.
     let mut node_secret_bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut node_secret_bytes);
-
-    // Encrypt with main age key so the identity is protected at rest
-    let recipient: age::x25519::Recipient = main_public
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parsing main public key as age recipient: {e}"))?;
-    let encryptor =
-        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
-            .map_err(|e| anyhow::anyhow!("creating age encryptor: {e}"))?;
-    let mut ciphertext = vec![];
-    let mut writer = encryptor
-        .wrap_output(&mut ciphertext)
-        .map_err(|e| anyhow::anyhow!("age encrypt: {e}"))?;
-    writer.write_all(&node_secret_bytes)?;
-    writer.finish().context("finishing age encryption")?;
-
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut node_secret_bytes);
     let node_secret_path = keys_dir.join("node-identity.key");
-    fs::write(&node_secret_path, &ciphertext)
-        .with_context(|| format!("writing node secret: {}", node_secret_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&node_secret_path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_secret_file(
+        &node_secret_path,
+        &age_encrypt_to(&main_public, &node_secret_bytes)?,
+    )?;
+
+    // WARM identity master (the operational signer): random per identity —
+    // deliberately NOT phrase-derived, so warm rotation never needs the
+    // mnemonic (spec §3). The daemon loads it from `[identity].master_key_file`
+    // and escrows the seed into the `identity_secrets` vault on first boot;
+    // paper recovery reads it back from there (spec §8).
+    let mut warm_seed = [0u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut warm_seed);
+    let warm = ed25519_dalek::SigningKey::from_bytes(&warm_seed);
+    let master_key_path = keys_dir.join("identity_master.key");
+    write_secret_file(&master_key_path, &age_encrypt_to(&main_public, &warm_seed)?)?;
+
+    // The cold pointer (DID → warm binding): the ONLY signature the cold key
+    // ever produces. Plain file — it is exactly the public registry entry;
+    // the daemon verifies + republishes it at startup, so onboarding needs
+    // no network.
+    let anchor_entry = s5_node::identity_anchor::sign_cold_pointer(
+        &cold,
+        &s5_node::identity_anchor::ColdPointer {
+            warm_pub: warm.verifying_key().to_bytes(),
+            next_cold_pub,
+        },
+        1,
+    )
+    .context("signing the cold-pointer anchor")?;
+    let anchor_entry_path = keys_dir.join("identity_anchor.entry");
+    fs::write(&anchor_entry_path, anchor_entry.serialize())
+        .with_context(|| format!("writing anchor entry: {}", anchor_entry_path.display()))?;
 
     // -- Choose backup store -------------------------------------------------
-    let store_choice = ask_store_type(&store_path).await?;
+    // Managed storage credentials derive from the storage seed (NOT the cold
+    // identity master) — see mnemonic-derivation.md § Layer C.
+    let stores_seed = s5_node::mnemonic::storage_root_seed(&root_master);
+    let store_choice = ask_store_type(&store_path, &stores_seed).await?;
 
     // -- Write config --------------------------------------------------------
     let local_store_path = store_choice.local_path();
@@ -106,8 +144,10 @@ pub async fn run_onboard(config_path: &Path) -> Result<()> {
         &main_public,
         &recovery_public,
         &node_secret_path,
+        &master_key_path,
+        &anchor_entry_path,
         &store_choice,
-        &vault_root_path,
+        &[("backup".to_string(), vault_root_path.clone())],
     );
 
     // Ensure the chosen local store dir exists
@@ -118,8 +158,16 @@ pub async fn run_onboard(config_path: &Path) -> Result<()> {
 
     // -- Print summary -------------------------------------------------------
     println!();
-    println!("✓ Config directory: {}/", config_dir.display());
+    println!("✓ Config file:      {}", config_path.display());
+    // The shareable identity: the COLD pubkey (D17) — stable across warm
+    // rotations, so it is safe to hand out from day one.
+    println!("✓ Identity DID:     {did}");
     println!("✓ Data directory:   {}/", data_dir.display());
+    println!(
+        "✓ Encryption keys:  {}/ (age keys, 0600 — lost with this machine; \
+         the recovery phrase below is the offline backup)",
+        keys_dir.display()
+    );
     match &store_choice {
         StoreChoice::Local { path } => {
             println!("✓ Backup store:     {}/", path.display());
@@ -128,137 +176,88 @@ pub async fn run_onboard(config_path: &Path) -> Result<()> {
             println!("✓ Backup store:     s3://{}", s3.bucket_name);
             println!("✓ Local cache:      {}/", local_cache.display());
         }
+        StoreChoice::Sia {
+            indexer_url,
+            cache_path,
+            ..
+        } => {
+            println!("✓ Backup store:     {indexer_url} (Sia, via indexd)");
+            println!("✓ Index cache:      {}/", cache_path.display());
+            println!(
+                "⚠ The indexer AppKey is stored inline in {} — if that file is\n\
+                 \x20 lost, `vup recover` re-derives the same AppKey from your recovery\n\
+                 \x20 phrase via a one-time browser re-authorization.",
+                config_path.display()
+            );
+        }
+    }
+    // D17 honesty: only the Sia path configures a durable
+    // [identity].bootstrap_store (build_config's bootstrap_line — keep in
+    // sync). Without one, the config vault and the warm-key escrow have
+    // nowhere durable to live — and the warm master is RANDOM, so the 12
+    // words alone cannot reconstruct it. The phrase still derives the DID
+    // and the paper age key, but there is nothing off-machine to walk.
+    let durable_bootstrap = matches!(store_choice, StoreChoice::Sia { .. });
+    if !durable_bootstrap {
+        println!();
+        println!("⚠  WARNING — no durable bootstrap store with this storage choice.");
+        println!("   The config vault and the warm-key escrow will NOT be published");
+        println!("   anywhere off this machine, and the operational (warm) identity");
+        println!("   key is random: the 12-word phrase alone CANNOT recover this");
+        println!("   identity if the machine is lost. `vup recover` and paper");
+        println!("   recovery only become available once a durable store (e.g. Sia)");
+        println!("   is configured as [identity].bootstrap_store.");
+        println!("   Still write the words down — they are the anchor everything");
+        println!("   else attaches to once a durable store exists.");
     }
     println!();
     println!("========================================================================");
     println!();
-    println!("  RECOVERY KEY — write this down and store it safely!");
-    println!("  This is the ONLY way to recover your data if you lose");
-    println!("  access to this machine.");
+    println!("  RECOVERY PHRASE — write these 12 words down, in order, and keep");
+    println!("  them somewhere safe and offline.");
+    if durable_bootstrap {
+        println!("  This is the ONLY way to recover your data if you lose access to");
+        println!("  this machine.");
+    } else {
+        println!("  (Mind the warning above: until a durable store is configured,");
+        println!("   the words alone cannot perform a full recovery.)");
+    }
     println!();
-    println!("  {}", recovery_secret);
+    println!("  {}", mnemonic);
     println!();
     println!("========================================================================");
     println!();
+    while !crate::interact::confirm("I have written down the 12 words", false)? {
+        println!("  Take your time — write them down before continuing.");
+    }
+    println!();
+    crate::cmd::service::offer_install_during_onboarding(config_path).await;
+    println!();
     println!("Next steps:");
-    println!("  1. Write down your recovery key on paper");
-    println!("  2. Add paths:   vup +backup add ~/Documents ~/Photos");
-    println!("  3. Take snap:   vup +backup snap");
+    println!("  1. Back up:     vup backup ~/Documents ~/Photos docs:");
+    println!("  2. Keep it up:  vup automate");
 
     Ok(())
 }
 
-/// S3 credentials collected from the user.
-struct S3Config {
-    endpoint: String,
-    bucket_name: String,
-    access_key: String,
-    secret_key: String,
-    region: String,
-}
-
-/// The user's store choice from the init wizard.
-enum StoreChoice {
-    Local {
-        path: std::path::PathBuf,
-    },
-    S3 {
-        local_cache: std::path::PathBuf,
-        s3: S3Config,
-    },
-}
-
-impl StoreChoice {
-    fn local_path(&self) -> &std::path::Path {
-        match self {
-            StoreChoice::Local { path } => path,
-            StoreChoice::S3 { local_cache, .. } => local_cache,
-        }
-    }
-}
-
-/// Ask the user where to store backups and collect the relevant details.
-async fn ask_store_type(default_local_path: &std::path::Path) -> Result<StoreChoice> {
-    use dialoguer::{Input, Select};
-
-    let choices = &["Local (this machine)", "S3-compatible storage"];
-    let selection = Select::new()
-        .with_prompt("Where do you want to store backups?")
-        .items(choices)
-        .default(0)
-        .interact()?;
-
-    if selection == 0 {
-        let path: String = Input::new()
-            .with_prompt("Local store path")
-            .default(default_local_path.to_string_lossy().into_owned())
-            .interact_text()?;
-        return Ok(StoreChoice::Local {
-            path: std::path::PathBuf::from(path),
-        });
-    }
-
-    // -- S3 prompts ----------------------------------------------------------
-    let endpoint: String = Input::new().with_prompt("Endpoint URL").interact_text()?;
-
-    let bucket_name: String = Input::new().with_prompt("Bucket name").interact_text()?;
-
-    let region: String = Input::new()
-        .with_prompt("Region")
-        .default("us-east-1".into())
-        .interact_text()?;
-
-    let access_key: String = Input::new().with_prompt("Access Key ID").interact_text()?;
-
-    let secret_key: String = Input::new()
-        .with_prompt("Secret Access Key")
-        .interact_text()?;
-
-    // -- Test connection -----------------------------------------------------
-    println!("Testing S3 connection...");
-    let s3_cfg = s5_store_s3::S3StoreConfig::new(
-        endpoint.clone(),
-        bucket_name.clone(),
-        access_key.clone(),
-        secret_key.clone(),
-        region.clone(),
-    );
-    let store = s5_store_s3::S3Store::create(s3_cfg);
-
-    use s5_core::store::Store;
-    use tokio_stream::StreamExt;
-
-    // Try to list — this validates endpoint, credentials, and bucket access.
-    let mut stream = store
-        .list()
-        .await
-        .context("S3 connection failed. Check endpoint, bucket, and credentials.")?;
-    // Consume the first item (or empty is fine) to confirm the stream works.
-    let _first = stream.next().await;
-    println!("✓ S3 connection successful");
-
-    Ok(StoreChoice::S3 {
-        local_cache: default_local_path.to_path_buf(),
-        s3: S3Config {
-            endpoint,
-            bucket_name,
-            access_key,
-            secret_key,
-            region,
-        },
-    })
-}
+// Store-backend selection lives in [`super::store_config`] so `store add`
+// (a new named store against the live daemon) shares the exact collectors +
+// validation `onboard`/`recover`/`device join` use. Re-exported here so the
+// established `super::onboard::{…}` import sites keep resolving.
+pub(crate) use super::store_config::{StoreChoice, ask_store_type, store_choice_from_synced};
 
 #[allow(clippy::too_many_arguments)]
-fn build_config(
+pub(crate) fn build_config(
     store_path: &Path,
     registry_path: &Path,
     identity_path: &Path,
     main_public: &str,
     recovery_public: &str,
     node_secret_path: &Path,
+    master_key_path: &Path,
+    anchor_entry_path: &Path,
     store_choice: &StoreChoice,
-    vault_root_path: &Path,
+    vaults: &[(String, std::path::PathBuf)],
 ) -> String {
     let store_section = match store_choice {
         StoreChoice::S3 { s3, .. } => {
@@ -290,25 +289,101 @@ base_path = "{store}""#,
                 store = store_path.display(),
             )
         }
+        StoreChoice::Sia {
+            indexer_url,
+            app_key,
+            cache_path,
+        } => {
+            format!(
+                r#"[store.sia]
+type = "indexd"
+indexer_url = "{indexer_url}"
+app_key = "{app_key}"
+cache_path = "{cache_path}""#,
+                app_key = hex::encode(app_key),
+                cache_path = cache_path.display(),
+            )
+        }
     };
 
-    let blob_stores = match store_choice {
-        StoreChoice::S3 { .. } => r#"["local", "s3"]"#,
-        StoreChoice::Local { .. } => r#"["local"]"#,
+    // The chosen backend is the node-wide default store (D1): every vault
+    // resolves its data + meta primaries to it unless overridden per-vault.
+    let default_store = match store_choice {
+        StoreChoice::S3 { .. } => "s3",
+        StoreChoice::Local { .. } => "local",
+        StoreChoice::Sia { .. } => "sia",
     };
+
+    // For a remote (Sia) store, make the registry durable: a Multi over the
+    // local redb (fast) AND a StoreRegistry over the remote store (recoverable),
+    // and mark that store the bootstrap host. So every HEAD lands in the remote
+    // store and `vup recover` can read the identity back from paper alone. A
+    // local-only setup keeps the plain redb registry (nothing off-machine to
+    // recover from).
+    let (registry_section, bootstrap_line) = match store_choice {
+        StoreChoice::Sia { .. } => (
+            format!(
+                r#"[registry.default]
+type = "multi"
+write_policy = "all"
+
+[[registry.default.backends]]
+type = "redb"
+path = "{registry}"
+
+[[registry.default.backends]]
+type = "store"
+store = "sia"
+prefix = "registry""#,
+                registry = registry_path.display(),
+            ),
+            "bootstrap_store = \"sia\"".to_string(),
+        ),
+        _ => (
+            format!(
+                r#"[registry.default]
+type = "redb"
+path = "{registry}""#,
+                registry = registry_path.display(),
+            ),
+            String::new(),
+        ),
+    };
+
+    // One `[vault.<name>]` per vault — `onboard` passes a single "backup"; on
+    // `recover` these are the vaults discovered in the config-vault directory.
+    // No per-vault store overrides: all ride the node `default_store`.
+    let vault_sections: String = vaults
+        .iter()
+        .map(|(name, root)| {
+            format!(
+                r#"[vault.{name}]
+root_path = "{root}"
+key = "main"
+recipients = ["main", "recovery"]
+sources = ["default"]
+"#,
+                name = name,
+                root = root.display(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         r#"# vup configuration — generated by `vup onboard`
 
+default_store = "{default_store}"
+
 [identity]
 secret_key_file = "{node_secret}"
+master_key_file = "{master_key}"
+anchor_entry_file = "{anchor_entry}"
 encrypted_with = "main"
-
+{bootstrap_line}
 {store_section}
 
-[registry.default]
-type = "redb"
-path = "{registry}"
+{registry_section}
 
 [key.main]
 public_key = "{main_pub}"
@@ -317,14 +392,7 @@ identity_file = "{identity}"
 [key.recovery]
 public_key = "{recovery_pub}"
 
-[vault.backup]
-root_path = "{vault_root}"
-key = "main"
-recipients = ["main", "recovery"]
-sources = ["default"]
-blob_stores = {blob_stores}
-# meta_targets = ["s3"]   # uncomment to publish encrypted snapshots to a remote store
-
+{vault_sections}
 [source.default]
 paths = []
 one_file_system = false
@@ -340,13 +408,110 @@ exclude = [
     "**/node_modules"
 ]
 "#,
+        default_store = default_store,
         node_secret = node_secret_path.display(),
+        master_key = master_key_path.display(),
+        anchor_entry = anchor_entry_path.display(),
+        bootstrap_line = bootstrap_line,
         store_section = store_section,
-        registry = registry_path.display(),
+        registry_section = registry_section,
         main_pub = main_public,
         identity = identity_path.display(),
         recovery_pub = recovery_public,
-        blob_stores = blob_stores,
-        vault_root = vault_root_path.display(),
+        vault_sections = vault_sections,
     )
+}
+
+/// Age-encrypt `plaintext` to a single recipient public-key string.
+pub(crate) fn age_encrypt_to(recipient_pub: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let recipient: age::x25519::Recipient = recipient_pub
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing recipient '{recipient_pub}': {e}"))?;
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| anyhow::anyhow!("creating age encryptor: {e}"))?;
+    let mut ciphertext = vec![];
+    let mut writer = encryptor
+        .wrap_output(&mut ciphertext)
+        .map_err(|e| anyhow::anyhow!("age encrypt: {e}"))?;
+    writer.write_all(plaintext)?;
+    writer.finish().context("finishing age encryption")?;
+    Ok(ciphertext)
+}
+
+/// Write `bytes` to `path`, restricting to owner-only (0o600) on unix.
+pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `build_config` must emit a config that parses back as `S5NodeConfig`,
+    /// with one `[vault.<name>]` per supplied vault and the bootstrap store set.
+    /// This is the shape both `onboard` (one vault) and `recover` (the discovered
+    /// vaults) depend on.
+    #[test]
+    fn build_config_parses_with_multiple_vaults() {
+        let choice = StoreChoice::Sia {
+            cache_path: PathBuf::from("/cache"),
+            indexer_url: "https://sia.storage".to_string(),
+            app_key: [7u8; 32],
+        };
+        let vaults = [
+            ("backup".to_string(), PathBuf::from("/data/vaults/backup")),
+            ("photos".to_string(), PathBuf::from("/data/vaults/photos")),
+        ];
+        let toml = build_config(
+            choice.local_path(),
+            Path::new("/data/registry"),
+            Path::new("/keys/main.txt"),
+            "age1main",
+            "age1paper",
+            Path::new("/keys/node.key"),
+            Path::new("/keys/master.key"),
+            Path::new("/keys/identity_anchor.entry"),
+            &choice,
+            &vaults,
+        );
+
+        let cfg: s5_node::config::S5NodeConfig =
+            toml::from_str(&toml).expect("generated config must parse");
+        assert!(cfg.vault.contains_key("backup"));
+        assert!(cfg.vault.contains_key("photos"));
+        // The daemon resolves its DID from the anchor entry file (D17).
+        assert_eq!(
+            cfg.identity.anchor_entry_file.as_deref(),
+            Some("/keys/identity_anchor.entry")
+        );
+        // Vaults carry no per-vault store overrides — they resolve to the
+        // node default store (D1).
+        assert_eq!(cfg.default_store.as_deref(), Some("sia"));
+        assert_eq!(
+            cfg.vault_data_store("photos", &cfg.vault["photos"])
+                .unwrap(),
+            "sia"
+        );
+        assert_eq!(
+            cfg.vault_meta_store("photos", &cfg.vault["photos"])
+                .unwrap(),
+            "sia"
+        );
+        assert_eq!(cfg.identity.bootstrap_store.as_deref(), Some("sia"));
+        // The Sia store config round-trips with the inline AppKey.
+        match &cfg.store["sia"].backend {
+            s5_node::config::NodeConfigStoreBackend::Indexd(c) => {
+                assert_eq!(c.app_key, hex::encode([7u8; 32]));
+            }
+            other => panic!("expected Indexd, got {other:?}"),
+        }
+    }
 }

@@ -11,8 +11,8 @@
 //! 2. Load the local TN (decrypted with the vault's own identity
 //!    files), re-encrypt the same CBOR with the vault's existing
 //!    recipients **plus** the ephemeral recipient.
-//! 3. Upload the new encrypted blob to `vault.blob_stores[0]` and
-//!    every entry in `vault.meta_targets`. The blob is content-
+//! 3. Upload the new encrypted blob to the vault's meta primary and
+//!    mirror to its data store when distinct (D1). The blob is content-
 //!    addressed by `M = BLAKE3(age_bytes)`.
 //! 4. Format the URL per `docs/reference/share-links.md`.
 //!
@@ -21,12 +21,13 @@
 //! identity exchange, no signature, no registry write.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use s5_core::Hash;
-use s5_core::blob::{BlobStore, BlobsWrite};
+use s5_core::blob::Blobs;
 
 use crate::config::S5NodeConfig;
 use crate::tasks::vault_persist::{
@@ -49,7 +50,7 @@ pub struct ExportResult {
 /// silently produce a whole-vault URL when the user asked for a subtree.
 pub async fn run_export(
     config: &S5NodeConfig,
-    stores: &HashMap<String, BlobStore>,
+    stores: &HashMap<String, Arc<dyn Blobs>>,
     vault_name: &str,
     path: Option<&str>,
 ) -> Result<ExportResult> {
@@ -114,14 +115,11 @@ pub async fn run_export(
         .context("re-encrypting TN for share")?;
     let encrypted_bytes = Bytes::from(encrypted);
 
-    // -- Upload to primary store --
-    let blob_store_name = vault
-        .blob_stores
-        .first()
-        .ok_or_else(|| anyhow!("vault '{}' has no blob_stores configured", vault_name))?;
+    // -- Upload to the vault's meta primary (exports are meta blobs — D1) --
+    let blob_store_name = config.vault_meta_store(vault_name, vault)?;
     let blob_store = stores
         .get(blob_store_name)
-        .ok_or_else(|| anyhow!("blob_store '{}' not configured", blob_store_name))?;
+        .ok_or_else(|| anyhow!("store '{}' not configured", blob_store_name))?;
 
     let blob_id = blob_store
         .blob_upload_bytes(encrypted_bytes.clone())
@@ -135,8 +133,9 @@ pub async fn run_export(
         "uploaded frozen-export Transparent Node"
     );
 
-    // -- Mirror to meta_targets (best-effort, same policy as publish) --
-    for meta_target in &vault.meta_targets {
+    // -- Mirror to the data store when meta rides a separate store
+    // (best-effort, same policy as publish) --
+    for meta_target in [config.vault_data_store(vault_name, vault)?] {
         if meta_target == blob_store_name {
             continue;
         }
@@ -177,7 +176,7 @@ pub async fn run_export(
 mod tests {
     use super::*;
     use crate::config::S5NodeConfig;
-    use s5_core::blob::BlobsRead;
+    use s5_core::blob::{BlobStore, BlobsRead};
     use s5_node_api::config::{
         NodeConfigIdentity, NodeConfigKey, NodeConfigSource, NodeConfigVault,
     };
@@ -237,13 +236,18 @@ mod tests {
             NodeConfigVault {
                 root_path: vault_dir.path().to_string_lossy().into_owned(),
                 key: "vault".to_string(),
-                blob_stores: vec!["primary".to_string()],
+                data_store: Some("primary".to_string()),
                 preset: None,
                 recipients: vec!["vault".to_string()],
                 sources: Vec::new(),
-                meta_targets: Vec::new(),
+                meta_store: None,
                 plaintext_tree: false,
+                plaintext_published_tn: false,
                 watch: false,
+                members: Vec::new(),
+                pipelines: Vec::new(),
+                vault_id: None,
+                ..Default::default()
             },
         );
         let config = S5NodeConfig {
@@ -251,20 +255,26 @@ mod tests {
                 secret_key_file: None,
                 secret_key: None,
                 encrypted_with: None,
+                master_key_file: None,
+                anchor_entry_file: None,
+                keyset_file: None,
+                bootstrap_store: None,
             },
             key: keys,
             store: BTreeMap::new(),
+            default_store: None,
             registry: BTreeMap::new(),
             source: BTreeMap::<String, NodeConfigSource>::new(),
             vault: vaults,
             task: BTreeMap::new(),
+            friend: BTreeMap::new(),
         };
 
         let blob_store = BlobStore::new(LocalStore::create(LocalStoreConfig {
             base_path: store_dir.path().to_string_lossy().into_owned(),
         }));
-        let mut stores_map = HashMap::new();
-        stores_map.insert("primary".to_string(), blob_store.clone());
+        let mut stores_map: HashMap<String, Arc<dyn Blobs>> = HashMap::new();
+        stores_map.insert("primary".to_string(), Arc::new(blob_store.clone()));
 
         // Run export.
         let result = run_export(&config, &stores_map, "test", None).await?;

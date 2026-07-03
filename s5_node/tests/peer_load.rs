@@ -12,7 +12,7 @@
 //!      merged view — which is what a multi-peer mount would do on the
 //!      receiving side.
 //!
-//! This is the unit covering `vup +<vault> mount` showing peers' files.
+//! This is the unit covering `vup mount <vault>:` showing peers' files.
 //! The CLI / config glue (peer enumeration, layered mount entry point)
 //! sits on top of this primitive in subsequent commits.
 
@@ -25,7 +25,7 @@ use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures_util::StreamExt;
 use s5_core::RegistryApi;
-use s5_core::blob::BlobStore;
+use s5_core::blob::{BlobStore, Blobs};
 use s5_core::store::Store;
 use s5_fs_v2::layer::ReadableLayer;
 use s5_fs_v2::merge::MergedView;
@@ -45,7 +45,7 @@ use tokio::sync::RwLock;
 
 /// Mirror of `async_relay::build_ctx`. Mints a TaskExecutorContext with
 /// `relay` (file blobs + TN primary) and `mirror` (encrypted-TN mirror
-/// target via `meta_targets`); `relay` is also the registry key-value
+/// target via `meta_store`); `relay` is also the registry key-value
 /// backend so peer-side reads find published entries even when the
 /// publishing node is gone.
 fn build_ctx(
@@ -55,9 +55,9 @@ fn build_ctx(
     relay_raw: Arc<dyn Store>,
     node_secret: [u8; 32],
 ) -> Arc<TaskExecutorContext> {
-    let mut stores = HashMap::new();
-    stores.insert("relay".to_string(), relay_blob);
-    stores.insert("mirror".to_string(), mirror_blob);
+    let mut stores: HashMap<String, Arc<dyn Blobs>> = HashMap::new();
+    stores.insert("relay".to_string(), Arc::new(relay_blob));
+    stores.insert("mirror".to_string(), Arc::new(mirror_blob));
 
     let memory: Arc<dyn RegistryApi + Send + Sync> = Arc::new(MemoryRegistry::new());
     let store_reg: Arc<dyn RegistryApi + Send + Sync> =
@@ -69,6 +69,9 @@ fn build_ctx(
         stores,
         node_secret,
         registry: Some(Arc::new(multi)),
+        membership: None,
+        membership_refresh: None,
+        discovery_seed: Default::default(),
     })
 }
 
@@ -97,6 +100,9 @@ fn vault_config(
             respect_ignore_files: false,
             exclude: Vec::new(),
             one_file_system: false,
+            follow_symlinks: false,
+            detect_deletions: false,
+            max_concurrent_ops: None,
         },
     );
 
@@ -106,13 +112,18 @@ fn vault_config(
         NodeConfigVault {
             root_path: vault_root.to_string(),
             key: "paper".to_string(),
-            blob_stores: vec!["relay".to_string()],
+            data_store: Some("relay".to_string()),
             preset: None,
             recipients: vec!["paper".to_string()],
             sources: vec!["docs".to_string()],
-            meta_targets: vec!["mirror".to_string()],
+            meta_store: Some("mirror".to_string()),
             plaintext_tree: false,
+            plaintext_published_tn: false,
             watch: false,
+            members: Vec::new(),
+            pipelines: Vec::new(),
+            vault_id: None,
+            ..Default::default()
         },
     );
 
@@ -121,13 +132,19 @@ fn vault_config(
             secret_key_file: None,
             secret_key: None,
             encrypted_with: None,
+            master_key_file: None,
+            anchor_entry_file: None,
+            keyset_file: None,
+            bootstrap_store: None,
         },
         key,
         store: BTreeMap::new(),
+        default_store: None,
         registry: BTreeMap::new(),
         source,
         vault,
         task: BTreeMap::new(),
+        friend: BTreeMap::new(),
     }
 }
 
@@ -218,6 +235,7 @@ async fn peer_snapshot_round_trip_via_relay() -> Result<()> {
             blob_store: "relay".to_string(),
             keys: vec!["paper".to_string()],
             target_path: None,
+            changed_paths: None,
         },
     )
     .await?;
