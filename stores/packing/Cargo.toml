@@ -10,13 +10,35 @@ license = "MIT OR Apache-2.0"
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+# Portable, pure-Rust minimal perfect hash (BBHash) for the compact in-memory
+# pack index — ~3 bits/key vs a HashMap's ~50, the RAM win at 10M+ blobs. The
+# workspace decl sets `default-features = false` to drop `parallel`/`rayon`
+# (no wasm32 support); we only call the single-threaded `Mphf::new`, and the
+# build runs off a blocking thread on native (see `rebuild_index`).
+# TODO(perf): a `ptrhash` cargo feature could swap in PtrHash (~2× faster
+# lookup) for x86-native builds; gxhash makes it non-portable as a default, and
+# the lookup is dwarfed by the blob read anyway (see the lookup-structure bench).
+# `serde` (for the index snapshot) works WITHOUT `parallel`: off-parallel
+# boomphf's BitVector is a plain `Box<[u64]>` with a default derive, so the
+# atomic ser/de helpers gated on `all(serde, parallel)` are never referenced.
+boomphf = { workspace = true, features = ["serde"] }
 bytes.workspace = true
 futures.workspace = true
-minicbor.workspace = true
+hex.workspace = true
+# Persisting the built bulk index to the cache store (browser-safe — a `Store`
+# blob, not mmap/epserde): postcard is a compact, no_std/wasm-friendly serde
+# binary format. `alloc` enables `to_allocvec` (and works on wasm32).
+postcard = { workspace = true, features = ["alloc"] }
 s5_core.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "time"] }
-tokio-util.workspace = true
+serde = { workspace = true }
+# `fs` is a native-only target dep below: `tokio::fs` does not exist on wasm32,
+# and the only fs user (`blob_upload_file`) is already wasm-gated.
+tokio = { workspace = true, features = ["sync", "rt", "time", "io-util"] }
 tracing.workspace = true
+
+# Native-only: `tokio::fs`, used by the wasm-gated `blob_upload_file`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 s5_core = { workspace = true, features = ["testutil"] }
