@@ -142,6 +142,7 @@ mod tests {
             keys: Some(keys),
             leaf: Some(leaf_pipeline),
             node: Some(node_pipeline),
+            chunking: None,
         };
         let read_store: Arc<dyn s5_core::BlobsRead> = Arc::new(store.clone());
         let snapshot = Snapshot::empty(read_store, ctx);

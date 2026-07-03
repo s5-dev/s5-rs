@@ -21,6 +21,8 @@ pub mod overlay;
 
 pub mod chunking;
 pub(crate) mod context;
+pub mod copy;
+pub mod import_stats;
 pub mod merge;
 pub mod persist;
 pub mod pipeline;

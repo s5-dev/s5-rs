@@ -175,6 +175,7 @@ fn make_initial_snapshot(
         keys: Some(keys),
         leaf: Some(leaf_pipeline),
         node: Some(node_pipeline),
+        chunking: None,
     };
     Snapshot::empty(read_store, ctx)
 }
@@ -198,7 +199,7 @@ async fn flush_and_publish(
 
     for (path, bytes) in overlay_writes {
         let entry = pipeline
-            .import_bytes(bytes, store, None, None)
+            .import_bytes(bytes, store, None)
             .await
             .with_context(|| format!("import {path}"))?;
         overlay.put((*path).to_string(), entry);
