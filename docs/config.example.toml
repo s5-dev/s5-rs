@@ -1,20 +1,32 @@
 # S5 Node Configuration Example
-# Copy to ~/.config/s5/local.toml and customize.
-# See docs/reference/configuration.md for full reference.
+# `vup onboard` generates a real one at ~/.config/s5/config.toml; this is an
+# annotated reference. See docs/reference/configuration.md for the full schema.
 
-# Human-readable name for this node
-name = "my-node"
+# Node-wide default store: any vault without an explicit `data_store` uses this.
+# When exactly one [store.*] exists, it is the implied default even if unset.
+default_store = "local"
 
 # --- Identity ---
-# The node's Ed25519 identity. Generate with: s5 config init
-# After running `s5 config init`, this will be set to `local.secretkey`
-# (a relative path next to this config file).
+# The node's cryptographic identity. Generate with `vup onboard`.
 [identity]
-secret_key_file = "local.secretkey"
+secret_key_file = "node.key.age"       # relative to this config file
+encrypted_with = "main"                # age key the identity file is sealed to
+master_key_file = "master.key"         # warm master signing key (D17)
+anchor_entry_file = "identity_anchor.entry"
+# bootstrap_store = "sia"              # remote store recovery reads back from
+
+# --- Keys ---
+# Age keys for vault encryption and publish recipients.
+[key.main]
+public_key = "age1main..."
+identity_file = "main.age"
+
+[key.recovery]
+public_key = "age1recovery..."          # encrypt-only paper recovery recipient
 
 # --- Blob Storage ---
-# Local filesystem store (default)
-[store.default]
+# Local filesystem store (the default here).
+[store.local]
 type = "local"
 base_path = "~/.local/share/s5/blobs"
 
@@ -27,34 +39,68 @@ base_path = "~/.local/share/s5/blobs"
 # access_key = "AKIAIOSFODNN7EXAMPLE"
 # secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
-# Uncomment to add Sia renterd storage:
+# Uncomment to add Sia storage (what `vup store add sia <name>` provisions):
 # [store.sia]
-# type = "sia_renterd"
-# bucket = "s5-blobs"
-# worker_api_url = "http://localhost:9980/api/worker"
-# bus_api_url = "http://localhost:9980/api/bus"
-# password = "your-renterd-password"
+# type = "indexd"
+# indexer_url = "https://sia.storage"
+# app_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# cache_path = "~/.local/share/s5/indexd-cache"
 
-# --- Peers ---
-# Add known peers for blob exchange and sync routing.
-# [peer.friend]
-# id = "2kajba6o6aa3f53szgv5kq1bjbs5d7w6xjbowtafbxfvrmbjb4tq"  # Their Endpoint ID
-#
-# [peer.friend.blobs]
-# readable_stores = ["default"]
-# store_uploads_in = "default"
+# --- Registry ---
+# Local, single-machine registry.
+[registry.default]
+type = "redb"
+path = "~/.config/s5/registry"
 
-# --- Sync ---
-# Continuous folder synchronization via untrusted relay.
-# [sync.documents]
-# local_path = "/home/user/Documents"
-# via_untrusted = ["friend"]
-# shared_secret = "correct-horse-battery-staple"
-# interval_secs = 60
+# --- Sources ---
+# Local directories s5 is allowed to read (a security boundary).
+[source.documents]
+paths = ["/home/user/Documents"]
+exclude = ["*.tmp", "*.log", "**/.cache", "**/node_modules"]
 
-# --- FUSE Mounts ---
-# Auto-mount FS5 roots when the node starts.
-# [fuse.docs]
-# root_path = "~/.local/share/s5/roots/local.fs5"
-# mount_path = "/mnt/s5-docs"
-# auto_unmount = true
+# --- Vaults ---
+# One FS5 root per vault. `vup vault create <name>` writes these.
+[vault.docs]
+root_path = "~/.local/share/s5/vaults/docs"
+key = "main"
+recipients = ["main", "recovery"]
+sources = ["documents"]
+# data_store = "local"                 # defaults to the node default_store (D1)
+# members = ["self", "alice"]          # sharing: read set ( `vup grant` )
+# writers = ["alice"]                  # subset granted write authority
+
+# --- Tasks & automation ---
+# On-demand backup (run with `vup backup docs: documents`):
+[task.backup-docs]
+type = "backup"
+vault = "docs"
+source = "documents"
+blob_store = "local"
+keys = ["main", "recovery"]
+
+# Scheduled nightly backup (daemon fires it every 24 h):
+# [task.nightly-backup]
+# type = "backup"
+# vault = "docs"
+# source = "documents"
+# blob_store = "local"
+# keys = ["main", "recovery"]
+# trigger = "every"                    # "manual" (default) | "watch" | "every"
+# interval_secs = 86400               # required for trigger = "every"
+# paused = false                      # `vup automate pause/resume` flips this
+
+# Snap-on-change (daemon watches the source paths; backup tasks only):
+# [task.watch-docs]
+# type = "backup"
+# vault = "docs"
+# source = "documents"
+# blob_store = "local"
+# keys = ["main", "recovery"]
+# trigger = "watch"
+
+# --- Friends ---
+# Other identities you have paired with (`vup friend pair`). Vault
+# members/writers reference these by nickname.
+# [friend.alice]
+# id = "did:s5:b..."
+# iroh_pubkey_hex = "..."             # optional direct-dial transport pubkey

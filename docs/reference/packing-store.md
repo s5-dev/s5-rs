@@ -6,11 +6,11 @@ The packing store (`stores/packing`, crate `s5_store_packing`) bundles many smal
 content-addressed blobs into large packs before they reach a slow or expensive
 backend, and serves reads back out of those packs.
 
-Related: [`architecture-directions.md`](./architecture-directions.md)
+Related: `architecture-directions.md`
 (where packing/tiered backends sit in the store stack),
-[`registry-durability.md`](./registry-durability.md) (the HEAD enumeration that
-recovery — and GC — root on), [`snapshot-publication.md`](./snapshot-publication.md)
-(snapshot trees = the reachability graph), [`compression-and-chunking.md`](./compression-and-chunking.md)
+`registry-durability.md` (the HEAD enumeration that
+recovery — and GC — root on), `snapshot-publication.md`
+(snapshot trees = the reachability graph), the compression pipeline
 (why blobs are small in the first place).
 
 ---
