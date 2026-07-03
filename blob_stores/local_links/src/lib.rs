@@ -26,7 +26,7 @@
 //! ```
 //!
 //! Make the store readable from a vault by listing it in
-//! `vault.<name>.blob_stores` (see `docs/reference/configuration.md`).
+//! `vault.<name>.data_store` (see `docs/reference/configuration.md`).
 //!
 //! # Limitations
 //!
@@ -428,7 +428,9 @@ impl BlobsRead for LocalLinksStore {
             .resolve(&hash)?
             .ok_or_else(|| anyhow!("No valid path for hash {}", hash))?;
         let data = tokio::fs::read(&path).await?;
-        Ok(data.into())
+        // Full reads verify the content address (BlobsRead contract) —
+        // a linked file can be modified out from under the link.
+        s5_core::blob::verify_bytes(hash, data.into())
     }
 
     async fn blob_download_slice(
@@ -468,7 +470,11 @@ impl BlobsRead for LocalLinksStore {
             .resolve(&hash)?
             .ok_or_else(|| anyhow!("No valid path for hash {}", hash))?;
         let file = tokio::fs::File::open(&path).await?;
-        Ok(Box::new(file))
+        // Streamed full reads verify at EOF (BlobsRead contract).
+        Ok(Box::new(s5_core::blob::VerifyingReader::new(
+            hash,
+            Box::new(file),
+        )))
     }
 }
 

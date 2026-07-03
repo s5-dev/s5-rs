@@ -568,6 +568,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boomphf"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617e2d952880a00583ddb9237ac3965732e8df6a92a8e7bcc054100ec467ec3b"
+dependencies = [
+ "log",
+ "serde",
+ "wyhash",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5353,6 +5364,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "filetime",
  "futures",
  "libc",
  "s5_core",
@@ -5360,6 +5372,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
  "walkdir",
 ]
 
@@ -5398,13 +5411,15 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "boomphf",
  "bytes",
  "futures",
- "minicbor",
+ "hex",
+ "postcard",
  "s5_core",
  "s5_store_memory",
+ "serde",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -7508,6 +7523,15 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wyhash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf6e163c25e3fac820b4b453185ea2dea3b6a3e0a721d4d23d75bd33734c295"
+dependencies = [
+ "rand_core 0.6.4",
 ]
 
 [[package]]

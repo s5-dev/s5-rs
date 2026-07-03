@@ -18,6 +18,10 @@ pub struct PendingBlob {
     /// to look up bytes from staging and to delete after flush.
     pub staging_path: String,
     pub length: u32,
+    /// When the blob entered staging. Drives the max-age flush: a group
+    /// with any member older than `PackingConfig::max_pending_age` is
+    /// flushed even below `min_group_size`.
+    pub staged_at: std::time::Instant,
 }
 
 /// A pack assembled in memory, ready to be flushed.
@@ -59,7 +63,10 @@ impl PackGroup {
 ///   only accept a blob if it fits the remaining slab tail OR
 ///   strictly reduces the waste fraction.
 /// - **Hard cap.** Never grow past `max_group_size` unless the blob
-///   exactly fits the remaining slab-aligned tail.
+///   fits the remaining slab-aligned tail AND the group is still below
+///   the cap — the exception may only complete the group's current
+///   slab, so `total_size` is bounded by `max_group_size` rounded up
+///   to a whole slab.
 pub fn try_add(
     group: &mut PackGroup,
     blob: &PendingBlob,
@@ -93,7 +100,13 @@ pub fn try_add(
     let fits_last_slab = (blob.length as u64) <= slab_remaining;
     let in_tight_mode = current_waste < waste_pct;
 
-    if exceeds_max && !fits_last_slab {
+    // The tail-fit exception may only complete the current slab. For
+    // small-blob workloads every candidate fits *some* tail, so an
+    // unconditional exception re-applies on every add and the cap never
+    // engages (observed live: a 15,957-member / 883 MB group against a
+    // 256 MiB cap).
+    let group_at_cap = group.total_size >= max_group_size;
+    if exceeds_max && (group_at_cap || !fits_last_slab) {
         return false;
     }
 
@@ -148,6 +161,7 @@ mod tests {
             key,
             staging_path: path,
             length: len,
+            staged_at: std::time::Instant::now(),
         }
     }
 
@@ -190,6 +204,31 @@ mod tests {
         first_fit(&mut groups, b(0, 200_000_000), 4_000_000, 256_000_000, 0.10);
         first_fit(&mut groups, b(1, 200_000_000), 4_000_000, 256_000_000, 0.10);
         assert_eq!(groups.len(), 2);
+    }
+
+    /// Regression for the 2026-07-02 live-drill finding (unbounded pack groups):
+    /// with small blobs every candidate fits the current slab tail, so
+    /// the tail-fit exception bypassed the cap on every add and groups
+    /// grew without bound. The exception may only complete the current
+    /// slab: groups are bounded by `max_group_size` rounded up to a
+    /// whole slab.
+    #[test]
+    fn small_blob_stream_cannot_grow_groups_past_cap() {
+        let slab = 4_000_000u64;
+        let max = 16_000_000u64;
+        let mut groups = Vec::new();
+        for i in 0..1_000 {
+            first_fit(&mut groups, b(i, 55_000), slab, max, 0.10);
+        }
+        let bound = max.div_ceil(slab) * slab;
+        assert!(groups.len() > 1, "cap never engaged: one giant group");
+        for g in &groups {
+            assert!(
+                g.total_size <= bound,
+                "group grew past the slab-aligned cap: {} > {bound}",
+                g.total_size
+            );
+        }
     }
 
     /// A blob larger than `max_group_size` must still land in a
