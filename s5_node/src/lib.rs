@@ -177,8 +177,12 @@ impl S5Node {
             // TODO: registry should forward set events to all connected peers
             // (push-based replication). Currently peers must poll to discover
             // new snapshot hashes.
-            router_builder =
-                router_builder.accept(REGISTRY_ALPN, RegistryServer::new(registry_ref.clone()));
+            router_builder = router_builder.accept(
+                REGISTRY_ALPN,
+                RegistryServer::new(s5_registry::BroadcastingRegistry::wrap(
+                    registry_ref.clone(),
+                )),
+            );
         }
         // Register S5NodeServer for task orchestration RPC if provided.
         if let Some(server) = s5_server.as_ref() {
