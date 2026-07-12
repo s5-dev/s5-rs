@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+# Sandboxed dir handle for restore: refuses paths that escape the target
+# (absolute, `..`, symlinked ancestors).
+cap-std = "3"
 futures.workspace = true
 globset = "0.4"
 ignore = "0.4"
