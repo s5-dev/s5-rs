@@ -28,6 +28,17 @@ use s5_core::store::{Store, StoreFeatures, StoreResult};
 pub struct FjallStore {
     db: Arc<fjall::Database>,
     blobs: Keyspace,
+    /// When true, `put_bytes` does NOT flush the journal per insert — inserts
+    /// only buffer in memory and durability relies on an explicit [`Store::sync`]
+    /// barrier (the publish flow must call it before committing the root).
+    ///
+    /// Gated by `S5_BATCH_BLOB_PERSIST` (2026-06-18 s5): the per-insert
+    /// `persist(Buffer)` was ~102 ms/blob (a journal flush every write) and the
+    /// dominant snap cost. Content-addressed blobs make a lost un-synced write
+    /// harmless — it's simply re-uploaded — so a single `sync()` before the root
+    /// is published is the correct durability guarantee, not one-per-blob.
+    /// Default `false` preserves the original per-write-persist behavior.
+    batch_persist: bool,
 }
 
 impl std::fmt::Debug for FjallStore {
@@ -57,9 +68,14 @@ impl FjallStore {
                 .with_kv_separation(Some(KvSeparationOptions::default()))
         })?;
 
+        let batch_persist = std::env::var("S5_BATCH_BLOB_PERSIST")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         Ok(Self {
             db: Arc::new(db),
             blobs,
+            batch_persist,
         })
     }
 
@@ -106,16 +122,28 @@ impl Store for FjallStore {
     async fn put_bytes(&self, path: &str, bytes: Bytes) -> StoreResult<()> {
         let blobs = self.blobs.clone();
         let db = self.db.clone();
+        let batch = self.batch_persist;
         let path = path.to_string();
         tokio::task::spawn_blocking(move || {
             blobs.insert(path.as_bytes(), bytes.as_ref())?;
             // `manual_journal_persist(true)` means inserts only land in the
-            // in-memory write buffer by default; flush the journal to the OS
-            // after each write so a hard crash doesn't lose acknowledged
-            // blobs. Uses `Buffer` (fdatasync-equivalent flush to page cache)
-            // rather than `SyncAll` (fsync) — adequate for content-addressed
-            // blobs where a lost write can be re-uploaded.
-            db.persist(PersistMode::Buffer)?;
+            // in-memory write buffer by default.
+            //
+            // Default (batch_persist=false): flush the journal to the OS after
+            // each write so a hard crash doesn't lose acknowledged blobs. Uses
+            // `Buffer` (fdatasync-equivalent flush to page cache) rather than
+            // `SyncAll` (fsync). This is ~102 ms/blob on a busy writer and the
+            // dominant publish-snap cost.
+            //
+            // batch_persist=true (S5_BATCH_BLOB_PERSIST): skip the per-write
+            // flush — inserts only buffer; the caller MUST `sync()` before it
+            // relies on durability (the publish flow calls it before committing
+            // the root). Safe because blobs are content-addressed: a lost
+            // un-synced write is simply re-uploaded on the redone snap, and the
+            // root referencing it is not published until after the sync.
+            if !batch {
+                db.persist(PersistMode::Buffer)?;
+            }
             Ok(())
         })
         .await?
