@@ -22,13 +22,12 @@ If you are familiar with IPFS or Iroh: think of S5 as a focused, Rust-native too
 cargo install --git https://github.com/s5-dev/s5-rs vup_cli
 ```
 
-Minimal workflow (sigil grammar — `+name` is a vault reference; the daemon auto-starts on first invocation):
+Minimal workflow (verb-first D20 grammar — a trailing colon marks a vault reference; the daemon auto-starts on first invocation):
 
 ```bash
-vup new +music                # create + onboard a vault, prints recovery key
-vup +music add ~/Music        # configure a source path
-vup +music snap               # snapshot + publish to configured stores
-vup +music mount /mnt/music   # FUSE-mount the vault read-only
+vup onboard                    # first-run setup: keys, a store, recovery key
+vup backup ~/Music music:      # map a source path, snapshot + publish to the store
+vup mount music: /mnt/music    # FUSE-mount the vault read-only
 ```
 
 ## Architecture
@@ -69,7 +68,7 @@ graph TD
 | **[s5_core](./s5_core)** | **Protocol Primitives.** `Hash`, `BlobId`, `Store` trait, `RegistryApi` trait. The foundation of the stack. |
 | **[s5_fs](./s5_fs)** | **Filesystem Logic.** Implements `DirV1` snapshots, directory actors, and the high-level `FS5` API. |
 | **[s5_node](./s5_node)** | **Server & Orchestration.** Configures and runs the S5 node, managing stores, networking, mounts, and sync. |
-| **[vup_cli](./vup_cli)** | **Primary Command Line Interface.** Vup Vault — `vup new +<vault>`, `vup +<vault> snap`, `vup +<vault> mount`, etc. Thin RPC frontend over the daemon. |
+| **[vup_cli](./vup_cli)** | **Primary Command Line Interface.** Vup Vault — `vup vault create <vault>`, `vup backup <path> <vault>:`, `vup mount <vault>: <dir>`, etc. Thin RPC frontend over the daemon. |
 | **[s5_cli](./s5_cli)** | **Low-level operational CLI.** GC, verify-local, HTTP import, FS5-on-disk snapshot ops. Will fold into `vup_cli` once it reaches parity. |
 | **[s5_blobs](./s5_blobs)** | **Blob Transport.** Iroh-based protocol for serving and fetching blobs over the network. |
 | **[s5_registry](./s5_registry)** | **Registry Transport.** Iroh-based protocol for syncing mutable registry entries. |
@@ -86,6 +85,7 @@ graph TD
 *   **Storage (`Store` / `BlobStore`)**: A trait for pluggable backends (local disk, S3, Sia renterd, memory, or your own), with a `BlobStore` façade on top.
 *   **Location (`BlobLocation`)**: Decouples *what* data is (hash) from *where* it lives (peer, bucket, Sia host, etc.).
 *   **Networking (Iroh)**: Two small protocols, `s5_blobs` and `s5_registry`, run on top of Iroh for blob and registry exchange.
+*   **Deletion & GC**: Vault data is encrypted client-side with keyed-convergent encryption before upload, so when a file is deleted its orphaned ciphertext becomes unreadable to anyone without the vault secret. Garbage collection is therefore **purely a storage-cost optimization** — never a privacy, correctness, or recovery requirement. See [packing-store.md §8](docs/reference/packing-store.md) for the full argument.
 
 ## Comparison
 
@@ -156,9 +156,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p vup_cli -- --help
 
 # Initialise a vault and snapshot some data (daemon auto-starts as needed)
-cargo run -p vup_cli -- new +photos
-cargo run -p vup_cli -- +photos add ~/Pictures
-cargo run -p vup_cli -- +photos snap
+cargo run -p vup_cli -- vault create photos
+cargo run -p vup_cli -- backup ~/Pictures photos:
 ```
 
 ## License

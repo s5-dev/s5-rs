@@ -17,7 +17,7 @@ pub struct MountOptions {
 
 /// FUSE mount via the legacy `s5` CLI is no longer wired up — the FUSE
 /// adapter only speaks `s5_fs_v2::Snapshot` (the new vault-shaped fs),
-/// not the v1 `FS5` this command targeted. The `vup +<vault> mount`
+/// not the v1 `FS5` this command targeted. The `vup mount <vault>:`
 /// path covers the v2 case end-to-end; this stub stays only so the
 /// `s5` binary still builds while the legacy CLI is being phased out.
 pub async fn run_mount(
@@ -29,6 +29,6 @@ pub async fn run_mount(
 ) -> Result<()> {
     Err(anyhow!(
         "`s5 mount` is not supported on the v2 FUSE adapter — \
-         use `vup +<vault> mount <path>` instead"
+         use `vup mount <vault>: <path>` instead"
     ))
 }
