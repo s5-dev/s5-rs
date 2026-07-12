@@ -140,6 +140,12 @@ cache_path = "/home/user/.local/share/s5/indexd-cache"
 account = ""
 # Optional upload concurrency knob (device RAM/throughput). Default 8.
 # max_inflight = 8
+
+# Optional: raise the whole-pack upload deadline (seconds) if a very slow uplink
+# can't finish a big backup within the default (1200 = 20 min). This is the only
+# indexd knob; the enumeration and download timeouts, their retries, and the
+# multi-device sync interval use defaults that carry every use case.
+# upload_timeout_secs = 1200
 ```
 
 #### Syncing store configs across devices

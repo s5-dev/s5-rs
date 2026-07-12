@@ -196,7 +196,7 @@ mod tests {
                 app_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(),
                 cache_path: "/c".to_string(),
-                max_inflight: None,
+                ..Default::default()
             }));
 
         // -- publish side: the config vault (sealed to paper) + discovery entry --

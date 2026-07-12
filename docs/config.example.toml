@@ -45,6 +45,10 @@ base_path = "~/.local/share/s5/blobs"
 # indexer_url = "https://sia.storage"
 # app_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # cache_path = "~/.local/share/s5/indexd-cache"
+# Optional: raise only if a very slow uplink can't finish a big backup within
+# the default (1200 s). Enumeration/download timeouts, retries and sync use
+# defaults that carry.
+# upload_timeout_secs = 1200
 
 # --- Registry ---
 # Local, single-machine registry.

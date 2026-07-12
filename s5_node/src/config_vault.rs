@@ -363,7 +363,7 @@ mod tests {
             account: String::new(),
             app_key: app_key_hex.to_string(),
             cache_path: "/data/s5/indexd-cache".to_string(),
-            max_inflight: None,
+            ..Default::default()
         }))
     }
 

@@ -436,6 +436,10 @@ pub async fn create_raw_store(
             // memory ≈ max_inflight × total_shards × 4 MiB — so phones lower it
             // and capable devices raise it for more concurrency.
             let max_inflight = cfg.max_inflight.unwrap_or(8);
+            // The enumeration/download timeouts and their retries use the store's
+            // generous defaults (60 s pages, 300 s reads) — they keep slow/bad
+            // links working without config and never slow a healthy one. Only the
+            // whole-pack upload deadline is tunable (see the packing_config below).
             let bodies = s5_store_indexd::IndexdStore::open(
                 s5_store_indexd::IndexdConfig {
                     indexer_url: cfg.indexer_url.clone(),
@@ -493,28 +497,30 @@ pub async fn create_raw_store(
             // `data_shards × 4 MiB sectors` = 40 MiB of payload at the 10-of-30
             // EC above, so pack sizes that are multiples of 40 MiB fill whole
             // slabs — anything else pays for the padded remainder of the last
-            // slab. Target 240 MiB (6 slabs) packs: big enough to amortize
-            // per-object overhead and drive upload concurrency (streaming flush
-            // keeps RAM at ~one staged blob regardless), small enough that one
-            // pack ≈ 1–2 min on a 40 mbps uplink — the blast radius of a wedged
-            // upload and the unit of incremental durability.
+            // slab. Target 80 MiB (2 slabs) packs: big enough to amortize
+            // per-object overhead, small enough that one pack uploads in seconds
+            // even on a weak uplink, keeping the blast radius of a wedged upload
+            // and the unit of incremental durability small. (s3d, the inspiration
+            // for packing, groups to a waste threshold at slab granularity rather
+            // than a fixed large target; big multi-slab packs were an s5 choice
+            // that hurt slow connections, so keep them modest here.)
             //
-            // `min_group_size` (120 MiB = 3 slabs) is the MINIMUM the background
-            // loop bothers flushing; the 240 MiB *target* comes from
-            // `max_group_size` (the cap `first_fit` fills toward). These MUST
-            // differ: the loop flushes a group only when `total_size >=
-            // min_group_size`, but `first_fit` stops *before* exceeding
-            // `max_group_size`, so a full group lands just under the cap. If min
-            // == max the gate can never trip and the background loop flushes
-            // nothing — the only flush left is publish's forced `sync()`, so a
-            // stalled first flush has no retry (that is the hang we saw on a
-            // fresh Sia account). Keep min well below max. (Sub-minimum tails
-            // still flush via `max_pending_age`, so small snaps and identity
-            // publishes never wait on 120 MiB accumulating.)
+            // `min_group_size` (40 MiB = 1 slab) is the MINIMUM the background
+            // loop flushes; the 80 MiB *target* is `max_group_size` (the cap
+            // `first_fit` fills toward). These MUST differ: the loop flushes only
+            // when `total_size >= min_group_size`, but `first_fit` stops *before*
+            // exceeding `max_group_size`, so a full group lands just under the
+            // cap. If min == max the gate never trips and the loop flushes
+            // nothing — the only flush left is publish's forced `sync()`, the
+            // hang we saw on a fresh Sia account. Keep min below max. (Sub-minimum
+            // tails still flush via `max_pending_age`, so small snaps never wait.)
             let packing_config = s5_store_packing::PackingConfig {
-                min_group_size: 120 << 20,
-                max_group_size: 240 << 20,
+                min_group_size: 40 << 20,
+                max_group_size: 80 << 20,
                 slab_size: 40 << 20,
+                upload_timeout_floor: std::time::Duration::from_secs(
+                    cfg.upload_timeout_secs.unwrap_or(1200),
+                ),
                 ..s5_store_packing::PackingConfig::default()
             };
             // Keep a handle to the (sync-on-open) IndexdStore so we can enumerate
