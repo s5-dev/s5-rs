@@ -44,6 +44,11 @@ use crate::write::WritableFs;
 /// `fusermount3`'s own "not found" error is already legible, so we
 /// don't shadow it here.
 pub fn preflight(mountpoint: &Path) -> anyhow::Result<()> {
+    // `/dev/fuse` is the Linux device node; macFUSE exposes `/dev/macfuse0`
+    // instead, so this specific check only makes sense on Linux. On macOS
+    // (and elsewhere) we skip it and let `fusermount`/macFUSE surface its own
+    // error rather than failing on a node that legitimately doesn't exist.
+    #[cfg(target_os = "linux")]
     if !std::path::Path::new("/dev/fuse").exists() {
         return Err(anyhow!(
             "/dev/fuse is not present — the FUSE kernel device node is missing.\n\

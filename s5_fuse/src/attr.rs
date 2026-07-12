@@ -47,6 +47,12 @@ pub(crate) fn file_attr(entry: &NodeEntry) -> FileAttr {
         atime: mtime,
         mtime,
         ctime,
+        // `fuse3::FileAttr` carries these two only on macOS. The v2 schema has
+        // no birth-time, so `crtime` reuses `mtime`; `flags` (chflags(2)) is 0.
+        #[cfg(target_os = "macos")]
+        crtime: mtime,
+        #[cfg(target_os = "macos")]
+        flags: 0,
         kind: FileType::RegularFile,
         perm: 0o444,
         nlink: 1,
@@ -67,6 +73,11 @@ pub(crate) fn dir_attr() -> FileAttr {
         atime: UNIX_EPOCH,
         mtime: UNIX_EPOCH,
         ctime: UNIX_EPOCH,
+        // macOS-only fields (see `file_attr`); implicit dirs fall back to epoch.
+        #[cfg(target_os = "macos")]
+        crtime: UNIX_EPOCH,
+        #[cfg(target_os = "macos")]
+        flags: 0,
         kind: FileType::Directory,
         perm: 0o555,
         nlink: 2,
