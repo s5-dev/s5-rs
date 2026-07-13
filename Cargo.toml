@@ -103,3 +103,6 @@ criterion = { version = "0.5.1", features = ["async_tokio"], default-features = 
 
 [workspace.package]
 version = "1.0.0-beta.2"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/s5-dev/s5-rs"

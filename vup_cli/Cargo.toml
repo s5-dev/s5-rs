@@ -6,11 +6,11 @@
 [package]
 name = "s5_vup"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
 description = "Vup Vault — personal E2EE backup, sync, archive, share and mount built on S5"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/s5-dev/s5-rs"
+repository.workspace = true
 
 # The installed binary is `vup`, independent of the package name above.
 [[bin]]

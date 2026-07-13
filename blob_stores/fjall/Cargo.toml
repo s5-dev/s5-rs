@@ -1,10 +1,10 @@
 [package]
 name = "s5_store_fjall"
-edition = "2024"
+edition.workspace = true
 version.workspace = true
 description = "Fjall LSM-tree blob store for S5 with KV separation"
-repository = "https://github.com/s5-dev/s5-rs"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 s5_core = { workspace = true }
