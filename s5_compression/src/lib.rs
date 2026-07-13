@@ -4,7 +4,7 @@
 //! dictionaries. No state, no I/O beyond the byte slices you pass in.
 //!
 //! Higher-level concerns (media type classification, dictionary storage,
-//! training orchestration) belong in the consuming crate (e.g. `vup_cli`).
+//! training orchestration) belong in the consuming crate (e.g. `s5_vup`).
 //!
 //! ## Usage
 //!

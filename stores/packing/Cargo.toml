@@ -1,6 +1,6 @@
 [package]
 name = "s5_store_packing"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "Pack-many-small-blobs-into-one decorator Store for S5"
 repository = "https://github.com/s5-dev/s5-rs"

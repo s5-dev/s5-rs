@@ -168,10 +168,10 @@ For now only option 1 is implemented; the URL stays minimal.
 ## Implementation surface
 
 - Producer logic: `s5_node::export::run_export` and the export-vault
-  RPC; CLI verb `vup share` — `vup_cli::cmd::share::run_share`
-  dispatches to `vup_cli::cmd::vault::run_export` for the whole-vault
+  RPC; CLI verb `vup share` — `s5_vup::cmd::share::run_share`
+  dispatches to `s5_vup::cmd::vault::run_export` for the whole-vault
   case and composes vault + copy + automation for a subtree.
-- Consumer logic: `vup join` — `vup_cli::cmd::stubs::run_join` over the
+- Consumer logic: `vup join` — `s5_vup::cmd::stubs::run_join` over the
   `s5_node::share::join_export` RPC handler.
 - URL parser: `s5_node::share::ExportUrl`.
 

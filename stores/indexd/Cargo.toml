@@ -1,6 +1,6 @@
 [package]
 name = "s5_store_indexd"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "indexd-backed Store for S5: per-path uploads to Sia hosts via sia_storage::Sdk"
 repository = "https://github.com/s5-dev/s5-rs"

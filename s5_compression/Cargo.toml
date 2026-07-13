@@ -1,6 +1,6 @@
 [package]
 name = "s5_compression"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "Zstd compression utilities for S5 blobs, with dictionary support"
 license = "MIT OR Apache-2.0"

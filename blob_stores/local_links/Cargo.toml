@@ -1,6 +1,6 @@
 [package]
 name = "s5_store_local_links"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "Reference local files by hash without copying to blob store"
 license = "MIT OR Apache-2.0"

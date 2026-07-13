@@ -1,6 +1,6 @@
 [package]
 name = "s5_blobs"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2024"
 description = "Blob management and networking for S5"
 repository = "https://github.com/s5-dev/s5-rs"

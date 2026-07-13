@@ -14,12 +14,12 @@ It gives you:
 
 If you are familiar with IPFS or Iroh: think of S5 as a focused, Rust-native toolkit for building distributed storage and sync flows, with strong separation between **wire-stable protocol types** and **high-level ergonomics**.
 
-> **Status**: Version `1.0.0-beta.1`. Wire-level protocol types (`Hash`, `BlobId`, `BlobLocation`, registry/stream messages) are treated as stable for the 1.0 series; library APIs may still evolve between betas.
+> **Status**: Version `1.0.0-beta.2`. Wire-level protocol types (`Hash`, `BlobId`, `BlobLocation`, registry/stream messages) are treated as stable for the 1.0 series; library APIs may still evolve between betas.
 
 ## Quick Install
 
 ```bash
-cargo install --git https://github.com/s5-dev/s5-rs vup_cli
+cargo install --git https://github.com/s5-dev/s5-rs s5_vup
 ```
 
 Minimal workflow (verb-first D20 grammar — a trailing colon marks a vault reference; the daemon auto-starts on first invocation):
@@ -36,7 +36,7 @@ The S5 stack is composed of layered crates, moving from low-level primitives to 
 
 ```mermaid
 graph TD
-    Vup[vup_cli] --> Node[s5_node]
+    Vup[s5_vup] --> Node[s5_node]
     LegacyCLI[s5_cli] --> Node
     Node --> Fuse[s5_fuse]
     Node --> FS[s5_fs_v2]
@@ -52,7 +52,7 @@ graph TD
 3.  **Network (`s5_blobs`, `s5_registry`)**: Iroh-based transport protocols for exchanging blobs and registry updates.
 4.  **Filesystem (`s5_fs_v2`)**: A content-addressed filesystem abstraction with `Node`-based snapshots and prolly-tree merges.
 5.  **Orchestration (`s5_node`)**: Wires together storage, networking, filesystem logic, and FUSE mounts into a runnable daemon.
-6.  **Interface (`vup_cli`, `s5_cli`)**: `vup_cli` is the primary user-facing tool, a thin RPC frontend over the daemon; `s5_cli` is a low-level operational CLI (GC, store verify, HTTP import, FS5-on-disk snapshot ops) kept until `vup_cli` reaches parity. `s5_fuse` lives inside the daemon; mounts are driven via the `MountVault` RPC.
+6.  **Interface (`s5_vup`, `s5_cli`)**: `s5_vup` (the `vup` binary, in the `vup_cli/` directory) is the primary user-facing tool, a thin RPC frontend over the daemon; `s5_cli` is a low-level operational CLI (GC, store verify, HTTP import, FS5-on-disk snapshot ops) kept until `s5_vup` reaches parity. `s5_fuse` lives inside the daemon; mounts are driven via the `MountVault` RPC.
 
 ### Typical Data Flow
 
@@ -68,8 +68,8 @@ graph TD
 | **[s5_core](./s5_core)** | **Protocol Primitives.** `Hash`, `BlobId`, `Store` trait, `RegistryApi` trait. The foundation of the stack. |
 | **[s5_fs](./s5_fs)** | **Filesystem Logic.** Implements `DirV1` snapshots, directory actors, and the high-level `FS5` API. |
 | **[s5_node](./s5_node)** | **Server & Orchestration.** Configures and runs the S5 node, managing stores, networking, mounts, and sync. |
-| **[vup_cli](./vup_cli)** | **Primary Command Line Interface.** Vup Vault — `vup vault create <vault>`, `vup backup <path> <vault>:`, `vup mount <vault>: <dir>`, etc. Thin RPC frontend over the daemon. |
-| **[s5_cli](./s5_cli)** | **Low-level operational CLI.** GC, verify-local, HTTP import, FS5-on-disk snapshot ops. Will fold into `vup_cli` once it reaches parity. |
+| **[s5_vup](./vup_cli)** | **Primary Command Line Interface** (crate `s5_vup`, binary `vup`, in `vup_cli/`). Vup Vault — `vup vault create <vault>`, `vup backup <path> <vault>:`, `vup mount <vault>: <dir>`, etc. Thin RPC frontend over the daemon. |
+| **[s5_cli](./s5_cli)** | **Low-level operational CLI.** GC, verify-local, HTTP import, FS5-on-disk snapshot ops. Will fold into `s5_vup` once it reaches parity. |
 | **[s5_blobs](./s5_blobs)** | **Blob Transport.** Iroh-based protocol for serving and fetching blobs over the network. |
 | **[s5_registry](./s5_registry)** | **Registry Transport.** Iroh-based protocol for syncing mutable registry entries. |
 | **[s5_fuse](./s5_fuse)** | **FUSE Mount.** Mounts an S5 filesystem locally using FUSE. |
@@ -153,11 +153,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ```bash
 # Run the CLI directly
-cargo run -p vup_cli -- --help
+cargo run -p s5_vup -- --help
 
 # Initialise a vault and snapshot some data (daemon auto-starts as needed)
-cargo run -p vup_cli -- vault create photos
-cargo run -p vup_cli -- backup ~/Pictures photos:
+cargo run -p s5_vup -- vault create photos
+cargo run -p s5_vup -- backup ~/Pictures photos:
 ```
 
 ## License
