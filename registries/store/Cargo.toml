@@ -1,9 +1,10 @@
 [package]
 name = "s5_registry_store"
-version = "1.0.0-beta.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Registry implementation backed by a BlobStore"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }

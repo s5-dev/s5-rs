@@ -200,7 +200,7 @@ fn make_initial_snapshot(
 /// Mirror of the rw-mount flush + publish flow: build a snapshot from a
 /// `WritableOverlay` over the given base, save the new vault root, run
 /// the publish task. This is what `s5_fuse::WritableFs::flush_overlay`
-/// + `vup_cli::publish_after_flush` do at the end of every debounce
+/// + `s5_vup::publish_after_flush` do at the end of every debounce
 ///   window.
 async fn flush_and_publish(
     base: Snapshot,

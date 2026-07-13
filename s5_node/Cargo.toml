@@ -1,10 +1,10 @@
 [package]
 name = "s5_node"
-version = "1.0.0-beta.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Server and orchestration logic for S5 nodes"
-repository = "https://github.com/s5-dev/s5-rs"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 age.workspace = true

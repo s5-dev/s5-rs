@@ -82,7 +82,7 @@ impl StoreChoice {
                 account: String::new(),
                 app_key: hex::encode(app_key),
                 cache_path: cache_path.to_string_lossy().into_owned(),
-                max_inflight: None,
+                ..Default::default()
             }),
         };
         NodeConfigStore::from_backend(backend)

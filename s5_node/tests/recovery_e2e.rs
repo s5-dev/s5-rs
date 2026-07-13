@@ -390,7 +390,7 @@ impl DurableBackend for IndexdBackend {
                 account: String::new(),
                 app_key: self.app_key_hex.clone(),
                 cache_path: cache_path.to_string_lossy().into_owned(),
-                max_inflight: None,
+                ..Default::default()
             }));
         let created = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(s5_node::create_raw_store(

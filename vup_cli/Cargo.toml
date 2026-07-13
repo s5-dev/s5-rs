@@ -1,12 +1,18 @@
+# Published as `s5_vup` (not `vup`/`vup_cli`/`vup-cli` — all taken by unrelated
+# crates, and crates.io normalizes `_`=`-`). The package name and the binary are
+# decoupled: `cargo install s5_vup` installs a binary called `vup`. The crate
+# *directory* stays `vup_cli` (`cargo install --path vup_cli` still works); only
+# the package name and `-p` selectors are `s5_vup`.
 [package]
-name = "vup_cli"
+name = "s5_vup"
 version.workspace = true
-edition = "2024"
-description = "Personal backup, sync, and archive tool built on S5"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+description = "Vup Vault — personal E2EE backup, sync, archive, share and mount built on S5"
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/s5-dev/s5-rs"
+repository.workspace = true
 
+# The installed binary is `vup`, independent of the package name above.
 [[bin]]
 name = "vup"
 path = "src/main.rs"

@@ -232,7 +232,11 @@ impl NodeConfigStore {
 /// Standalone: every field needed to open the store lives here, mirroring the
 /// `S3` backend's inline credentials. The same shape is what the `stores` vault
 /// holds for cross-device sync (`docs/reference/special-vaults.md`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Default` exists so construction sites can spread `..Default::default()` for
+/// the optional tuning knobs (a `Default` instance has empty credentials and is
+/// only meaningful once the required fields are filled in).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexdStoreConfig {
     /// Indexer URL the SDK connects to (e.g. `https://sia.storage`).
     pub indexer_url: String,
@@ -257,6 +261,17 @@ pub struct IndexdStoreConfig {
     /// `None` = the built-in default (8).
     #[serde(default)]
     pub max_inflight: Option<usize>,
+    /// Floor (seconds) for the whole-pack upload timeout — the reviewer's
+    /// "a slow connection can't finish a big backup" knob. A backup over a very
+    /// slow uplink needs this generous so a still-progressing upload isn't
+    /// killed; good links finish far inside it. `None` = the built-in default
+    /// (1200 s / 20 min). Wires `s5_store_packing::PackingConfig::upload_timeout_floor`.
+    ///
+    /// This is the only exposed indexd knob. The enumeration/download timeouts,
+    /// their retries, and the sync interval are internal: their defaults (60 s
+    /// pages, 300 s reads, retries on both, 60 s sync) carry every use case.
+    #[serde(default)]
+    pub upload_timeout_secs: Option<u64>,
 }
 
 /// Configuration for a fjall blob store.
@@ -942,6 +957,8 @@ cache_path = "/data/s5/indexd-cache"
                 assert_eq!(icfg.account, "", "account defaults to the primary account");
                 assert_eq!(icfg.app_key.len(), 64, "32-byte AppKey, hex-encoded");
                 assert_eq!(icfg.cache_path, "/data/s5/indexd-cache");
+                // Optional tuning knobs are absent → None → built-in defaults.
+                assert!(icfg.upload_timeout_secs.is_none());
             }
             other => panic!("expected Indexd variant, got {other:?}"),
         }
@@ -954,6 +971,36 @@ cache_path = "/data/s5/indexd-cache"
         );
 
         // Round-trip via TOML re-emit.
+        let back = toml::to_string(&config).expect("serialize");
+        let config2: S5NodeConfig = toml::from_str(&back).expect("re-parse");
+        assert_eq!(config, config2);
+    }
+
+    /// The optional network-timeout / sync-interval knobs parse when present
+    /// and survive a TOML round-trip. They exist for the rare slow/flaky host;
+    /// omitting them (the common case) uses the built-in defaults.
+    #[test]
+    fn indexd_timeout_knobs_round_trip() {
+        let toml_str = r#"
+[identity]
+secret_key_file = "local.secretkey"
+
+[store.sia]
+type = "indexd"
+indexer_url = "https://sia.storage"
+app_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+cache_path = "/data/s5/indexd-cache"
+upload_timeout_secs = 3600
+"#;
+        let config: S5NodeConfig = toml::from_str(toml_str).expect("parse indexd knobs");
+        match &config.store["sia"].backend {
+            NodeConfigStoreBackend::Indexd(icfg) => {
+                assert_eq!(icfg.upload_timeout_secs, Some(3600));
+            }
+            other => panic!("expected Indexd variant, got {other:?}"),
+        }
+        assert!(config.validate().is_empty());
+
         let back = toml::to_string(&config).expect("serialize");
         let config2: S5NodeConfig = toml::from_str(&back).expect("re-parse");
         assert_eq!(config, config2);

@@ -9,16 +9,121 @@
 //!   snapshot — permissions, ownership (uid/gid via `lchown`), extended
 //!   attributes, and timestamps.
 
+use std::ffi::{CString, OsStr};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use s5_fs_v2::node::{FileType, NodeEntry};
 use s5_fs_v2::snapshot::Snapshot;
+
+/// The setuid + setgid mode bits (`S_ISUID | S_ISGID`).
+const SETID_BITS: u32 = 0o6000;
+
+/// Reject a snapshot entry key that could escape the restore target when
+/// joined onto it.
+///
+/// Snapshot keys are arbitrary strings. A normal local backup only ever
+/// produces clean relative paths (they come from `strip_prefix`), but a
+/// **crafted or shared snapshot** — the "before sharing is used for real"
+/// threat — can carry an absolute path (`/etc/cron.d/x`, which `Path::join`
+/// would follow by discarding the target root) or `..` segments that climb out
+/// of `target_dir`. Neither can ever be a legitimate entry, so we reject rather
+/// than silently rewrite: a hostile name fails the restore loudly instead of
+/// landing outside the target.
+///
+/// This is the first line of defence; symlinked-ancestor traversal (a symlink
+/// entry `foo -> /etc` plus a file `foo/passwd`) is closed separately by
+/// materialising every entry through a [`cap_std::fs::Dir`] sandbox rooted at
+/// the target, which refuses to resolve a path out of the tree.
+fn validate_relative_key(key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        anyhow::bail!("snapshot entry has an empty name");
+    }
+    if key.as_bytes().contains(&0) {
+        anyhow::bail!("snapshot entry name contains a NUL byte: {key:?}");
+    }
+    let mut saw_normal = false;
+    for comp in Path::new(key).components() {
+        match comp {
+            Component::Normal(_) => saw_normal = true,
+            // RootDir / Prefix = absolute; ParentDir = `..`; CurDir = `.`.
+            other => anyhow::bail!(
+                "snapshot entry name {key:?} contains an unsafe path component ({other:?}); \
+                 absolute paths and `..`/`.` segments are rejected on restore"
+            ),
+        }
+    }
+    if !saw_normal {
+        anyhow::bail!("snapshot entry name {key:?} resolves to an empty relative path");
+    }
+    Ok(())
+}
+
+/// Create a symlink at `key` (relative to the sandbox `root`) pointing at
+/// `target`, storing the target **verbatim**.
+///
+/// `cap_std::fs::Dir::symlink` refuses an absolute or escaping target — correct
+/// for a capability sandbox, but wrong for a backup tool, which must faithfully
+/// restore a symlink that legitimately points at `/usr/bin/…` or `../sibling`.
+/// So we resolve the link's *parent* through the sandbox (`open_dir`, which
+/// won't traverse out of the tree) and then `symlinkat` the verbatim target
+/// against that parent's fd. Placement stays contained; the stored target is
+/// unrestricted; and later writes that would *traverse* this symlink are still
+/// refused by `cap-std`.
+fn symlink_verbatim(root: &Dir, key: &str, target: &OsStr) -> anyhow::Result<()> {
+    let path = Path::new(key);
+    let (parent_dir, base) = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => {
+            root.create_dir_all(parent)
+                .with_context(|| format!("creating parent dir {}", parent.display()))?;
+            let dir = root
+                .open_dir(parent)
+                .with_context(|| format!("opening parent dir {}", parent.display()))?;
+            let base = path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("symlink key {key:?} has no final component"))?;
+            (Some(dir), base)
+        }
+        None => (None, path.as_os_str()),
+    };
+    let dir_fd = parent_dir
+        .as_ref()
+        .map(|d| d.as_raw_fd())
+        .unwrap_or_else(|| root.as_raw_fd());
+
+    // Best-effort remove of an existing entry at this exact path (final
+    // component is never followed by unlinkat without AT_SYMLINK flags).
+    let base_c = CString::new(base.as_bytes())
+        .with_context(|| format!("symlink name {key:?} contains a NUL byte"))?;
+    unsafe { libc::unlinkat(dir_fd, base_c.as_ptr(), 0) };
+
+    let target_c = CString::new(target.as_bytes())
+        .with_context(|| format!("symlink target for {key:?} contains a NUL byte"))?;
+    let ret = unsafe { libc::symlinkat(target_c.as_ptr(), dir_fd, base_c.as_ptr()) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("creating symlink {key}"));
+    }
+    Ok(())
+}
+
+/// Strip the setuid and setgid bits from a restored file/directory mode.
+///
+/// A snapshot may come from another user when a vault is shared, so restore
+/// must never be able to drop a setuid-root (or setgid) binary onto the host —
+/// the reviewer flagged this explicitly. The sticky bit (`0o1000`) and the
+/// standard rwx bits are preserved.
+fn sanitize_mode(mode: u32) -> u32 {
+    mode & !SETID_BITS
+}
 
 /// Files (and symlinks) restored concurrently. Restore is download-bound, so
 /// overlapping per-file fetches recovers the latency a serial walk wasted — the
@@ -83,6 +188,18 @@ pub async fn restore(
         .await
         .with_context(|| format!("creating target dir {}", target_dir.display()))?;
 
+    // Every write goes through this sandbox handle rather than a
+    // `target_dir.join(key)` path. `cap_std::fs::Dir` resolves paths relative to
+    // the target's directory fd and refuses to escape it — so an absolute key,
+    // a `..` key, or a symlinked ancestor (`foo -> /etc` with a later
+    // `foo/passwd`) can never write outside the target. This is the containment
+    // boundary; `validate_relative_key` below is defence-in-depth plus legible
+    // errors. Metadata (chmod/chown/xattr/mtime) is applied afterwards over the
+    // resolved path — safe because the entry was already placed inside the
+    // sandbox, so no ancestor it traverses leaves the tree.
+    let root = Dir::open_ambient_dir(target_dir, ambient_authority())
+        .with_context(|| format!("opening restore root {}", target_dir.display()))?;
+
     let mut walk = std::pin::pin!(snapshot.walk());
 
     // Collect directory entries so we can restore their metadata after
@@ -134,12 +251,20 @@ pub async fn restore(
             }
         };
 
+        // The tree root (and a subtree's own root entry) re-roots to an empty
+        // key — nothing to materialise, the target dir already exists. Skip it
+        // before validation, which treats a truly empty name as malformed.
+        if key.is_empty() {
+            continue;
+        }
+        // Reject absolute / `..` / NUL keys before they reach the sandbox —
+        // clear error, and defence-in-depth behind `root`.
+        validate_relative_key(&key)?;
+
         match file_type {
             Some(FileType::Directory) => {
-                let target_path = target_dir.join(&key);
-                tokio::fs::create_dir_all(&target_path)
-                    .await
-                    .with_context(|| format!("creating dir {}", target_path.display()))?;
+                root.create_dir_all(&key)
+                    .with_context(|| format!("creating dir {key}"))?;
                 stats.dirs_created.fetch_add(1, Ordering::Relaxed);
                 // Defer metadata restore until after children are written.
                 dir_entries.push((key, entry));
@@ -163,7 +288,7 @@ pub async fn restore(
                     }
                 }
                 inflight.push(restore_file_or_symlink(
-                    snapshot, target_dir, key, entry, config, &stats,
+                    snapshot, target_dir, &root, key, entry, config, &stats,
                 ));
             }
         }
@@ -192,11 +317,15 @@ pub async fn restore(
 async fn restore_file_or_symlink(
     snapshot: &Snapshot,
     target_dir: &Path,
+    root: &Dir,
     key: String,
     entry: NodeEntry,
     config: &RestoreConfig,
     stats: &RestoreStats,
 ) -> anyhow::Result<()> {
+    // Resolved path for metadata ops only (chmod/chown/xattr/mtime). The entry
+    // itself is created through `root`, so it is guaranteed inside the target;
+    // applying metadata over the resolved path can't escape.
     let target_path = target_dir.join(&key);
     let is_symlink = matches!(
         entry
@@ -209,13 +338,13 @@ async fn restore_file_or_symlink(
 
     if is_symlink {
         let target_bytes = snapshot.export_bytes(&entry).await?;
-        let target = std::ffi::OsStr::from_bytes(&target_bytes);
+        let target = OsStr::from_bytes(&target_bytes);
 
-        // Remove existing file/symlink if present.
-        let _ = tokio::fs::remove_file(&target_path).await;
-        tokio::fs::symlink(target, &target_path)
-            .await
-            .with_context(|| format!("creating symlink {}", target_path.display()))?;
+        // Create the link inside the sandbox with its target stored verbatim — a
+        // symlink may legitimately point anywhere (absolute, `..`); only
+        // *traversing* it to write another entry is sandboxed (that write would
+        // leave the tree and `cap-std` refuses it).
+        symlink_verbatim(root, &key, target)?;
 
         // In backup mode, restore symlink ownership via lchown.
         if config.backup {
@@ -227,15 +356,19 @@ async fn restore_file_or_symlink(
         let content = snapshot.export_bytes(&entry).await?;
         let content_len = content.len() as u64;
 
-        if let Some(parent) = target_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
+        if let Some(parent) = Path::new(&key)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            root.create_dir_all(parent)
                 .with_context(|| format!("creating parent dir {}", parent.display()))?;
         }
 
-        tokio::fs::write(&target_path, &content)
-            .await
-            .with_context(|| format!("writing {}", target_path.display()))?;
+        // Remove-then-write so a stale symlink left at this path by a previous
+        // restore is replaced, never followed.
+        let _ = root.remove_file(&key);
+        root.write(&key, content.as_ref())
+            .with_context(|| format!("writing {key}"))?;
 
         restore_metadata(&target_path, &entry, config);
 
@@ -284,9 +417,9 @@ fn restore_metadata(path: &Path, entry: &NodeEntry, config: &RestoreConfig) {
         return;
     };
 
-    // Permissions.
+    // Permissions — with setuid/setgid stripped (see `sanitize_mode`).
     if let Some(mode) = unix.permissions {
-        let perms = std::fs::Permissions::from_mode(mode);
+        let perms = std::fs::Permissions::from_mode(sanitize_mode(mode));
         if let Err(e) = std::fs::set_permissions(path, perms) {
             tracing::debug!(path = %path.display(), "failed to set permissions: {e}");
         }
@@ -414,5 +547,107 @@ mod tests {
         }
         assert!(dst.join("a/b").is_dir());
         assert!(dst.join("c/d").is_dir());
+    }
+
+    #[test]
+    fn validate_relative_key_accepts_clean_paths() {
+        validate_relative_key("file.txt").unwrap();
+        validate_relative_key("a/b/c.txt").unwrap();
+        validate_relative_key("weird name with spaces.txt").unwrap();
+    }
+
+    #[test]
+    fn validate_relative_key_rejects_traversal_and_absolute() {
+        for bad in [
+            "",            // empty
+            "/etc/passwd", // absolute
+            "../escape",   // parent traversal
+            "a/../../etc", // interior traversal
+            "a/../b",      // interior traversal
+            "./x",         // leading current-dir
+            "a\0b",        // embedded NUL
+        ] {
+            assert!(
+                validate_relative_key(bad).is_err(),
+                "validate_relative_key should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_mode_strips_setid_keeps_the_rest() {
+        // setuid + setgid + sticky + rwxr-xr-x → setuid/setgid gone, rest kept.
+        assert_eq!(sanitize_mode(0o7755), 0o1755);
+        assert_eq!(sanitize_mode(0o4755) & SETID_BITS, 0, "setuid removed");
+        assert_eq!(sanitize_mode(0o2755) & SETID_BITS, 0, "setgid removed");
+        assert_eq!(sanitize_mode(0o644), 0o644, "ordinary mode untouched");
+        assert_eq!(sanitize_mode(0o1777), 0o1777, "sticky bit preserved");
+    }
+
+    /// The containment boundary: a snapshot's symlink entry pointing outside the
+    /// target must not let a later entry write through it. `cap-std` refuses to
+    /// resolve `esc/secret` because it escapes the sandbox root.
+    #[test]
+    fn cap_std_root_refuses_symlinked_ancestor_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"top secret").unwrap();
+
+        let root_tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root_tmp.path().join("esc")).unwrap();
+
+        let root = Dir::open_ambient_dir(root_tmp.path(), ambient_authority()).unwrap();
+        assert!(
+            root.write("esc/secret", b"pwned").is_err(),
+            "cap-std must refuse to write through an escaping symlink"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"top secret",
+            "the file outside the target must be untouched"
+        );
+    }
+
+    /// Regression guard: restoring a symlink whose target is an absolute path is
+    /// legitimate and must still work (cap-std's own `symlink` refuses it, which
+    /// is why `symlink_verbatim` exists). Nested placement is sandboxed but the
+    /// stored target is faithful.
+    #[test]
+    fn symlink_verbatim_stores_absolute_target() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(root_tmp.path(), ambient_authority()).unwrap();
+        symlink_verbatim(&root, "sub/link", OsStr::new("/etc/hostname")).unwrap();
+
+        let link = root_tmp.path().join("sub/link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("/etc/hostname")
+        );
+    }
+
+    /// And a symlink `symlink_verbatim` places pointing outside the target still
+    /// can't be *traversed* by a subsequent sandboxed write.
+    #[test]
+    fn symlink_verbatim_target_is_not_traversable() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"top secret").unwrap();
+
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(root_tmp.path(), ambient_authority()).unwrap();
+        symlink_verbatim(&root, "esc", OsStr::new(outside.path().to_str().unwrap())).unwrap();
+
+        assert!(
+            root.write("esc/secret", b"pwned").is_err(),
+            "writing through a stored escaping symlink must be refused"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"top secret"
+        );
     }
 }

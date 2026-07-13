@@ -1,14 +1,17 @@
 [package]
 name = "s5_fs_local"
-version = "1.0.0-beta.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Local filesystem backup and restore for S5 FS V2"
-repository = "https://github.com/s5-dev/s5-rs"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+# Sandboxed dir handle for restore: refuses paths that escape the target
+# (absolute, `..`, symlinked ancestors).
+cap-std = "3"
 futures.workspace = true
 globset = "0.4"
 ignore = "0.4"

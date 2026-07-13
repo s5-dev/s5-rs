@@ -1,10 +1,10 @@
 [package]
 name = "s5_registry"
-version = "1.0.0-beta.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Registry service for S5"
-repository = "https://github.com/s5-dev/s5-rs"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true

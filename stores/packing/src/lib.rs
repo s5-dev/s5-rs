@@ -110,7 +110,15 @@ pub struct PackingConfig {
     /// `max(upload_timeout_floor, total_size / 1 MiB/s)` for the backend before
     /// giving up on the cycle. The staged entries survive (that is what the WAL
     /// is for) and the next tick retries. Without this a single wedged upload
-    /// stalls the store forever, silently. Default 10 min.
+    /// stalls the store forever, silently.
+    ///
+    /// Default 20 min. This must be generous: it is a whole-upload deadline, and
+    /// the backend gives us no mid-upload progress signal, so too tight a bound
+    /// kills a big backup that is still making slow progress on a poor link
+    /// (the reviewer's "a slow connection can't finish a big backup" case). A
+    /// healthy link finishes a 240 MiB pack in well under a minute, so a large
+    /// floor never slows it down — the deadline only bites a genuinely wedged or
+    /// crawling upload, which the WAL + next-tick retry then re-drives.
     pub upload_timeout_floor: Duration,
 }
 
@@ -126,7 +134,7 @@ impl Default for PackingConfig {
             staging_max_packs: 4,
             index_cache_prefix: "manifests/".to_string(),
             max_pending_age: Duration::from_secs(90),
-            upload_timeout_floor: Duration::from_secs(600),
+            upload_timeout_floor: Duration::from_secs(1200),
         }
     }
 }

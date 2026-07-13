@@ -14,7 +14,7 @@ recipes: [`../reference/cli-workflows.md`](../reference/cli-workflows.md).
 ## 1. Install
 
 ```sh
-cargo install vup_cli        # from crates.io (or: cargo install --path vup_cli from a checkout)
+cargo install s5_vup        # from crates.io (or: cargo install --path vup_cli from a checkout)
 ```
 
 This installs the `vup` binary. Everything else — the background daemon,

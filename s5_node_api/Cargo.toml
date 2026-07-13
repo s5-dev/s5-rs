@@ -1,9 +1,10 @@
 [package]
 name = "s5_node_api"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
 description = "S5 node API — RPC protocol, config types, and client for communicating with an S5 node"
-license = "MIT OR Apache-2.0"
+repository.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true

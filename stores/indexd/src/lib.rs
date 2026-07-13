@@ -78,6 +78,17 @@ use crate::cache::SealedObjectCache;
 /// / [`IndexdStore::sync_from_indexer`]).
 const RECONSTRUCT_BATCH: usize = 256;
 
+/// Network reads that a bad connection can blip mid-flight — indexer
+/// enumeration pages and blob downloads — are attempted this many times total
+/// before failing, with exponential backoff from [`RETRY_BASE_BACKOFF`]. Each
+/// attempt is separately bounded by its timeout. This is what turns a transient
+/// hiccup while listing a vault on a poor link into a retry instead of a hard
+/// failure. Uploads are deliberately NOT retried here — the packing store's
+/// background tick already re-drives a failed pack (see `stores/packing`).
+const NETWORK_ATTEMPTS: usize = 3;
+/// Base backoff between retry attempts; doubles each attempt.
+const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Outcome counts from enumerating the indexer
 /// ([`IndexdStore::reconstruct_from_indexer`] / [`IndexdStore::sync_from_indexer`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -168,10 +179,20 @@ pub struct IndexdConfig {
     /// Per-request timeout for an indexer enumeration page
     /// ([`IndexdStore::reconstruct_from_indexer`] / [`sync_from_indexer`]). Bounds
     /// each `object_events` call so a degraded indexer fails fast instead of
-    /// hanging the open / sync. Default 30 s.
+    /// hanging the open / sync; a timed-out page is retried
+    /// ([`NETWORK_ATTEMPTS`]) before the sync gives up. Default 60 s. A fast
+    /// indexer answers a page in well under a second, so a generous bound only
+    /// helps slow links and never delays a healthy one.
     ///
     /// [`sync_from_indexer`]: IndexdStore::sync_from_indexer
     pub request_timeout: Duration,
+    /// Per-download timeout for a single blob read (`open_read_bytes` /
+    /// `open_read_stream`). Bounds prolly-tree node reads (vault listing) and
+    /// file-export chunk reads so a bad connection can't hang a `list`/`restore`
+    /// forever — previously these had no bound at all. A timed-out buffered read
+    /// is retried ([`NETWORK_ATTEMPTS`]); reads are content-addressed and ranged,
+    /// so a retry is idempotent. Default 300 s.
+    pub download_timeout: Duration,
     /// Block `open` on a full enumeration when the cache is **cold** (no persisted
     /// cursor), so the store never reports a false "not found" from an
     /// unpopulated cache. Warm opens (cursor present) never block — they have a
@@ -207,7 +228,8 @@ impl Default for IndexdConfig {
             share_validity: Duration::from_secs(24 * 3600),
             upload_options: None,
             indexer_url: DEFAULT_INDEXER_URL.to_string(),
-            request_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(60),
+            download_timeout: Duration::from_secs(300),
             sync_on_open: true,
         }
     }
@@ -389,19 +411,39 @@ impl<C: Store> IndexdStore<C> {
     async fn run_events(&self, mut after: Option<EnumCursor>) -> StoreResult<SyncStats> {
         let mut stats = SyncStats::default();
         loop {
-            // Per-page timeout so a degraded/hung indexer fails fast instead of
-            // blocking the open / sync indefinitely.
-            let batch = tokio::time::timeout(
-                self.config.request_timeout,
-                self.backend.object_events(after, RECONSTRUCT_BATCH),
-            )
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "indexd object_events timed out after {:?}",
-                    self.config.request_timeout
+            // Per-page timeout + bounded retry: a degraded/hung indexer fails a
+            // page fast, and a transient blip on a bad connection is retried
+            // rather than aborting the whole open/sync — the "issues listing
+            // vault contents on a bad connection" the reviewer hit.
+            // `object_events` reads from `after`, so a retry is idempotent.
+            let mut attempt = 0;
+            let batch = loop {
+                attempt += 1;
+                match tokio::time::timeout(
+                    self.config.request_timeout,
+                    self.backend.object_events(after, RECONSTRUCT_BATCH),
                 )
-            })??;
+                .await
+                {
+                    Ok(Ok(batch)) => break batch,
+                    Ok(Err(e)) if attempt >= NETWORK_ATTEMPTS => return Err(e),
+                    Err(_) if attempt >= NETWORK_ATTEMPTS => {
+                        return Err(anyhow!(
+                            "indexd object_events timed out after {:?} ({attempt} attempts)",
+                            self.config.request_timeout
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(attempt, "indexd object_events failed: {e:?}; retrying")
+                    }
+                    Err(_) => tracing::debug!(
+                        attempt,
+                        "indexd object_events timed out after {:?}; retrying",
+                        self.config.request_timeout
+                    ),
+                }
+                tokio::time::sleep(RETRY_BASE_BACKOFF * (1 << (attempt - 1))).await;
+            };
             if batch.is_empty() {
                 break;
             }
@@ -570,12 +612,43 @@ impl<C: Store> Store for IndexdStore<C> {
         max_len: Option<u64>,
     ) -> StoreResult<Bytes> {
         let sealed = self.cache.load(path).await?;
-        let mut reader = self.backend.download(&sealed, offset, max_len).await?;
-        let mut buf: Vec<u8> = Vec::new();
-        tokio::io::copy(&mut reader, &mut buf)
-            .await
-            .map_err(|e| anyhow!("indexd download copy for {path}: {e}"))?;
-        Ok(Bytes::from(buf))
+        // Bounded, retried download. Reads have no other timeout in this stack,
+        // so on a bad connection a prolly-tree node read (listing) or a file
+        // chunk read (restore) could otherwise hang indefinitely. Idempotent —
+        // content-addressed and ranged — so a timed-out attempt is safely
+        // retried before failing.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let read = async {
+                let mut reader = self.backend.download(&sealed, offset, max_len).await?;
+                let mut buf: Vec<u8> = Vec::new();
+                tokio::io::copy(&mut reader, &mut buf)
+                    .await
+                    .map_err(|e| anyhow!("indexd download copy for {path}: {e}"))?;
+                Ok::<_, anyhow::Error>(Bytes::from(buf))
+            };
+            match tokio::time::timeout(self.config.download_timeout, read).await {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err(e)) if attempt >= NETWORK_ATTEMPTS => return Err(e),
+                Err(_) if attempt >= NETWORK_ATTEMPTS => {
+                    return Err(anyhow!(
+                        "indexd download for {path} timed out after {:?} ({attempt} attempts)",
+                        self.config.download_timeout
+                    ));
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(attempt, %path, "indexd download failed: {e:?}; retrying")
+                }
+                Err(_) => tracing::debug!(
+                    attempt,
+                    %path,
+                    "indexd download timed out after {:?}; retrying",
+                    self.config.download_timeout
+                ),
+            }
+            tokio::time::sleep(RETRY_BASE_BACKOFF * (1 << (attempt - 1))).await;
+        }
     }
 
     async fn open_read_stream(
@@ -585,9 +658,22 @@ impl<C: Store> Store for IndexdStore<C> {
         max_len: Option<u64>,
     ) -> StoreResult<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>>
     {
-        // True streaming: wrap the download reader as a chunk stream.
+        // True streaming: wrap the download reader as a chunk stream. Bound the
+        // *establishment* of the download so a bad connection can't hang opening
+        // the stream; the caller drives the byte flow after that (a mid-stream
+        // stall can't be retried without re-reading, so it's left to the caller).
         let sealed = self.cache.load(path).await?;
-        let reader = self.backend.download(&sealed, offset, max_len).await?;
+        let reader = tokio::time::timeout(
+            self.config.download_timeout,
+            self.backend.download(&sealed, offset, max_len),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "indexd download for {path} timed out after {:?}",
+                self.config.download_timeout
+            )
+        })??;
         Ok(Box::new(ReaderStream::new(reader)))
     }
 

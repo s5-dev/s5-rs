@@ -7,7 +7,7 @@ anything leaves your machine** — with content-addressed deduplication, snapsho
 you can roll back to, and recovery from a single offline key. Backends: a local
 disk, any S3-compatible bucket, or Sia (decentralized) via an indexd service.
 
-> Status: `1.0.0-beta.1`. Moving fast; expect rough edges.
+> Status: `1.0.0-beta.2`. Moving fast; expect rough edges.
 
 ## Install
 
@@ -25,16 +25,16 @@ cargo install --path vup_cli      # installs the `vup` binary into ~/.cargo/bin
 **From git (no clone):**
 
 ```sh
-cargo install --git https://github.com/s5-dev/s5-rs vup_cli
+cargo install --git https://github.com/s5-dev/s5-rs s5_vup
 ```
 
 **From crates.io** _(coming with the crates.io release)_:
 
 ```sh
-cargo install vup_cli
+cargo install s5_vup
 ```
 
-> The package is `vup_cli`; the installed binary is `vup`. Make sure
+> The package is `s5_vup`; the installed binary is `vup`. Make sure
 > `~/.cargo/bin` is on your `PATH` (rustup sets this up).
 
 _A one-line `curl … | sh` installer with prebuilt binaries is planned._
